@@ -1,0 +1,75 @@
+################################################################################
+################################################################################
+###                                                                          ###
+###                      docker-compose.yml                                 ###
+###                   Docker Compose Configuration                          ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+version: '3.8'
+
+services:
+  ephemeral-rest:
+    build: .
+    container_name: ephemeral-rest
+    restart: unless-stopped
+    ports:
+      - "${FLASK_PORT:-5000}:5000"
+    environment:
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=5000
+      - FLASK_DEBUG=${FLASK_DEBUG:-False}
+      - SECRET_KEY=${SECRET_KEY}
+      - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - API_KEY=${API_KEY}
+      - DATABASE_PATH=/app/data/ephemeral.db
+      - SWISS_EPHEMERIS_PATH=/app/sweph
+      - LOG_FILE=/app/logs/google_api_usage.log
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - USAGE_COUNT_FILE=/app/data/api_usage_count.json
+      - MAX_MONTHLY_REQUESTS=${MAX_MONTHLY_REQUESTS:-10000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-True}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-10}
+      - RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR:-50}
+      - RATE_LIMIT_PER_DAY=${RATE_LIMIT_PER_DAY:-200}
+      - CACHE_EXPIRY_DAYS=${CACHE_EXPIRY_DAYS:-90}
+    volumes:
+      - ./sweph:/app/sweph:ro
+      - ephemeral-data:/app/data
+      - ephemeral-logs:/app/logs
+    networks:
+      - ephemeral-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: ephemeral-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - ephemeral-api
+    networks:
+      - ephemeral-network
+
+volumes:
+  ephemeral-data:
+    driver: local
+  ephemeral-logs:
+    driver: local
+
+networks:
+  ephemeral-network:
+    driver: bridge
