@@ -1,4 +1,4 @@
-# Ephemeral.REST — Architecture & Developer Guide
+# ephemeralREST — Architecture & Developer Guide
 
 This document describes how the codebase is structured, how the components relate to each other, and how to navigate and modify the code. It is written for developers who are new to the project, or who want to understand how something works before changing it.
 
@@ -55,7 +55,7 @@ This document describes how the codebase is structured, how the components relat
 
 ## Licence
 
-Ephemeral.REST is licensed under the **GNU Affero General Public License v3 (AGPL v3)**. This licence was selected for compatibility with the Swiss Ephemeris library, which is itself AGPL v3. Because the Swiss Ephemeris is linked at runtime, the combined work must be distributed under the AGPL v3.
+ephemeralREST is licensed under the **GNU Affero General Public License v3 (AGPL v3)**. This licence was selected for compatibility with the Swiss Ephemeris library, which is itself AGPL v3. Because the Swiss Ephemeris is linked at runtime, the combined work must be distributed under the AGPL v3.
 
 The critical difference between GPL v3 and AGPL v3 is the **network service clause**. Under AGPL v3, users who interact with the software over a network (i.e., anyone who calls the API) are legally entitled to receive the source code of the running application. A public GitHub repository satisfies this obligation.
 
@@ -67,7 +67,7 @@ The full licence text lives in `LICENSE` at the repository root.
 
 ## 1. System overview
 
-Ephemeral.REST consists of two separate applications that communicate over HTTP:
+ephemeralREST consists of two separate applications that communicate over HTTP:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -685,8 +685,8 @@ If `host`, `user`, and `password` are all set, `self.enabled = True` and email s
 
 ```python
 def send_my_notification(self, to_email: str, name: str, data: str) -> bool:
-    subject = "Ephemeral.REST — Your notification"
-    text = f"""Hello {name},\n\n{data}\n\nEphemeral.REST\n"""
+    subject = "ephemeralREST — Your notification"
+    text = f"""Hello {name},\n\n{data}\n\nephemeralREST\n"""
     html = f"""<!DOCTYPE html><html><body>
       <h2>Your notification</h2>
       <p>{data}</p>

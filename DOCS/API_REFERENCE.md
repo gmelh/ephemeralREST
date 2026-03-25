@@ -1,8 +1,8 @@
-# Ephemeral.REST — API Reference
+# ephemeralREST — API Reference
 
 ## Introduction
 
-Ephemeral.REST is a REST API for astronomical chart calculations. It uses the **Swiss Ephemeris** — the same calculation engine used by professional astrological software — to compute precise planetary positions, house cusps, and angles for any date, time, and location between 1800 and 2200 CE.
+ephemeralREST is a REST API for astronomical chart calculations. It uses the **Swiss Ephemeris** — the same calculation engine used by professional astrological software — to compute precise planetary positions, house cusps, and angles for any date, time, and location between 1800 and 2200 CE.
 
 This document explains how to connect to the API, what you can ask it to do, and what you will receive back. Every endpoint is shown with a working `curl` example you can run directly from a terminal.
 
@@ -12,7 +12,7 @@ If you are new to REST APIs, the short version is: you send a **request** contai
 
 ## Licence
 
-Ephemeral.REST is open source software, released under the **GNU Affero General Public License v3 (AGPL v3)**.
+ephemeralREST is open source software, released under the **GNU Affero General Public License v3 (AGPL v3)**.
 
 The source code is available on GitHub. As a user of this API you are entitled to receive the source code of the running application — this is a requirement of the AGPL v3 network service clause, which applies because the software uses the Swiss Ephemeris library (itself AGPL v3).
 

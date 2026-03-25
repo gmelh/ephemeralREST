@@ -1,7 +1,7 @@
 ################################################################################
 #                                                                              #
-#  Ephemeral.REST — Swiss Ephemeris REST API                                   #
-#  Copyright (C) 2026  Ephemeral.REST contributors                             #
+#  ephemeralREST — Swiss Ephemeris REST API                                   #
+#  Copyright (C) 2026  ephemeralREST contributors                             #
 #                                                                              #
 #  This program is free software: you can redistribute it and/or modify       #
 #  it under the terms of the GNU Affero General Public License as published   #
@@ -31,7 +31,7 @@
 ################################################################################
 
 """
-Configuration module for Ephemeral.REST
+Configuration module for ephemeralREST
 Handles environment variables and application settings.
 
 User API keys are NOT stored here — they are stored in .env and referenced

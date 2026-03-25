@@ -1,7 +1,7 @@
 ################################################################################
 #                                                                              #
-#  Ephemeral.REST — Swiss Ephemeris REST API                                   #
-#  Copyright (C) 2026  Ephemeral.REST contributors                             #
+#  ephemeralREST — Swiss Ephemeris REST API                                   #
+#  Copyright (C) 2026  ephemeralREST contributors                             #
 #                                                                              #
 #  This program is free software: you can redistribute it and/or modify       #
 #  it under the terms of the GNU Affero General Public License as published   #
@@ -31,7 +31,7 @@
 ################################################################################
 
 """
-Main application module for Ephemeral.REST
+Main application module for ephemeralREST
 Application factory pattern with dependency injection
 """
 import logging
@@ -97,7 +97,7 @@ def create_app(config_class=Config):
     # Setup logging
     setup_logging(config_class)
     logger = logging.getLogger(__name__)
-    logger.info("Starting Ephemeral.REST application")
+    logger.info("Starting ephemeralREST application")
     logger.info(f"Configuration: {config_class.get_summary()}")
     logger.info(f"User key resolution: database-backed")
 
@@ -233,7 +233,7 @@ def setup_logging(config):
 def print_startup_info(config):
     """Print startup information"""
     print("\n" + "=" * 60)
-    print("🌟 Ephemeral.REST Server Starting")
+    print("🌟 ephemeralREST Server Starting")
     print("=" * 60)
     print(f"📍 Host:                {config.FLASK_HOST}")
     print(f"🔌 Port:                {config.FLASK_PORT}")

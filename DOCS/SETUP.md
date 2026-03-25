@@ -1,6 +1,6 @@
-# Deploying Ephemeral.REST on nginx
+# Deploying ephemeralREST on nginx
 
-This guide covers deploying the Ephemeral.REST API on a Linux server using nginx as a reverse proxy and Gunicorn as the WSGI server.
+This guide covers deploying the ephemeralREST API on a Linux server using nginx as a reverse proxy and Gunicorn as the WSGI server.
 
 ---
 
@@ -16,7 +16,7 @@ This guide covers deploying the Ephemeral.REST API on a Linux server using nginx
 
 ## Licensing
 
-Ephemeral.REST is released under the **GNU Affero General Public License v3 (AGPL v3)**.
+ephemeralREST is released under the **GNU Affero General Public License v3 (AGPL v3)**.
 
 This licence was chosen because the Swiss Ephemeris library — which powers all calculations — is itself licensed under the AGPL v3. Under the terms of the AGPL, any software that incorporates or links against an AGPL-licensed library must also be distributed under the AGPL v3.
 
@@ -61,7 +61,7 @@ sudo chown ephemeral:ephemeral /srv/ephemeral
 ```bash
 sudo -u ephemeral -s
 cd /srv/ephemeral
-git clone https://github.com/your-org/ephemeral-rest.git app
+git clone https://github.com/gmelh/ephemeralREST.git app
 cd app
 python3 -m venv .venv
 source .venv/bin/activate
@@ -170,7 +170,7 @@ sudo nano /etc/systemd/system/ephemeral.service
 
 ```ini
 [Unit]
-Description=Ephemeral.REST API
+Description=ephemeralREST API
 After=network.target
 
 [Service]
@@ -361,7 +361,7 @@ Edit `config.php` to point at the API:
 ```php
 define('API_BASE',      'https://api.yourdomain.com');
 define('ADMIN_API_KEY', 'your-admin-key-here');
-define('SITE_NAME',     'Ephemeral.REST');
+define('SITE_NAME',     'ephemeralREST');
 ```
 
 ---
@@ -377,7 +377,7 @@ SMTP_HOST=smtp.yourmailprovider.com
 SMTP_PORT=587
 SMTP_USER=no-reply@yourdomain.com
 SMTP_PASSWORD=your-smtp-password
-SMTP_FROM=Ephemeral.REST <no-reply@yourdomain.com>
+SMTP_FROM=ephemeralREST <no-reply@yourdomain.com>
 SMTP_TLS=true
 ADMIN_EMAIL=admin@yourdomain.com
 API_BASE_URL=https://api.yourdomain.com

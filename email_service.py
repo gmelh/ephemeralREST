@@ -1,7 +1,7 @@
 ################################################################################
 #                                                                              #
-#  Ephemeral.REST — Swiss Ephemeris REST API                                   #
-#  Copyright (C) 2026  Ephemeral.REST contributors                             #
+#  ephemeralREST — Swiss Ephemeris REST API                                   #
+#  Copyright (C) 2026  ephemeralREST contributors                             #
 #                                                                              #
 #  This program is free software: you can redistribute it and/or modify       #
 #  it under the terms of the GNU Affero General Public License as published   #
@@ -31,7 +31,7 @@
 ################################################################################
 
 """
-Sends transactional email for Ephemeral.REST.
+Sends transactional email for ephemeralREST.
 
 Configuration is loaded from the smtp_config database table (managed via
 the admin SMTP settings page). Any key missing from the database falls back
@@ -124,10 +124,10 @@ class EmailService:
 
     def send_user_verification(self, to_email: str, name: str, token: str) -> bool:
         verify_url = f"{self.base_url}/register/verify?t={token}"
-        subject    = "Ephemeral.REST — Verify your email to activate your API key"
+        subject    = "ephemeralREST — Verify your email to activate your API key"
         text = f"""Hello {name},
 
-Thank you for registering with Ephemeral.REST.
+Thank you for registering with ephemeralREST.
 
 To activate your API key click the link below:
 
@@ -138,10 +138,10 @@ shown once — please save it securely.
 
 If you did not request this, ignore this email.
 
-Ephemeral.REST
+ephemeralREST
 """
         html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">Ephemeral.REST — Email Verification</h2>
+<h2 style="color:#1F4E79;">ephemeralREST — Email Verification</h2>
 <p>Hello {name},</p>
 <p>Click below to activate your API key:</p>
 <p style="margin:28px 0;">
@@ -159,7 +159,7 @@ Ephemeral.REST
     def send_domain_registration_received(
             self, to_email: str, name: str, domain: str
     ) -> bool:
-        subject = "Ephemeral.REST — Registration request received"
+        subject = "ephemeralREST — Registration request received"
         text = f"""Hello {name},
 
 We have received your API key registration request for:
@@ -168,15 +168,15 @@ We have received your API key registration request for:
 
 Your request is pending review. We will email your key once approved.
 
-Ephemeral.REST
+ephemeralREST
 """
         html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">Ephemeral.REST — Request Received</h2>
+<h2 style="color:#1F4E79;">ephemeralREST — Request Received</h2>
 <p>Hello {name},</p>
 <p>We've received your registration request for <strong>{domain}</strong>.</p>
 <p>We'll email your API key once approved.</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">Ephemeral.REST</p>
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
         return self._send(to_email, subject, text, html)
 
@@ -184,7 +184,7 @@ Ephemeral.REST
             self, to_email: str, name: str, domain: str,
             api_key: str, admin_note: str = None
     ) -> bool:
-        subject   = "Ephemeral.REST — Your API key is ready"
+        subject   = "ephemeralREST — Your API key is ready"
         note_text = f"\nNote from admin: {admin_note}\n" if admin_note else ""
         note_html = f'<p style="color:#555;"><em>Note: {admin_note}</em></p>' if admin_note else ""
         text = f"""Hello {name},
@@ -201,10 +201,10 @@ Use it in every API request:
 
     X-API-Key: {api_key}
 
-Ephemeral.REST
+ephemeralREST
 """
         html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">Ephemeral.REST — API Key Approved ✓</h2>
+<h2 style="color:#375623;">ephemeralREST — API Key Approved ✓</h2>
 <p>Hello {name},</p>
 <p>Your registration for <strong>{domain}</strong> has been approved.</p>
 {note_html}
@@ -213,29 +213,29 @@ Ephemeral.REST
 <p style="color:#c00;font-weight:bold;">⚠ Save this key — it will not be shown again.</p>
 <p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">Ephemeral.REST</p>
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
         return self._send(to_email, subject, text, html)
 
     def send_domain_rejected(
             self, to_email: str, name: str, domain: str, admin_note: str = None
     ) -> bool:
-        subject   = "Ephemeral.REST — Registration not approved"
+        subject   = "ephemeralREST — Registration not approved"
         note_text = f"\n{admin_note}\n" if admin_note else "\nContact us if you believe this is an error.\n"
         note_html = f'<p>{admin_note}</p>' if admin_note else '<p>Contact us if you believe this is an error.</p>'
         text = f"""Hello {name},
 
 Your API key registration for '{domain}' could not be approved.
 {note_text}
-Ephemeral.REST
+ephemeralREST
 """
         html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#833C00;">Ephemeral.REST — Not Approved</h2>
+<h2 style="color:#833C00;">ephemeralREST — Not Approved</h2>
 <p>Hello {name},</p>
 <p>Your registration for <strong>{domain}</strong> could not be approved.</p>
 {note_html}
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">Ephemeral.REST</p>
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
         return self._send(to_email, subject, text, html)
 
@@ -248,7 +248,7 @@ Ephemeral.REST
 
         approve_url = f"{self.base_url}/admin/registrations/{request_id}/approve"
         reject_url  = f"{self.base_url}/admin/registrations/{request_id}/reject"
-        subject     = f"Ephemeral.REST — New registration: {domain}"
+        subject     = f"ephemeralREST — New registration: {domain}"
         text = f"""New registration request:
 
   Domain:  {domain}
@@ -275,13 +275,13 @@ Ephemeral.REST
 
     def send_test_email(self, to_email: str) -> bool:
         """Send a test message to verify SMTP configuration."""
-        subject = "Ephemeral.REST — SMTP configuration test"
-        text    = "This is a test email from Ephemeral.REST confirming SMTP is working."
+        subject = "ephemeralREST — SMTP configuration test"
+        text    = "This is a test email from ephemeralREST confirming SMTP is working."
         html    = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">Ephemeral.REST — SMTP Test ✓</h2>
+<h2 style="color:#375623;">ephemeralREST — SMTP Test ✓</h2>
 <p>Your SMTP configuration is working correctly.</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">Ephemeral.REST</p>
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
         return self._send(to_email, subject, text, html)
 
