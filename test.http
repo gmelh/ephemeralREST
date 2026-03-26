@@ -1,7 +1,7 @@
 POST http://localhost:5000/calculate
 
 Content-Type: application/json
-X-API-Key: t_Cu2m-_Cej96t9TG4JqBpXKU0_6Yy3jGYK-St1k9oY
+X-API-Key: YOUR_KEY
 {
     "chart_name": "Test Chart",
     "datetime": "1985-06-12 14:30:00",
