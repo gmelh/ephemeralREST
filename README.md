@@ -1,7 +1,7 @@
 EphemeralREST
 -------------
 
-EphemeralRST is a REST API that enables developers of astronomy and astrology applications to 
+EphemeralREST is a REST API that enables developers of astronomy and astrology applications to 
 perform the sometimes complex calculations with simple calls to a REST service.
 
 This application is still at pre-release though it is envisaged that it will become tested
