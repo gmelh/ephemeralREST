@@ -38,7 +38,7 @@ import logging
 import pytz
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
-from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, RegisterDomainSchema, RegisterUserSchema, AdminReviewSchema
+from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterDomainSchema, RegisterUserSchema, AdminReviewSchema
 from output_config import OutputConfig
 from email_service import EmailService
 import secrets as _secrets
@@ -1084,6 +1084,47 @@ def ephemeris(validated_data):
 
 
 
+@api.route('/eclipses', methods=['POST'])
+@validate_request(EclipseSchema)
+def eclipses(validated_data):
+    """
+    Find all solar and lunar eclipses within a given time window.
+
+    Body param: reference_date — start of the search window (YYYY-MM-DD or ISO)
+    Body param: years_ahead    — how many years forward to search (1–50, default 5)
+
+    Returns a chronological list of eclipses, each with:
+      type, eclipse_type, datetime_utc, julian_day,
+      magnitude, obscuration, saros_series, saros_member
+
+    Solar eclipse types:  total, annular, hybrid, partial
+    Lunar eclipse types:  total, partial, penumbral
+
+    obscuration is the fraction of the disc covered at maximum (0.0–1.0).
+    """
+    reference_date_str = validated_data['reference_date']
+    years_ahead        = validated_data.get('years_ahead', 5)
+
+    reference_date = _parse_datetime(str(reference_date_str))
+    if reference_date is None:
+        return _error('Invalid reference_date format', 400)
+    reference_date = reference_date.replace(tzinfo=None)
+
+    result, error = astronomy_service.calculate_eclipses(
+        reference_date=reference_date,
+        years_ahead=years_ahead,
+    )
+    if error:
+        return _error(error, 500)
+
+    return jsonify({
+        'reference_date': reference_date.date().isoformat(),
+        'years_ahead':    years_ahead,
+        'count':          len(result),
+        'eclipses':       result,
+    })
+
+
 # ---------------------------------------------------------------------------
 # Registration — Domain
 # ---------------------------------------------------------------------------
@@ -1145,7 +1186,7 @@ def register_domain(validated_data):
 
     # Emails
     email_svc = EmailService()
-    email_svc.send_domain_registration_received(contact_email, name, domain)
+    email_svc.send_domain_registration_received(contact_email, name, domain, template=_resolve_template('register-domain'))
     email_svc.send_admin_new_registration(domain, name, contact_email, reason, request_id)
 
     logger.info(f"Domain registration request: '{domain}' (request_id={request_id}, key_id={key_id})")
@@ -1218,7 +1259,7 @@ def register_user(validated_data):
     )
 
     email_svc = EmailService()
-    email_svc.send_user_verification(email, name, token)
+    email_svc.send_user_verification(email, name, token, template=_resolve_template('user-verify'))
 
     logger.info(f"User registration: '{email}' (key_id={key_id}) — verification sent")
 
@@ -1235,9 +1276,8 @@ def verify_email():
 
     Query param: t — the verification token from the email
 
-    Activates the key, emails the plaintext key to the user,
-    and returns JSON. The portal's verify.php page calls this
-    endpoint and renders the result as a proper page.
+    The plaintext API key is returned once in the response.
+    The token is marked used and the key activated.
     """
     token = request.args.get('t', '').strip()
     if not token:
@@ -1251,8 +1291,8 @@ def verify_email():
     email  = record['email']
 
     # Retrieve and decrypt the pending plaintext key
-    all_keys   = db_manager.get_all_api_keys(include_inactive=True)
-    key_record = next((k for k in all_keys if k['id'] == key_id), None)
+    all_keys    = db_manager.get_all_api_keys(include_inactive=True)
+    key_record  = next((k for k in all_keys if k['id'] == key_id), None)
     if not key_record:
         return _error('Key record not found', 500)
 
@@ -1261,19 +1301,19 @@ def verify_email():
     crypto = KeyCrypto(Config.SECRET_KEY)
 
     # Retrieve pending reveal, activate key, clear reveal field
-    output_cfg = key_record.get('output_config') or {}
-    reveal_enc = output_cfg.pop('_pending_reveal', None)
-    plaintext  = crypto.decrypt(reveal_enc) if reveal_enc else None
+    output_cfg  = key_record.get('output_config') or {}
+    reveal_enc  = output_cfg.pop('_pending_reveal', None)
+    plaintext   = crypto.decrypt(reveal_enc) if reveal_enc else None
 
     db_manager.update_api_key(key_id, active=1, output_config=output_cfg or None)
     db_manager.mark_email_verification_used(token)
 
     logger.info(f"Email verified: '{email}' (key_id={key_id}) — key activated")
 
-    # Email the API key — the only delivery point for the plaintext key
+    # Email the API key to the user — this is the one and only time it is delivered
     if plaintext:
         email_svc = EmailService()
-        email_svc.send_user_key_activated(email, key_record.get('name', ''), plaintext)
+        email_svc.send_user_key_activated(email, key_record.get('name', ''), plaintext, template=_resolve_template('user-activated'))
         logger.info(f"API key emailed to '{email}' (key_id={key_id})")
 
     return jsonify({
@@ -1357,7 +1397,7 @@ def admin_approve_registration(validated_data, request_id):
     if plaintext and reg.get('contact_email'):
         email_svc.send_domain_approved(
             reg['contact_email'], reg['name'], reg['domain'],
-            plaintext, admin_note
+            plaintext, admin_note, template=_resolve_template('register-approved')
         )
 
     logger.info(f"Domain registration approved: '{reg['domain']}' (request_id={request_id})")
@@ -1398,7 +1438,8 @@ def admin_reject_registration(validated_data, request_id):
     email_svc = EmailService()
     if reg.get('contact_email'):
         email_svc.send_domain_rejected(
-            reg['contact_email'], reg['name'], reg['domain'], admin_note
+            reg['contact_email'], reg['name'], reg['domain'],
+            admin_note, template=_resolve_template('register-rejected')
         )
 
     logger.info(f"Domain registration rejected: '{reg['domain']}' (request_id={request_id})")
@@ -1418,13 +1459,13 @@ _TEMPLATE_CONTENT_DEFAULTS = {
     'test': {
         'subject':     'Test email from ephemeralREST',
         'header_text': 'Test Email',
-        'body_text':   'This is a test email from ephemeralREST.\n\nIf you received this, your SMTP configuration is working correctly.',
+        'body_text':   'This is a test email from ephemeralREST.\n\nYour SMTP configuration is working correctly.',
         'footer_text': 'ephemeralREST',
     },
     'register-domain': {
         'subject':     'Domain registration received — {domain}',
         'header_text': 'Registration Received',
-        'body_text':   'Hi {name},\n\nThank you for registering {domain}. Your request is under review.\n\nWe\'ll be in touch once a decision has been made.',
+        'body_text':   'Hi {name},\n\nThank you for registering {domain}. Your request is under review.',
         'footer_text': 'ephemeralREST',
     },
     'register-approved': {
@@ -1449,6 +1490,12 @@ _TEMPLATE_CONTENT_DEFAULTS = {
         'subject':     'Your API key has been rotated',
         'header_text': 'API Key Rotated',
         'body_text':   'Hi {name},\n\nYour API key for {identifier} has been rotated.\n\nNew key:\n\n{api_key}\n\nSave this key — it will not be shown again.',
+        'footer_text': 'ephemeralREST',
+    },
+    'user-activated': {
+        'subject':     'Your API key is ready',
+        'header_text': 'API Key Activated',
+        'body_text':   'Hi {name},\n\nYour email has been verified and your API key is now active.\n\nYour API key:\n\n{api_key}\n\nSave this key — it will not be shown again.',
         'footer_text': 'ephemeralREST',
     },
 }
@@ -1565,6 +1612,34 @@ def me():
 # Admin — Key management endpoints
 # ---------------------------------------------------------------------------
 
+@api.route('/admin/keys/<int:key_id>/set-type', methods=['POST'])
+def admin_set_key_type(key_id):
+    """Change the key_type of an API key between 'domain' and 'user'. Admin only."""
+    user = getattr(g, 'user', None)
+    if not user or not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    data     = request.get_json(silent=True) or {}
+    key_type = data.get('key_type', '').strip().lower()
+
+    if key_type not in ('domain', 'user'):
+        return _error("key_type must be 'domain' or 'user'", 400)
+
+    key_record = db_manager.get_api_key_by_id(key_id)
+    if not key_record:
+        return _error('Key not found', 404)
+
+    if key_record.get('key_type') == key_type:
+        return _error(f'Key is already of type {key_type!r}', 400)
+
+    db_manager.update_api_key(key_id, key_type=key_type)
+    logger.info(
+        f"Admin [{user.get('identifier')}] changed key_id={key_id} "
+        f"type: {key_record.get('key_type')} → {key_type}"
+    )
+    return jsonify({'message': f"Key type updated to '{key_type}'", 'key_id': key_id, 'key_type': key_type})
+
+
 @api.route('/admin/keys', methods=['GET'])
 def admin_list_keys():
     """
@@ -1669,6 +1744,25 @@ def admin_rotate_key(key_id):
         return _error(f'Failed to update key {key_id}', 500)
 
     logger.info(f"Admin rotated key {key_id} (identifier={record['identifier']})")
+
+    # Determine the contact email for this key
+    # Domain keys: use registration contact_email; user keys: identifier is the email
+    to_email = None
+    if record.get('key_type') == 'user':
+        to_email = record.get('identifier')
+    else:
+        reg = next(
+            (r for r in db_manager.get_registration_requests()
+             if r.get('api_key_id') == key_id),
+            None
+        )
+        if reg:
+            to_email = reg.get('contact_email')
+
+    if to_email:
+        email_svc = EmailService()
+        email_svc.send_key_rotated(to_email, record.get('name', ''), record['identifier'], plaintext, template=_resolve_template('key-rotated'))
+        logger.info(f"Key rotation email sent to '{to_email}' (key_id={key_id})")
 
     return jsonify({
         'message':    f'Key rotated for {record["identifier"]}',
@@ -1885,6 +1979,23 @@ def me_rotate():
 
     logger.info(f"Self-rotated key {key_id} (identifier={record['identifier']})")
 
+    # Send the new key by email
+    to_email = record.get('identifier') if record.get('key_type') == 'user' else None
+    if not to_email:
+        # Domain key — look up the registration contact email
+        reg = next(
+            (r for r in db_manager.get_registration_requests()
+             if r.get('api_key_id') == key_id),
+            None
+        )
+        if reg:
+            to_email = reg.get('contact_email')
+
+    if to_email:
+        email_svc = EmailService()
+        email_svc.send_key_rotated(to_email, record.get('name', ''), record['identifier'], plaintext, template=_resolve_template('key-rotated'))
+        logger.info(f"Key rotation email sent to '{to_email}' (key_id={key_id})")
+
     return jsonify({
         'message':    'Key rotated successfully',
         'key_id':     key_id,
@@ -1994,7 +2105,7 @@ def admin_test_smtp():
             'SMTP is not configured. Set host, user, and password first.', 400
         )
 
-    sent = svc.send_test_email(to_email)
+    sent = svc.send_test_email(to_email, template=_resolve_template('test'))
 
     if sent:
         return jsonify({'message': f'Test email sent to {to_email}'})

@@ -174,6 +174,7 @@ def create_app(config_class=Config):
         'api.next_apsides',
         'api.lunations',
         'api.ephemeris',
+        'api.eclipses',
         'api.admin_list_registrations',
         'api.admin_approve_registration',
         'api.admin_reject_registration',
@@ -181,6 +182,7 @@ def create_app(config_class=Config):
         'api.admin_set_email_template',
         'api.admin_reset_email_template',
         'api.admin_set_key_admin',
+        'api.admin_set_key_type',
     ]
     for _endpoint in _protected:
         app.view_functions[_endpoint] = auth_manager.require_api_key(

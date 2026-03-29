@@ -1,6 +1,6 @@
 ################################################################################
 #                                                                              #
-#  ephemeralREST — Swiss Ephemeris REST API                                   #
+#  ephemeralREST - Swiss Ephemeris REST API                                   #
 #  Copyright (C) 2026  ephemeralREST contributors                             #
 #                                                                              #
 #  This program is free software: you can redistribute it and/or modify       #
@@ -16,7 +16,7 @@
 #  You should have received a copy of the GNU Affero General Public License   #
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.    #
 #                                                                              #
-#  ADDITIONAL NOTICE — Swiss Ephemeris dependency:                             #
+#  ADDITIONAL NOTICE - Swiss Ephemeris dependency:                             #
 #  This software uses the Swiss Ephemeris library developed by                #
 #  Astrodienst AG, Zurich, Switzerland. The Swiss Ephemeris is licensed       #
 #  under the GNU Affero General Public License (AGPL) v3. Use of this        #
@@ -86,7 +86,7 @@ def _load_config() -> dict:
         db = DatabaseManager(os.environ.get('DATABASE_PATH', 'ephemeral.db'))
         db_cfg = db.get_smtp_config()
     except Exception as e:
-        logger.debug(f"SMTP config DB read failed — using env vars: {e}")
+        logger.debug(f"SMTP config DB read failed - using env vars: {e}")
 
     cfg = {}
     for key, (env_var, default) in _ENV_MAP.items():
@@ -126,7 +126,7 @@ class EmailService:
 
     def send_user_verification(self, to_email: str, name: str, token: str) -> bool:
         verify_url = f"{self.portal_url}/verify.php?t={token}"
-        subject    = "ephemeralREST — Verify your email to activate your API key"
+        subject    = "ephemeralREST - Verify your email to activate your API key"
         text = f"""Hello {name},
 
 Thank you for registering with ephemeralREST.
@@ -136,14 +136,14 @@ To activate your API key click the link below:
     {verify_url}
 
 This link expires in 24 hours. Once verified, your API key will be
-shown once — please save it securely.
+shown once - please save it securely.
 
 If you did not request this, ignore this email.
 
 ephemeralREST
 """
         html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">ephemeralREST — Email Verification</h2>
+<h2 style="color:#1F4E79;">ephemeralREST - Email Verification</h2>
 <p>Hello {name},</p>
 <p>Click below to activate your API key:</p>
 <p style="margin:28px 0;">
@@ -159,10 +159,16 @@ ephemeralREST
         return self._send(to_email, subject, text, html)
 
     def send_domain_registration_received(
-            self, to_email: str, name: str, domain: str
+            self, to_email: str, name: str, domain: str, template: dict = None
     ) -> bool:
-        subject = "ephemeralREST — Registration request received"
-        text = f"""Hello {name},
+        vars = {'name': name, 'domain': domain}
+        if template:
+            subject   = self._substitute(template.get('subject') or 'Registration received', vars)
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'ephemeralREST - Registration request received'
+            text_body = f"""Hello {name},
 
 We have received your API key registration request for:
 
@@ -172,24 +178,31 @@ Your request is pending review. We will email your key once approved.
 
 ephemeralREST
 """
-        html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">ephemeralREST — Request Received</h2>
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#1F4E79;">ephemeralREST - Request Received</h2>
 <p>Hello {name},</p>
 <p>We've received your registration request for <strong>{domain}</strong>.</p>
 <p>We'll email your API key once approved.</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
-        return self._send(to_email, subject, text, html)
+        return self._send(to_email, subject, text_body, html_body)
 
     def send_domain_approved(
             self, to_email: str, name: str, domain: str,
-            api_key: str, admin_note: str = None
+            api_key: str, admin_note: str = None, template: dict = None
     ) -> bool:
-        subject   = "ephemeralREST — Your API key is ready"
-        note_text = f"\nNote from admin: {admin_note}\n" if admin_note else ""
-        note_html = f'<p style="color:#555;"><em>Note: {admin_note}</em></p>' if admin_note else ""
-        text = f"""Hello {name},
+        vars = {'name': name, 'domain': domain, 'api_key': api_key,
+                'admin_note': admin_note or ''}
+        if template:
+            subject   = self._substitute(template.get('subject') or 'Registration approved', vars)
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            note_text = f"\nNote from admin: {admin_note}\n" if admin_note else ""
+            note_html = f'<p style="color:#555;"><em>Note: {admin_note}</em></p>' if admin_note else ""
+            subject   = "ephemeralREST - Your API key is ready"
+            text_body = f"""Hello {name},
 
 Your API key registration for '{domain}' has been approved.
 
@@ -205,41 +218,48 @@ Use it in every API request:
 
 ephemeralREST
 """
-        html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">ephemeralREST — API Key Approved ✓</h2>
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#375623;">ephemeralREST - API Key Approved </h2>
 <p>Hello {name},</p>
 <p>Your registration for <strong>{domain}</strong> has been approved.</p>
 {note_html}
 <p><strong>Your API key:</strong></p>
 <p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
-<p style="color:#c00;font-weight:bold;">⚠ Save this key — it will not be shown again.</p>
+<p style="color:#c00;font-weight:bold;">Save this key - it will not be shown again.</p>
 <p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
-        return self._send(to_email, subject, text, html)
+        return self._send(to_email, subject, text_body, html_body)
 
     def send_domain_rejected(
-            self, to_email: str, name: str, domain: str, admin_note: str = None
+            self, to_email: str, name: str, domain: str,
+            admin_note: str = None, template: dict = None
     ) -> bool:
-        subject   = "ephemeralREST — Registration not approved"
-        note_text = f"\n{admin_note}\n" if admin_note else "\nContact us if you believe this is an error.\n"
-        note_html = f'<p>{admin_note}</p>' if admin_note else '<p>Contact us if you believe this is an error.</p>'
-        text = f"""Hello {name},
+        vars = {'name': name, 'domain': domain, 'admin_note': admin_note or ''}
+        if template:
+            subject   = self._substitute(template.get('subject') or 'Registration update', vars)
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            note_text = f"\n{admin_note}\n" if admin_note else "\nContact us if you believe this is an error.\n"
+            note_html = f'<p>{admin_note}</p>' if admin_note else '<p>Contact us if you believe this is an error.</p>'
+            subject   = "ephemeralREST - Registration not approved"
+            text_body = f"""Hello {name},
 
 Your API key registration for '{domain}' could not be approved.
 {note_text}
 ephemeralREST
 """
-        html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#833C00;">ephemeralREST — Not Approved</h2>
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#833C00;">ephemeralREST - Not Approved</h2>
 <p>Hello {name},</p>
 <p>Your registration for <strong>{domain}</strong> could not be approved.</p>
 {note_html}
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
-        return self._send(to_email, subject, text, html)
+        return self._send(to_email, subject, text_body, html_body)
 
     def send_user_key_activated(
             self, to_email: str, name: str, api_key: str, template: dict = None
@@ -270,12 +290,54 @@ Include it in every API request as the X-API-Key header:
 ephemeralREST
 """
             html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">ephemeralREST — API Key Activated ✓</h2>
+<h2 style="color:#375623;">ephemeralREST - API Key Activated</h2>
 <p>Hello {name},</p>
 <p>Your email address has been verified and your API key is now active.</p>
 <p><strong>Your API key:</strong></p>
 <p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
-<p style="color:#c00;font-weight:bold;">⚠ Save this key — it will not be shown again.</p>
+<p style="color:#c00;font-weight:bold;">Save this key - it will not be shown again.</p>
+<p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
+<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
+</body></html>"""
+        return self._send(to_email, subject, text_body, html_body)
+
+    def send_key_rotated(
+            self, to_email: str, name: str, identifier: str, api_key: str, template: dict = None
+    ) -> bool:
+        """Notify a key holder that their key has been rotated and deliver the new key."""
+        vars = {'name': name, 'identifier': identifier, 'api_key': api_key}
+
+        if template:
+            subject   = template.get('subject') or 'Your API key has been rotated'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Your ephemeralREST API key has been rotated'
+            text_body = f"""Hello {name},
+
+Your API key for {identifier} has been rotated.
+
+Your new API key:
+
+    {api_key}
+
+IMPORTANT: This key will not be shown again. Save it securely now.
+Your previous key has been deactivated.
+
+Include it in every API request as the X-API-Key header:
+
+    X-API-Key: {api_key}
+
+ephemeralREST
+"""
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#375623;">ephemeralREST - API Key Rotated</h2>
+<p>Hello {name},</p>
+<p>Your API key for <strong>{identifier}</strong> has been rotated.</p>
+<p><strong>Your new API key:</strong></p>
+<p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
+<p style="color:#c00;font-weight:bold;">Save this key - it will not be shown again. Your previous key has been deactivated.</p>
 <p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
@@ -287,11 +349,11 @@ ephemeralREST
             reason: str, request_id: int
     ) -> bool:
         if not self.admin_email:
-            return True  # no admin email configured — silently skip
+            return True  # no admin email configured - silently skip
 
         approve_url = f"{self.base_url}/admin/registrations/{request_id}/approve"
         reject_url  = f"{self.base_url}/admin/registrations/{request_id}/reject"
-        subject     = f"ephemeralREST — New registration: {domain}"
+        subject     = f"ephemeralREST - New registration: {domain}"
         text = f"""New registration request:
 
   Domain:  {domain}
@@ -301,7 +363,7 @@ ephemeralREST
   ID:      {request_id}
 """
         html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">New Registration — {domain}</h2>
+<h2 style="color:#1F4E79;">New Registration - {domain}</h2>
 <table style="width:100%;border-collapse:collapse;">
   <tr><td style="padding:8px;color:#666;width:80px;">Domain</td><td style="padding:8px;"><strong>{domain}</strong></td></tr>
   <tr><td style="padding:8px;color:#666;">Name</td><td style="padding:8px;">{name}</td></tr>
@@ -316,29 +378,93 @@ ephemeralREST
 </body></html>"""
         return self._send(self.admin_email, subject, text, html)
 
-    def send_test_email(self, to_email: str) -> bool:
+    def send_test_email(self, to_email: str, template: dict = None) -> bool:
         """Send a test message to verify SMTP configuration."""
-        subject = "ephemeralREST — SMTP configuration test"
-        text    = "This is a test email from ephemeralREST confirming SMTP is working."
-        html    = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">ephemeralREST — SMTP Test ✓</h2>
+        if template:
+            subject   = template.get('subject') or 'ephemeralREST - SMTP test'
+            text_body = template.get('body_text') or 'This is a test email confirming SMTP is working.'
+            html_body = self._render_template_html(template)
+        else:
+            subject   = 'ephemeralREST - SMTP configuration test'
+            text_body = 'This is a test email from ephemeralREST confirming SMTP is working.'
+            html_body = """<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#375623;">ephemeralREST - SMTP Test </h2>
 <p>Your SMTP configuration is working correctly.</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
-        return self._send(to_email, subject, text, html)
+        return self._send(to_email, subject, text_body, html_body)
 
     # -------------------------------------------------------------------------
-    # Internal
+    # Template helpers
+    # -------------------------------------------------------------------------
+
+    def _substitute(self, text: str, vars: dict) -> str:
+        """Replace {key} placeholders in text with values from vars dict."""
+        for k, v in vars.items():
+            text = text.replace('{' + k + '}', str(v) if v is not None else '')
+        return text
+
+    def _render_template_html(self, template: dict, vars: dict = None) -> str:
+        """Render a full styled HTML email from a template dict."""
+        bg_color      = template.get('bg_color', '#f4f4f4')
+        panel_color   = template.get('panel_color', '#ffffff')
+        text_color    = template.get('text_color', '#1a1a1a')
+        content_width = int(template.get('content_width', 600))
+        header_align  = template.get('header_align', 'left')
+        header_text   = template.get('header_text', 'ephemeralREST')
+        body_text     = template.get('body_text', '')
+        footer_text   = template.get('footer_text', 'ephemeralREST')
+
+        if vars:
+            header_text = self._substitute(header_text, vars)
+            body_text   = self._substitute(body_text, vars)
+            footer_text = self._substitute(footer_text, vars)
+
+        # Convert plain line breaks to HTML paragraphs
+        body_html = ''.join(
+            f'<p style="margin:0 0 12px;">{line}</p>' if line.strip() else '<br>'
+            for line in body_text.split('\n')
+        )
+
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:{bg_color};font-family:Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:{bg_color};padding:32px 16px;">
+    <tr><td align="center">
+      <table width="{content_width}" cellpadding="0" cellspacing="0"
+             style="max-width:{content_width}px;background:{panel_color};border-radius:6px;overflow:hidden;">
+        <tr>
+          <td style="padding:28px 32px 20px;border-bottom:1px solid #e0e0e0;text-align:{header_align};">
+            <span style="font-size:18px;font-weight:600;color:{text_color};">{header_text}</span>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 32px;color:{text_color};font-size:14px;line-height:1.6;">
+            {body_html}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 32px;background:{panel_color};color:#888;font-size:12px;border-top:1px solid #e0e0e0;">
+            {footer_text}
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
+
+    # -------------------------------------------------------------------------
+    # Internal send
     # -------------------------------------------------------------------------
 
     def _send(self, to: str, subject: str, text_body: str, html_body: str) -> bool:
         if not self.enabled:
             logger.warning(
-                f"SMTP not configured — skipping '{subject}' to {to}. "
+                f"SMTP not configured - skipping '{subject}' to {to}. "
                 "Configure via the admin SMTP settings page."
             )
-            return True  # non-fatal — caller continues normally
+            return True  # non-fatal - caller continues normally
 
         try:
             msg            = MIMEMultipart('alternative')

@@ -336,6 +336,20 @@ class EphemerisSchema(Schema):
 
 
 
+class EclipseSchema(Schema):
+    """Schema for eclipses endpoint"""
+    reference_date = fields.Str(
+        required=True,
+        error_messages={'required': 'reference_date is required'}
+    )
+    years_ahead = fields.Int(
+        load_default=5,
+        validate=validate.Range(min=1, max=50,
+            error='years_ahead must be between 1 and 50')
+    )
+
+
+
 class RegisterDomainSchema(Schema):
     domain         = fields.Str(required=True, validate=validate.Length(min=3, max=200))
     name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))

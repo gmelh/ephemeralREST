@@ -349,9 +349,7 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_hash            ON derived_charts(chart_hash)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_last_accessed   ON derived_charts(last_accessed)')
 
-            # ------------------------------------------------------------------
             # Email templates
-            # ------------------------------------------------------------------
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS email_templates
                 (
@@ -1316,7 +1314,7 @@ class DatabaseManager:
     def update_api_key(self, key_id: int, **fields) -> bool:
         """Update one or more fields on an API key record."""
         allowed = {
-            'name', 'key_enc', 'key_prefix', 'admin', 'active',
+            'name', 'key_enc', 'key_prefix', 'admin', 'active', 'key_type',
             'rate_per_minute', 'rate_per_hour', 'rate_per_day', 'output_config'
         }
         updates = {k: v for k, v in fields.items() if k in allowed}

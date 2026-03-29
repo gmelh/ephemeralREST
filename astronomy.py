@@ -980,56 +980,37 @@ class AstronomyService:
                     f"in {'month ' + str(month) + ' of ' if month else ''}year {year}"
                 )
 
-            # ----------------------------------------------------------------
-            # Hybrid Newton's method + bisection refinement
-            #
-            # We know the crossing lies in [lo_jd, hi_jd].  Newton's step is
-            # used when it stays inside the bracket (fast quadratic convergence).
-            # Bisection is the safe fallback when Newton would escape the bracket
-            # or when speed is near zero — guaranteeing convergence in all cases.
-            # ----------------------------------------------------------------
-            lo_jd = bracket_jd
-            hi_jd = bracket_jd + step
-
-            # Sign of diff at lo_jd: positive means target is ahead of the
-            # planet at lo_jd (the expected state at the bracket start).
-            pos_lo, _  = swe.calc_ut(lo_jd, planet_id, flags)
-            lo_diff    = target_longitude - pos_lo[0]
-            if lo_diff >  180.0: lo_diff -= 360.0
-            if lo_diff < -180.0: lo_diff += 360.0
-            lo_positive = lo_diff >= 0
-
-            jd = lo_jd
+            # Newton's method refinement
+            jd = bracket_jd
             for _ in range(max_iterations):
                 pos, _  = swe.calc_ut(jd, planet_id, flags)
                 lon     = pos[0]
                 speed   = pos[3]  # degrees per day
 
+                if abs(speed) < 0.0001:
+                    return None, f"Planet speed near zero — cannot converge"
+
+                # Angular difference accounting for wrap
                 diff = target_longitude - lon
-                if diff >  180.0: diff -= 360.0
-                if diff < -180.0: diff += 360.0
+                if diff > 180.0:
+                    diff -= 360.0
+                elif diff < -180.0:
+                    diff += 360.0
 
                 if abs(diff) < tolerance:
                     return jd, None
 
-                # Narrow the bracket using the sign of diff
-                curr_positive = diff >= 0
-                if curr_positive == lo_positive:
-                    lo_jd = jd   # same sign as lo → lo advances
-                else:
-                    hi_jd = jd   # opposite sign → hi retreats
+                jd += diff / speed
 
-                # Try Newton step; fall back to bisection if:
-                #   • speed is too small (avoids division instability), or
-                #   • the candidate falls outside the current bracket
-                use_bisection = abs(speed) < 0.0001
-                if not use_bisection:
-                    candidate = jd + diff / speed
-                    use_bisection = not (lo_jd < candidate < hi_jd)
+            # Final check after max iterations
+            pos, _ = swe.calc_ut(jd, planet_id, flags)
+            diff   = abs(target_longitude - pos[0])
+            if diff > 180.0:
+                diff = 360.0 - diff
+            if diff < 0.001:
+                return jd, None
 
-                jd = (lo_jd + hi_jd) / 2.0 if use_bisection else candidate
-
-            return None, f"Return search did not converge after {max_iterations} iterations"
+            return None, f"Newton's method did not converge (final diff={diff:.6f}°)"
 
         except Exception as e:
             return None, f"Return search failed: {str(e)}"
@@ -1833,3 +1814,175 @@ class AstronomyService:
         except Exception as e:
             logger.error(f"Monthly ephemeris error: {str(e)}")
             return None, f"Monthly ephemeris failed: {str(e)}"
+
+    # ==========================================================================
+    # Eclipse calculations
+    # ==========================================================================
+
+    # Swiss Ephemeris eclipse type bit flags
+    _ECL_TOTAL         = 4
+    _ECL_ANNULAR       = 8
+    _ECL_PARTIAL       = 16
+    _ECL_ANNULAR_TOTAL = 32   # hybrid solar eclipse
+    _ECL_PENUMBRAL     = 64   # lunar penumbral
+
+    def _solar_eclipse_type(self, retval: int) -> str:
+        if retval & self._ECL_ANNULAR_TOTAL: return 'hybrid'
+        if retval & self._ECL_TOTAL:         return 'total'
+        if retval & self._ECL_ANNULAR:       return 'annular'
+        if retval & self._ECL_PARTIAL:       return 'partial'
+        return 'unknown'
+
+    def _lunar_eclipse_type(self, retval: int) -> str:
+        if retval & self._ECL_TOTAL:       return 'total'
+        if retval & self._ECL_PARTIAL:     return 'partial'
+        if retval & self._ECL_PENUMBRAL:   return 'penumbral'
+        return 'unknown'
+
+    def calculate_eclipses(
+            self,
+            reference_date: datetime,
+            years_ahead: int = 5,
+    ) -> Tuple[Optional[list], Optional[str]]:
+        """
+        Find all solar and lunar eclipses within a given time window.
+
+        Searches from reference_date forward for years_ahead years.
+        Both solar and lunar eclipses are returned, sorted chronologically.
+
+        For each eclipse the disc obscuration is the fraction of the
+        Sun/Moon diameter covered at maximum eclipse (0.0–1.0).
+        Totality is represented as 1.0 regardless of the raw magnitude.
+
+        Args:
+            reference_date: Start of the search window
+            years_ahead:    Number of years to search forward (max 50)
+
+        Returns:
+            Tuple of (eclipses_list, error_message)
+            Each entry: {
+                type, eclipse_type, datetime_utc, julian_day,
+                magnitude, obscuration, saros_series, saros_member
+            }
+        """
+        years_ahead = max(1, min(50, years_ahead))
+
+        start_jd = swe.julday(
+            reference_date.year, reference_date.month, reference_date.day,
+            reference_date.hour + reference_date.minute / 60.0 + reference_date.second / 3600.0
+        )
+        end_jd = start_jd + years_ahead * 365.25
+
+        eclipses = []
+
+        # ── Solar eclipses ────────────────────────────────────────────────────
+        jd = start_jd
+        max_iterations = years_ahead * 6   # ~4–5 solar eclipses per year max
+        _solar_logged = False
+        for _ in range(max_iterations):
+            try:
+                raw = swe.sol_eclipse_when_glob(jd + 0.001, swe.FLG_SWIEPH, False)
+                if not _solar_logged:
+                    logger.debug(f"sol_eclipse_when_glob returned {len(raw)} values: types={[type(v).__name__ for v in raw]}")
+                    _solar_logged = True
+                if len(raw) == 3:
+                    retval, tret, attr = raw
+                elif len(raw) == 2:
+                    retval, tret = raw
+                    attr = []
+                else:
+                    break
+            except Exception as e:
+                logger.warning(f"Solar eclipse search error at jd={jd:.1f}: {e}")
+                break
+
+            if retval == 0 or not tret or tret[0] == 0:
+                break
+            if tret[0] > end_jd:
+                break
+
+            eclipse_type = self._solar_eclipse_type(retval)
+
+            # attr[0] = fraction of solar disc obscured (0–1, or >1 for total)
+            # attr[1] = ratio of apparent Moon/Sun diameters (eclipse magnitude)
+            raw_obscuration = float(attr[0]) if attr else 0.0
+            magnitude       = float(attr[1]) if attr and len(attr) > 1 else None
+            obscuration     = round(min(1.0, max(0.0, raw_obscuration)), 4)
+
+            # Saros series data
+            saros_series = int(attr[6]) if attr and len(attr) > 6 and attr[6] else None
+            saros_member = int(attr[7]) if attr and len(attr) > 7 and attr[7] else None
+
+            dt = self._jd_to_datetime(tret[0])
+            eclipses.append({
+                'type':         'solar',
+                'eclipse_type': eclipse_type,
+                'datetime_utc': dt.isoformat(),
+                'julian_day':   round(tret[0], 6),
+                'magnitude':    round(magnitude, 4) if magnitude is not None else None,
+                'obscuration':  obscuration,
+                'saros_series': saros_series,
+                'saros_member': saros_member,
+            })
+
+            jd = tret[0] + 25   # advance past this eclipse (shortest cycle ~29 days)
+
+        # ── Lunar eclipses ────────────────────────────────────────────────────
+        jd = start_jd
+        max_iterations = years_ahead * 6
+        for _ in range(max_iterations):
+            try:
+                raw = swe.lun_eclipse_when(jd + 0.001, swe.FLG_SWIEPH, False)
+                if len(raw) == 3:
+                    retval, tret, attr = raw
+                elif len(raw) == 2:
+                    retval, tret = raw
+                    attr = []
+                else:
+                    break
+            except Exception as e:
+                logger.warning(f"Lunar eclipse search error at jd={jd:.1f}: {e}")
+                break
+
+            if retval == 0 or not tret or tret[0] == 0:
+                break
+            if tret[0] > end_jd:
+                break
+
+            eclipse_type = self._lunar_eclipse_type(retval)
+
+            # attr[0] = penumbral magnitude
+            # attr[1] = umbral magnitude (negative means no umbral contact)
+            penumbral_mag = float(attr[0]) if attr else 0.0
+            umbral_mag    = float(attr[1]) if attr and len(attr) > 1 else 0.0
+
+            # Obscuration: umbral fraction for umbral eclipses, penumbral fraction otherwise
+            if eclipse_type in ('total', 'partial'):
+                obscuration = round(min(1.0, max(0.0, umbral_mag)), 4)
+            else:
+                obscuration = round(min(1.0, max(0.0, penumbral_mag)), 4)
+
+            saros_series = int(attr[4]) if attr and len(attr) > 4 and attr[4] else None
+            saros_member = int(attr[5]) if attr and len(attr) > 5 and attr[5] else None
+
+            dt = self._jd_to_datetime(tret[0])
+            eclipses.append({
+                'type':            'lunar',
+                'eclipse_type':    eclipse_type,
+                'datetime_utc':    dt.isoformat(),
+                'julian_day':      round(tret[0], 6),
+                'magnitude':       round(penumbral_mag, 4),
+                'umbral_magnitude': round(umbral_mag, 4) if umbral_mag > 0 else None,
+                'obscuration':     obscuration,
+                'saros_series':    saros_series,
+                'saros_member':    saros_member,
+            })
+
+            jd = tret[0] + 25
+
+        eclipses.sort(key=lambda e: e['julian_day'])
+        logger.info(
+            f"Eclipse search: {reference_date.date()} + {years_ahead}yr → "
+            f"{len(eclipses)} eclipses found"
+        )
+        return eclipses, None
