@@ -70,6 +70,7 @@ _ENV_MAP = {
     'use_ssl':     ('SMTP_SSL',      'false'),
     'admin_email': ('ADMIN_EMAIL',   ''),
     'base_url':    ('API_BASE_URL',  'http://localhost:5000'),
+    'portal_url':  ('PORTAL_URL',    ''),
 }
 
 
@@ -110,6 +111,7 @@ class EmailService:
         self.use_ssl     = cfg['use_ssl'].lower()  in ('true', '1', 'yes')
         self.admin_email = cfg['admin_email']
         self.base_url    = cfg['base_url'].rstrip('/')
+        self.portal_url  = cfg['portal_url'].rstrip('/') if cfg.get('portal_url') else self.base_url
         self.enabled     = bool(self.host and self.user and self.password)
 
         if not self.enabled:
@@ -123,7 +125,7 @@ class EmailService:
     # -------------------------------------------------------------------------
 
     def send_user_verification(self, to_email: str, name: str, token: str) -> bool:
-        verify_url = f"{self.base_url}/register/verify?t={token}"
+        verify_url = f"{self.portal_url}/verify.php?t={token}"
         subject    = "ephemeralREST — Verify your email to activate your API key"
         text = f"""Hello {name},
 
@@ -238,6 +240,47 @@ ephemeralREST
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
         return self._send(to_email, subject, text, html)
+
+    def send_user_key_activated(
+            self, to_email: str, name: str, api_key: str, template: dict = None
+    ) -> bool:
+        """Send the API key to a user after their email address is verified."""
+        vars = {'name': name, 'identifier': to_email, 'api_key': api_key}
+
+        if template:
+            subject   = template.get('subject') or 'Your ephemeralREST API key is ready'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Your ephemeralREST API key is ready'
+            text_body = f"""Hello {name},
+
+Your email address has been verified and your ephemeralREST API key is now active.
+
+Your API key:
+
+    {api_key}
+
+IMPORTANT: This key will not be shown again. Save it securely now.
+
+Include it in every API request as the X-API-Key header:
+
+    X-API-Key: {api_key}
+
+ephemeralREST
+"""
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#375623;">ephemeralREST — API Key Activated ✓</h2>
+<p>Hello {name},</p>
+<p>Your email address has been verified and your API key is now active.</p>
+<p><strong>Your API key:</strong></p>
+<p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
+<p style="color:#c00;font-weight:bold;">⚠ Save this key — it will not be shown again.</p>
+<p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
+<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
+</body></html>"""
+        return self._send(to_email, subject, text_body, html_body)
 
     def send_admin_new_registration(
             self, domain: str, name: str, contact_email: str,

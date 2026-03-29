@@ -349,7 +349,95 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_hash            ON derived_charts(chart_hash)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_last_accessed   ON derived_charts(last_accessed)')
 
+            # ------------------------------------------------------------------
+            # Email templates
+            # ------------------------------------------------------------------
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS email_templates
+                (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            VARCHAR(64) UNIQUE NOT NULL,
+                    bg_color        VARCHAR(16)  NOT NULL DEFAULT '#f4f4f4',
+                    panel_color     VARCHAR(16)  NOT NULL DEFAULT '#ffffff',
+                    text_color      VARCHAR(16)  NOT NULL DEFAULT '#1a1a1a',
+                    content_width   INTEGER      NOT NULL DEFAULT 600,
+                    header_align    VARCHAR(8)   NOT NULL DEFAULT 'left',
+                    subject         TEXT,
+                    header_text     TEXT,
+                    body_text       TEXT,
+                    footer_text     TEXT,
+                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             logger.info("Database initialized successfully")
+
+    # ==========================================================================
+    # Email template methods
+    # ==========================================================================
+
+    def get_email_template(self, name: str) -> Optional[Dict[str, Any]]:
+        """Return stored overrides for a named template, or None if not customised."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                'SELECT * FROM email_templates WHERE name = ?', (name,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_email_template(self, name: str, fields: Dict[str, Any]) -> bool:
+        """Insert or update a named email template."""
+        allowed = {
+            'bg_color', 'panel_color', 'text_color', 'content_width',
+            'header_align', 'subject', 'header_text', 'body_text', 'footer_text',
+        }
+        safe = {k: v for k, v in fields.items() if k in allowed}
+        if not safe:
+            return False
+        with self.get_connection() as conn:
+            existing = conn.execute(
+                'SELECT id FROM email_templates WHERE name = ?', (name,)
+            ).fetchone()
+            if existing:
+                sets = ', '.join(f'{k} = ?' for k in safe)
+                conn.execute(
+                    f'UPDATE email_templates SET {sets}, updated_at = CURRENT_TIMESTAMP WHERE name = ?',
+                    [*safe.values(), name]
+                )
+            else:
+                cols = 'name, ' + ', '.join(safe)
+                vals = ', '.join('?' * (len(safe) + 1))
+                conn.execute(
+                    f'INSERT INTO email_templates ({cols}) VALUES ({vals})',
+                    [name, *safe.values()]
+                )
+            return True
+
+    def reset_email_template(self, name: str) -> bool:
+        """Delete stored overrides for a named template, reverting to code defaults."""
+        with self.get_connection() as conn:
+            conn.execute('DELETE FROM email_templates WHERE name = ?', (name,))
+            return True
+
+    # ==========================================================================
+    # Key admin methods
+    # ==========================================================================
+
+    def set_key_admin(self, key_id: int, admin: bool) -> bool:
+        """Grant or revoke admin status on a key."""
+        with self.get_connection() as conn:
+            conn.execute(
+                'UPDATE api_keys SET admin = ? WHERE id = ?',
+                (1 if admin else 0, key_id)
+            )
+            return True
+
+    def count_admin_keys(self) -> int:
+        """Return the number of currently active admin keys."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM api_keys WHERE admin = 1 AND active = 1"
+            ).fetchone()
+            return row[0] if row else 0
 
     # ==========================================================================
     # Existing location cache methods (unchanged — used by charts FK)
@@ -968,7 +1056,7 @@ class DatabaseManager:
 
     SMTP_KEYS = [
         'host', 'port', 'user', 'password', 'from_addr',
-        'use_tls', 'use_ssl', 'admin_email', 'base_url',
+        'use_tls', 'use_ssl', 'admin_email', 'base_url', 'portal_url',
     ]
 
     def get_smtp_config(self) -> Dict[str, str]:

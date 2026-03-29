@@ -980,37 +980,56 @@ class AstronomyService:
                     f"in {'month ' + str(month) + ' of ' if month else ''}year {year}"
                 )
 
-            # Newton's method refinement
-            jd = bracket_jd
+            # ----------------------------------------------------------------
+            # Hybrid Newton's method + bisection refinement
+            #
+            # We know the crossing lies in [lo_jd, hi_jd].  Newton's step is
+            # used when it stays inside the bracket (fast quadratic convergence).
+            # Bisection is the safe fallback when Newton would escape the bracket
+            # or when speed is near zero — guaranteeing convergence in all cases.
+            # ----------------------------------------------------------------
+            lo_jd = bracket_jd
+            hi_jd = bracket_jd + step
+
+            # Sign of diff at lo_jd: positive means target is ahead of the
+            # planet at lo_jd (the expected state at the bracket start).
+            pos_lo, _  = swe.calc_ut(lo_jd, planet_id, flags)
+            lo_diff    = target_longitude - pos_lo[0]
+            if lo_diff >  180.0: lo_diff -= 360.0
+            if lo_diff < -180.0: lo_diff += 360.0
+            lo_positive = lo_diff >= 0
+
+            jd = lo_jd
             for _ in range(max_iterations):
                 pos, _  = swe.calc_ut(jd, planet_id, flags)
                 lon     = pos[0]
                 speed   = pos[3]  # degrees per day
 
-                if abs(speed) < 0.0001:
-                    return None, f"Planet speed near zero — cannot converge"
-
-                # Angular difference accounting for wrap
                 diff = target_longitude - lon
-                if diff > 180.0:
-                    diff -= 360.0
-                elif diff < -180.0:
-                    diff += 360.0
+                if diff >  180.0: diff -= 360.0
+                if diff < -180.0: diff += 360.0
 
                 if abs(diff) < tolerance:
                     return jd, None
 
-                jd += diff / speed
+                # Narrow the bracket using the sign of diff
+                curr_positive = diff >= 0
+                if curr_positive == lo_positive:
+                    lo_jd = jd   # same sign as lo → lo advances
+                else:
+                    hi_jd = jd   # opposite sign → hi retreats
 
-            # Final check after max iterations
-            pos, _ = swe.calc_ut(jd, planet_id, flags)
-            diff   = abs(target_longitude - pos[0])
-            if diff > 180.0:
-                diff = 360.0 - diff
-            if diff < 0.001:
-                return jd, None
+                # Try Newton step; fall back to bisection if:
+                #   • speed is too small (avoids division instability), or
+                #   • the candidate falls outside the current bracket
+                use_bisection = abs(speed) < 0.0001
+                if not use_bisection:
+                    candidate = jd + diff / speed
+                    use_bisection = not (lo_jd < candidate < hi_jd)
 
-            return None, f"Newton's method did not converge (final diff={diff:.6f}°)"
+                jd = (lo_jd + hi_jd) / 2.0 if use_bisection else candidate
+
+            return None, f"Return search did not converge after {max_iterations} iterations"
 
         except Exception as e:
             return None, f"Return search failed: {str(e)}"

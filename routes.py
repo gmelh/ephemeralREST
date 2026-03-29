@@ -1235,8 +1235,9 @@ def verify_email():
 
     Query param: t — the verification token from the email
 
-    The plaintext API key is returned once in the response.
-    The token is marked used and the key activated.
+    Activates the key, emails the plaintext key to the user,
+    and returns JSON. The portal's verify.php page calls this
+    endpoint and renders the result as a proper page.
     """
     token = request.args.get('t', '').strip()
     if not token:
@@ -1250,8 +1251,8 @@ def verify_email():
     email  = record['email']
 
     # Retrieve and decrypt the pending plaintext key
-    all_keys    = db_manager.get_all_api_keys(include_inactive=True)
-    key_record  = next((k for k in all_keys if k['id'] == key_id), None)
+    all_keys   = db_manager.get_all_api_keys(include_inactive=True)
+    key_record = next((k for k in all_keys if k['id'] == key_id), None)
     if not key_record:
         return _error('Key record not found', 500)
 
@@ -1260,26 +1261,26 @@ def verify_email():
     crypto = KeyCrypto(Config.SECRET_KEY)
 
     # Retrieve pending reveal, activate key, clear reveal field
-    output_cfg  = key_record.get('output_config') or {}
-    reveal_enc  = output_cfg.pop('_pending_reveal', None)
-    plaintext   = crypto.decrypt(reveal_enc) if reveal_enc else None
+    output_cfg = key_record.get('output_config') or {}
+    reveal_enc = output_cfg.pop('_pending_reveal', None)
+    plaintext  = crypto.decrypt(reveal_enc) if reveal_enc else None
 
     db_manager.update_api_key(key_id, active=1, output_config=output_cfg or None)
     db_manager.mark_email_verification_used(token)
 
     logger.info(f"Email verified: '{email}' (key_id={key_id}) — key activated")
 
-    response = {
-        'message':    'Email verified. Your API key is active.',
+    # Email the API key — the only delivery point for the plaintext key
+    if plaintext:
+        email_svc = EmailService()
+        email_svc.send_user_key_activated(email, key_record.get('name', ''), plaintext)
+        logger.info(f"API key emailed to '{email}' (key_id={key_id})")
+
+    return jsonify({
+        'message':    'Email verified. Your API key has been sent to your email address.',
         'email':      email,
         'key_active': True,
-    }
-
-    if plaintext:
-        response['api_key'] = plaintext
-        response['warning'] = 'Save this key — it will not be shown again'
-
-    return jsonify(response)
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1408,130 @@ def admin_reject_registration(validated_data, request_id):
         'domain':     reg['domain'],
         'email_sent': bool(reg.get('contact_email')),
     })
+
+
+# ---------------------------------------------------------------------------
+# Admin — Email templates
+# ---------------------------------------------------------------------------
+
+_TEMPLATE_CONTENT_DEFAULTS = {
+    'test': {
+        'subject':     'Test email from ephemeralREST',
+        'header_text': 'Test Email',
+        'body_text':   'This is a test email from ephemeralREST.\n\nIf you received this, your SMTP configuration is working correctly.',
+        'footer_text': 'ephemeralREST',
+    },
+    'register-domain': {
+        'subject':     'Domain registration received — {domain}',
+        'header_text': 'Registration Received',
+        'body_text':   'Hi {name},\n\nThank you for registering {domain}. Your request is under review.\n\nWe\'ll be in touch once a decision has been made.',
+        'footer_text': 'ephemeralREST',
+    },
+    'register-approved': {
+        'subject':     'Domain registration approved — {domain}',
+        'header_text': 'Registration Approved',
+        'body_text':   'Hi {name},\n\nYour registration for {domain} has been approved.\n\nYour API key:\n\n{api_key}\n\nSave this key — it will not be shown again.\n\n{admin_note}',
+        'footer_text': 'ephemeralREST',
+    },
+    'register-rejected': {
+        'subject':     'Domain registration update — {domain}',
+        'header_text': 'Registration Update',
+        'body_text':   'Hi {name},\n\nYour registration for {domain} was not approved at this time.\n\n{admin_note}',
+        'footer_text': 'ephemeralREST',
+    },
+    'user-verify': {
+        'subject':     'Verify your email address',
+        'header_text': 'Verify Your Email',
+        'body_text':   'Hi {name},\n\nPlease verify your email address to activate your API key:\n\n{verify_url}\n\nThis link expires in 24 hours.',
+        'footer_text': 'ephemeralREST',
+    },
+    'key-rotated': {
+        'subject':     'Your API key has been rotated',
+        'header_text': 'API Key Rotated',
+        'body_text':   'Hi {name},\n\nYour API key for {identifier} has been rotated.\n\nNew key:\n\n{api_key}\n\nSave this key — it will not be shown again.',
+        'footer_text': 'ephemeralREST',
+    },
+}
+
+_TEMPLATE_APPEARANCE_DEFAULTS = {
+    'bg_color':      '#f4f4f4',
+    'panel_color':   '#ffffff',
+    'text_color':    '#1a1a1a',
+    'content_width': 600,
+    'header_align':  'left',
+}
+
+
+def _resolve_template(name: str) -> dict:
+    """Merge DB overrides onto hardcoded defaults for a named template."""
+    defaults = {**_TEMPLATE_APPEARANCE_DEFAULTS, **_TEMPLATE_CONTENT_DEFAULTS.get(name, {})}
+    stored   = db_manager.get_email_template(name)
+    if stored:
+        for k, v in stored.items():
+            if k not in ('id', 'name', 'updated_at') and v is not None:
+                defaults[k] = v
+    return defaults
+
+
+@api.route('/admin/email-templates/<name>', methods=['GET'])
+def admin_get_email_template(name):
+    """Return the resolved template (DB overrides merged onto defaults)."""
+    if name not in _TEMPLATE_CONTENT_DEFAULTS:
+        return _error(f"Unknown template '{name}'", 404)
+    return jsonify(_resolve_template(name))
+
+
+@api.route('/admin/email-templates/<name>', methods=['POST'])
+def admin_set_email_template(name):
+    """Save appearance and content overrides for a named template."""
+    if name not in _TEMPLATE_CONTENT_DEFAULTS:
+        return _error(f"Unknown template '{name}'", 404)
+    data = request.get_json(silent=True) or {}
+    ok   = db_manager.set_email_template(name, data)
+    if not ok:
+        return _error('No valid fields provided', 400)
+    return jsonify({'message': f"Template '{name}' saved", 'template': _resolve_template(name)})
+
+
+@api.route('/admin/email-templates/<name>/reset', methods=['POST'])
+def admin_reset_email_template(name):
+    """Delete DB overrides for a named template, reverting to code defaults."""
+    if name not in _TEMPLATE_CONTENT_DEFAULTS:
+        return _error(f"Unknown template '{name}'", 404)
+    db_manager.reset_email_template(name)
+    return jsonify({'message': f"Template '{name}' reset to defaults", 'template': _resolve_template(name)})
+
+
+# ---------------------------------------------------------------------------
+# Admin — Key admin promotion
+# ---------------------------------------------------------------------------
+
+@api.route('/admin/keys/<int:key_id>/set-admin', methods=['POST'])
+def admin_set_key_admin(key_id):
+    """Grant or revoke admin status on a key."""
+    user = getattr(g, 'user', None)
+    if not user or not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    data  = request.get_json(silent=True) or {}
+    admin = bool(data.get('admin', False))
+
+    if key_id == int(user.get('id', 0)):
+        return _error('You cannot modify your own admin status', 400)
+
+    if not admin and db_manager.count_admin_keys() <= 1:
+        return _error('Cannot remove the last admin key', 400)
+
+    key_record = db_manager.get_api_key_by_id(key_id)
+    if not key_record:
+        return _error('Key not found', 404)
+
+    db_manager.set_key_admin(key_id, admin)
+    logger.info(
+        f"Admin [{user.get('identifier')}] {'granted' if admin else 'revoked'} "
+        f"admin on key_id={key_id}"
+    )
+    return jsonify({'message': f"Admin {'granted' if admin else 'revoked'}", 'key_id': key_id, 'admin': admin})
 
 
 
@@ -1832,7 +1957,7 @@ def admin_set_smtp():
 
     allowed = {
         'host', 'port', 'user', 'password', 'from_addr',
-        'use_tls', 'use_ssl', 'admin_email', 'base_url',
+        'use_tls', 'use_ssl', 'admin_email', 'base_url', 'portal_url',
     }
     config = {k: str(v) for k, v in data.items() if k in allowed}
 
