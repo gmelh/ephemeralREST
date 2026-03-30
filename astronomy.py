@@ -1839,6 +1839,233 @@ class AstronomyService:
         if retval & self._ECL_PENUMBRAL:   return 'penumbral'
         return 'unknown'
 
+    def _eclipse_attr_from_positions(self, jd_approx: float, is_solar: bool,
+                                      eclipse_type: str = None) -> dict:
+        """
+        Compute eclipse magnitude, obscuration, and Saros data from geometry.
+
+        Solar eclipses:
+            tret[0] from pyswisseph is the new-moon conjunction time, not the
+            moment of minimum Sun-Moon separation. Scan ±6 hours in fine steps
+            to find the actual minimum, then compute attributes there.
+
+        Lunar eclipses:
+            Obscuration is measured against Earth's shadow centre (antisolar
+            point), not the Sun itself. sep(Sun, Moon) ≈ 180° at full moon —
+            what matters is how close the Moon is to (sun_lon+180°, -sun_lat).
+        """
+        import math
+
+        saros_series = saros_member = None
+
+        # ── Get Saros data via sol_eclipse_where + sol_eclipse_how ──────────
+        # sol_eclipse_when_glob doesn't return attr; sol_eclipse_where gives
+        # the geographic coordinates of greatest eclipse, and sol_eclipse_how
+        # at those coordinates returns the full attr array with Saros data.
+        if is_solar:
+            try:
+                where_raw = swe.sol_eclipse_where(jd_approx, swe.FLG_SWIEPH)
+                # Returns (retval, pathpos, attr) or (retval, pathpos) — extract pathpos
+                pathpos = None
+                if isinstance(where_raw, (list, tuple)):
+                    for item in where_raw:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            try:
+                                float(item[0]); float(item[1])
+                                pathpos = item
+                                break
+                            except (TypeError, ValueError):
+                                pass
+                geopos = [float(pathpos[0]), float(pathpos[1]), 0.0] if pathpos else [0.0, 0.0, 0.0]
+                how_raw = swe.sol_eclipse_how(jd_approx, swe.FLG_SWIEPH, geopos)
+                if isinstance(how_raw, (list, tuple)):
+                    for item in how_raw:
+                        if isinstance(item, (list, tuple)) and len(item) > 7:
+                            saros_series = int(item[6]) if item[6] else None
+                            saros_member = int(item[7]) if item[7] else None
+                            break
+            except Exception as e:
+                logger.debug(f"sol_eclipse_where/how Saros lookup failed: {e}")
+
+        # ── Angular separation helper ─────────────────────────────────────────
+        def _sep(lon_a, lat_a, lon_b, lat_b):
+            la = math.radians(lat_a); lb = math.radians(lat_b)
+            dl = math.radians(lon_a - lon_b)
+            c  = math.sin(la)*math.sin(lb) + math.cos(la)*math.cos(lb)*math.cos(dl)
+            return math.degrees(math.acos(max(-1.0, min(1.0, c))))
+
+        # ── Circle overlap fraction (fraction of circle R covered by circle r) ─
+        def _overlap(R, r, d):
+            if R <= 0 or r <= 0: return 0.0
+            if d >= R + r:       return 0.0
+            if d <= abs(R - r):  return min(r, R) ** 2 / R ** 2
+            ca = max(-1.0, min(1.0, (d*d + R*R - r*r) / (2*d*R)))
+            cb = max(-1.0, min(1.0, (d*d + r*r - R*R) / (2*d*r)))
+            a  = math.acos(ca); b = math.acos(cb)
+            area = (R*R*a + r*r*b
+                    - R*R*math.sin(a)*math.cos(a)
+                    - r*r*math.sin(b)*math.cos(b))
+            return min(1.0, area / (math.pi * R * R))
+
+        # ── Apparent radius in degrees from dist_au and body_radius_km ────────
+        km_per_au = 149_597_870.7
+        def _R_deg(radius_km, dist_au):
+            return math.degrees(math.atan2(radius_km, dist_au * km_per_au))
+
+        try:
+            if is_solar:
+                # ── Solar eclipse ────────────────────────────────────────────
+                # Scan ±6 hours around the reported eclipse time in 10-min steps
+                # to find the moment of minimum Sun–Moon angular separation.
+                scan_step = 10.0 / 1440.0   # 10 minutes in days
+                scan_half = 6.0 / 24.0      # 6 hours in days
+
+                best_jd   = jd_approx
+                best_sep  = 999.0
+                scan_jd   = jd_approx - scan_half
+                end_scan  = jd_approx + scan_half
+
+                while scan_jd <= end_scan:
+                    sp, _ = swe.calc_ut(scan_jd, swe.SUN,  swe.FLG_SWIEPH)
+                    mp, _ = swe.calc_ut(scan_jd, swe.MOON, swe.FLG_SWIEPH)
+                    s = _sep(sp[0], sp[1], mp[0], mp[1])
+                    if s < best_sep:
+                        best_sep = s
+                        best_jd  = scan_jd
+                    scan_jd += scan_step
+
+                # Refine with 1-minute steps around best
+                scan_jd  = best_jd - 15.0/1440.0
+                end_scan = best_jd + 15.0/1440.0
+                fine_step = 1.0 / 1440.0
+                while scan_jd <= end_scan:
+                    sp, _ = swe.calc_ut(scan_jd, swe.SUN,  swe.FLG_SWIEPH)
+                    mp, _ = swe.calc_ut(scan_jd, swe.MOON, swe.FLG_SWIEPH)
+                    s = _sep(sp[0], sp[1], mp[0], mp[1])
+                    if s < best_sep:
+                        best_sep = s
+                        best_jd  = scan_jd
+                    scan_jd += fine_step
+
+                # Compute attributes at minimum separation
+                sp, _ = swe.calc_ut(best_jd, swe.SUN,  swe.FLG_SWIEPH)
+                mp, _ = swe.calc_ut(best_jd, swe.MOON, swe.FLG_SWIEPH)
+                R_sun  = _R_deg(696_000.0, float(sp[2]))
+                R_moon = _R_deg(1_737.4,   float(mp[2]))
+                sep    = best_sep
+
+                logger.info(
+                    f"Solar eclipse attr (type={eclipse_type}): "
+                    f"min_sep={sep:.4f}° R_sun={R_sun:.4f}° R_moon={R_moon:.4f}° "
+                    f"at {self._jd_to_datetime(best_jd).isoformat()}"
+                )
+
+                magnitude   = (R_sun + R_moon - sep) / (2 * R_sun)
+                obscuration = round(_overlap(R_sun, R_moon, sep), 4)
+
+                # Sanity: if type says total/hybrid but geometry disagrees, correct it
+                if eclipse_type in ('total', 'hybrid') and obscuration < 1.0:
+                    obscuration = 1.0
+                    magnitude   = max(magnitude, 1.0)
+
+                return {
+                    'magnitude':    round(magnitude, 4),
+                    'obscuration':  obscuration,
+                    'saros_series': saros_series,
+                    'saros_member': saros_member,
+                }
+
+            else:
+                # ── Lunar eclipse ────────────────────────────────────────────
+                # Scan ±6 hours to find moment of minimum Moon-to-shadow separation.
+                # Earth's shadow centre = antisolar point (sun_lon+180°, -sun_lat).
+                scan_step = 10.0 / 1440.0
+                scan_half = 6.0  / 24.0
+
+                best_jd   = jd_approx
+                best_sep  = 999.0
+                scan_jd   = jd_approx - scan_half
+                end_scan  = jd_approx + scan_half
+
+                while scan_jd <= end_scan:
+                    sp, _ = swe.calc_ut(scan_jd, swe.SUN,  swe.FLG_SWIEPH)
+                    mp, _ = swe.calc_ut(scan_jd, swe.MOON, swe.FLG_SWIEPH)
+                    shadow_lon = (float(sp[0]) + 180.0) % 360.0
+                    shadow_lat = -float(sp[1])
+                    s = _sep(shadow_lon, shadow_lat, float(mp[0]), float(mp[1]))
+                    if s < best_sep:
+                        best_sep = s
+                        best_jd  = scan_jd
+                    scan_jd += scan_step
+
+                # Refine
+                scan_jd  = best_jd - 15.0/1440.0
+                end_scan = best_jd + 15.0/1440.0
+                fine_step = 1.0 / 1440.0
+                while scan_jd <= end_scan:
+                    sp, _ = swe.calc_ut(scan_jd, swe.SUN,  swe.FLG_SWIEPH)
+                    mp, _ = swe.calc_ut(scan_jd, swe.MOON, swe.FLG_SWIEPH)
+                    shadow_lon = (float(sp[0]) + 180.0) % 360.0
+                    shadow_lat = -float(sp[1])
+                    s = _sep(shadow_lon, shadow_lat, float(mp[0]), float(mp[1]))
+                    if s < best_sep:
+                        best_sep = s
+                        best_jd  = scan_jd
+                    scan_jd += fine_step
+
+                # Compute at minimum
+                sp, _ = swe.calc_ut(best_jd, swe.SUN,  swe.FLG_SWIEPH)
+                mp, _ = swe.calc_ut(best_jd, swe.MOON, swe.FLG_SWIEPH)
+                R_sun_km   = 696_000.0
+                earth_r_km = 6_371.0
+                sun_dist   = float(sp[2])
+                moon_dist  = float(mp[2])
+                R_moon     = _R_deg(1_737.4, moon_dist)
+
+                # Earth's umbra and penumbra radii at Moon's distance
+                umbra_km   = earth_r_km - R_sun_km * (moon_dist / sun_dist)
+                penumb_km  = earth_r_km + R_sun_km * (moon_dist / sun_dist)
+                R_umbra    = _R_deg(max(0.0, umbra_km), moon_dist) if umbra_km > 0 else 0.0
+                R_penumbra = _R_deg(penumb_km, moon_dist)
+
+                sep = best_sep
+
+                umbral_mag    = (R_umbra   + R_moon - sep) / (2 * R_moon) if R_umbra > 0 else -1
+                penumbral_mag = (R_penumbra + R_moon - sep) / (2 * R_moon)
+
+                logger.info(
+                    f"Lunar eclipse attr (type={eclipse_type}): "
+                    f"shadow_sep={sep:.4f}° R_umbra={R_umbra:.4f}° "
+                    f"R_penumbra={R_penumbra:.4f}° R_moon={R_moon:.4f}° "
+                    f"umbral_mag={umbral_mag:.4f} at {self._jd_to_datetime(best_jd).isoformat()}"
+                )
+
+                if umbral_mag > 0:
+                    obscuration = round(_overlap(R_moon, R_umbra, sep), 4)
+                else:
+                    obscuration = round(_overlap(R_moon, R_penumbra, sep), 4)
+
+                # Sanity check for total lunar
+                if eclipse_type == 'total' and obscuration < 1.0:
+                    obscuration = 1.0
+
+                return {
+                    'magnitude':        round(max(0.0, penumbral_mag), 4),
+                    'umbral_magnitude': round(umbral_mag, 4) if umbral_mag > 0 else None,
+                    'obscuration':      obscuration,
+                    'saros_series':     saros_series,
+                    'saros_member':     saros_member,
+                }
+
+        except Exception as e:
+            logger.warning(f"Eclipse attr computation failed: {e}")
+            # Last resort fallback
+            if eclipse_type in ('total', 'hybrid'):
+                return {'magnitude': 1.01, 'obscuration': 1.0,
+                        'saros_series': saros_series, 'saros_member': saros_member}
+            return {'magnitude': None, 'obscuration': 0.0,
+                    'saros_series': saros_series, 'saros_member': saros_member}
+
     def calculate_eclipses(
             self,
             reference_date: datetime,
@@ -1903,15 +2130,19 @@ class AstronomyService:
 
             eclipse_type = self._solar_eclipse_type(retval)
 
-            # attr[0] = fraction of solar disc obscured (0–1, or >1 for total)
-            # attr[1] = ratio of apparent Moon/Sun diameters (eclipse magnitude)
-            raw_obscuration = float(attr[0]) if attr else 0.0
-            magnitude       = float(attr[1]) if attr and len(attr) > 1 else None
-            obscuration     = round(min(1.0, max(0.0, raw_obscuration)), 4)
-
-            # Saros series data
-            saros_series = int(attr[6]) if attr and len(attr) > 6 and attr[6] else None
-            saros_member = int(attr[7]) if attr and len(attr) > 7 and attr[7] else None
+            if attr:
+                raw_obscuration = float(attr[0]) if attr else 0.0
+                magnitude       = float(attr[1]) if len(attr) > 1 else None
+                obscuration     = round(min(1.0, max(0.0, raw_obscuration)), 4)
+                saros_series    = int(attr[6]) if len(attr) > 6 and attr[6] else None
+                saros_member    = int(attr[7]) if len(attr) > 7 and attr[7] else None
+            else:
+                computed     = self._eclipse_attr_from_positions(tret[0], is_solar=True,
+                                                                  eclipse_type=eclipse_type)
+                magnitude    = computed['magnitude']
+                obscuration  = computed['obscuration']
+                saros_series = computed['saros_series']
+                saros_member = computed['saros_member']
 
             dt = self._jd_to_datetime(tret[0])
             eclipses.append({
@@ -1951,31 +2182,37 @@ class AstronomyService:
 
             eclipse_type = self._lunar_eclipse_type(retval)
 
-            # attr[0] = penumbral magnitude
-            # attr[1] = umbral magnitude (negative means no umbral contact)
-            penumbral_mag = float(attr[0]) if attr else 0.0
-            umbral_mag    = float(attr[1]) if attr and len(attr) > 1 else 0.0
-
-            # Obscuration: umbral fraction for umbral eclipses, penumbral fraction otherwise
-            if eclipse_type in ('total', 'partial'):
-                obscuration = round(min(1.0, max(0.0, umbral_mag)), 4)
+            if attr:
+                penumbral_mag = float(attr[0]) if attr else 0.0
+                umbral_mag    = float(attr[1]) if len(attr) > 1 else 0.0
+                if eclipse_type in ('total', 'partial'):
+                    obscuration = round(min(1.0, max(0.0, umbral_mag)), 4)
+                else:
+                    obscuration = round(min(1.0, max(0.0, penumbral_mag)), 4)
+                saros_series = int(attr[4]) if len(attr) > 4 and attr[4] else None
+                saros_member = int(attr[5]) if len(attr) > 5 and attr[5] else None
+                umbral_out   = round(umbral_mag, 4) if umbral_mag > 0 else None
             else:
-                obscuration = round(min(1.0, max(0.0, penumbral_mag)), 4)
-
-            saros_series = int(attr[4]) if attr and len(attr) > 4 and attr[4] else None
-            saros_member = int(attr[5]) if attr and len(attr) > 5 and attr[5] else None
+                computed      = self._eclipse_attr_from_positions(tret[0], is_solar=False,
+                                                                   eclipse_type=eclipse_type)
+                penumbral_mag = computed['magnitude']
+                umbral_mag    = computed.get('umbral_magnitude')
+                obscuration   = computed['obscuration']
+                saros_series  = computed['saros_series']
+                saros_member  = computed['saros_member']
+                umbral_out    = umbral_mag
 
             dt = self._jd_to_datetime(tret[0])
             eclipses.append({
-                'type':            'lunar',
-                'eclipse_type':    eclipse_type,
-                'datetime_utc':    dt.isoformat(),
-                'julian_day':      round(tret[0], 6),
-                'magnitude':       round(penumbral_mag, 4),
-                'umbral_magnitude': round(umbral_mag, 4) if umbral_mag > 0 else None,
-                'obscuration':     obscuration,
-                'saros_series':    saros_series,
-                'saros_member':    saros_member,
+                'type':             'lunar',
+                'eclipse_type':     eclipse_type,
+                'datetime_utc':     dt.isoformat(),
+                'julian_day':       round(tret[0], 6),
+                'magnitude':        round(penumbral_mag, 4) if penumbral_mag is not None else None,
+                'umbral_magnitude': umbral_out,
+                'obscuration':      obscuration,
+                'saros_series':     saros_series,
+                'saros_member':     saros_member,
             })
 
             jd = tret[0] + 25

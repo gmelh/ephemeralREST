@@ -1126,7 +1126,7 @@ curl -X POST https://api.yourdomain.com/me/output \
 
 #### `POST /me/rotate`
 
-Generate a new API key. Your current key stops working immediately and cannot be recovered. The new key is returned in the response — save it immediately.
+Generate a new API key. Your current key stops working immediately. The new key is returned in the response **and emailed to your registered address** — save it immediately.
 
 ```bash
 curl -X POST https://api.yourdomain.com/me/rotate \
@@ -1264,15 +1264,124 @@ curl -X POST https://api.yourdomain.com/register/domain \
 
 ---
 
+#### `POST /register/user`
+
+Register a personal user key tied to your email address. No authentication required. A verification email is sent immediately — no admin approval is needed.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `email` | string | Yes | Your email address — becomes your key identifier |
+| `name` | string | Yes | Your name |
+
+```bash
+curl -X POST https://api.yourdomain.com/register/user \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "jane@example.com",
+    "name": "Jane Smith"
+  }'
+```
+
+```json
+{
+  "message": "If this email is not already registered, a verification email has been sent"
+}
+```
+
+The response is intentionally generic to avoid leaking whether a given email is already registered. Check your inbox for a verification link. The link leads to `verify.php` on the admin portal and expires after 24 hours.
+
+---
+
 #### `GET /register/verify?t=<token>`
 
-Activate a user key via email verification link. This endpoint is typically called by clicking the link in the verification email rather than directly.
+Activate a user key via the email verification token. This endpoint is called automatically when the user clicks the link in their verification email — it is not normally called directly.
 
 ```bash
 curl "https://api.yourdomain.com/register/verify?t=your-verification-token"
 ```
 
-On success, returns the API key. **This is the only time the key is ever shown** — copy it immediately.
+On success, the key is activated and emailed to the registered address. The key is **never returned in the JSON response** — it is delivered by email only.
+
+```json
+{
+  "message": "Email verified. Your API key has been sent to your email address.",
+  "email": "jane@example.com",
+  "key_active": true
+}
+```
+
+If the token is invalid, expired, or already used, a `400` error is returned. The admin portal's `verify.php` page handles both the redirect from this endpoint and the display of a user-facing result page.
+
+---
+
+### Eclipses
+
+#### `POST /eclipses`
+
+Find all solar and lunar eclipses within a time window. Results are sorted chronologically and include the eclipse type, disc obscuration, magnitude, and Saros series data for each event.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `reference_date` | string | Yes | Start of the search window |
+| `years_ahead` | integer | No | How many years forward to search. Range 1–50. Default: 5 |
+
+```bash
+curl -X POST https://api.yourdomain.com/eclipses \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: eph_your_key_here" \
+  -d '{
+    "reference_date": "2026-03-29",
+    "years_ahead": 5
+  }'
+```
+
+```json
+{
+  "reference_date": "2026-03-29",
+  "years_ahead": 5,
+  "count": 22,
+  "eclipses": [
+    {
+      "type": "solar",
+      "eclipse_type": "total",
+      "datetime_utc": "2026-08-12T17:45:59",
+      "julian_day": 2461265.240269,
+      "magnitude": 1.038,
+      "obscuration": 1.0,
+      "saros_series": 126,
+      "saros_member": 54
+    },
+    {
+      "type": "lunar",
+      "eclipse_type": "partial",
+      "datetime_utc": "2026-08-28T04:12:57",
+      "julian_day": 2461280.675671,
+      "magnitude": 1.9394,
+      "umbral_magnitude": 0.9048,
+      "obscuration": 0.9408,
+      "saros_series": null,
+      "saros_member": null
+    }
+  ]
+}
+```
+
+**Eclipse types**
+
+| `type` | `eclipse_type` values |
+|---|---|
+| `solar` | `total`, `annular`, `hybrid`, `partial` |
+| `lunar` | `total`, `partial`, `penumbral` |
+
+**Field descriptions**
+
+| Field | Description |
+|---|---|
+| `magnitude` | Solar: eclipse magnitude (Moon/Sun diameter ratio at maximum). Lunar: penumbral magnitude |
+| `umbral_magnitude` | Lunar only: umbral magnitude. Positive means the Moon enters the umbra; present only for total and partial lunar eclipses |
+| `obscuration` | Fraction of the disc covered at maximum (0.0–1.0). For total eclipses this is always 1.0 |
+| `saros_series` | Saros series number. Solar only — populated when available |
+| `saros_member` | Member number within the Saros series. Solar only |
 
 ---
 
@@ -1283,8 +1392,9 @@ On success, returns the API key. **This is the only time the key is ever shown**
 | `GET` | `/health` | No | Server status |
 | `GET` | `/autocomplete?q=` | No | Location autocomplete |
 | `POST` | `/locations/resolve` | No | Resolve place to coordinates |
-| `POST` | `/register/domain` | No | Request an API key |
-| `GET` | `/register/verify?t=` | No | Verify email and activate key |
+| `POST` | `/register/domain` | No | Request a domain API key |
+| `POST` | `/register/user` | No | Register a personal user key |
+| `GET` | `/register/verify?t=` | No | Verify email and activate user key |
 | `GET` | `/me` | Yes | Your key identity and settings |
 | `GET` | `/me/output` | Yes | Your output configuration |
 | `POST` | `/me/output` | Yes | Update your output configuration |
@@ -1303,3 +1413,4 @@ On success, returns the API key. **This is the only time the key is ever shown**
 | `POST` | `/apsides` | Yes | Current apside positions |
 | `POST` | `/apsides/next` | Yes | Next apside events |
 | `POST` | `/lunations` | Yes | Lunation events |
+| `POST` | `/eclipses` | Yes | Solar and lunar eclipses |

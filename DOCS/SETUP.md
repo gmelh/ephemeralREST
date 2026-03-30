@@ -381,6 +381,12 @@ SMTP_FROM=ephemeralREST <no-reply@yourdomain.com>
 SMTP_TLS=true
 ADMIN_EMAIL=admin@yourdomain.com
 API_BASE_URL=https://api.yourdomain.com
+PORTAL_URL=https://admin.yourdomain.com
+```
+
+> **`PORTAL_URL`** — the public URL of the ephemeralADMIN portal. Used in user verification emails to construct the link `{PORTAL_URL}/verify.php?t={token}`. If not set, verification links point to the API instead, which returns raw JSON rather than a user-friendly page. This variable must be set for user key self-registration to work correctly end-to-end.
+
+SMTP settings configured via environment variables can be overridden at any time through the admin portal's SMTP Settings page. Database values take precedence over environment variables.
 ```
 
 ---
