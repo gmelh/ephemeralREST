@@ -175,6 +175,8 @@ def create_app(config_class=Config):
         'api.lunations',
         'api.ephemeris',
         'api.eclipses',
+        'api.save_view',
+        'api.update_view',
         'api.admin_list_registrations',
         'api.admin_approve_registration',
         'api.admin_reject_registration',

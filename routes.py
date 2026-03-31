@@ -38,7 +38,7 @@ import logging
 import pytz
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
-from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterDomainSchema, RegisterUserSchema, AdminReviewSchema
+from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterDomainSchema, RegisterUserSchema, AdminReviewSchema, SaveViewSchema
 from output_config import OutputConfig
 from email_service import EmailService
 import secrets as _secrets
@@ -1122,6 +1122,102 @@ def eclipses(validated_data):
         'years_ahead':    years_ahead,
         'count':          len(result),
         'eclipses':       result,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Views — opaque JSON blob storage, retrieved by UUID
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Views — opaque JSON blob storage, retrieved by UUID
+# ---------------------------------------------------------------------------
+
+@api.route('/views', methods=['POST'])
+@validate_request(SaveViewSchema)
+def save_view(validated_data):
+    """
+    Save a new opaque JSON blob. Always generates a fresh UUID.
+    Returns: { "view_id": "<uuid>" }
+
+    Body: { "data": { ...any JSON... } }
+    """
+    import uuid as _uuid
+    import json
+
+    user   = getattr(g, 'user', {})
+    key_id = int(user.get('id', 0))
+
+    view_id  = str(_uuid.uuid4())
+    data_str = json.dumps(validated_data['data'], separators=(',', ':'))
+
+    try:
+        db_manager.save_view(view_id, key_id, data_str)
+    except Exception as e:
+        logger.error(f"save_view error: {e}")
+        return _error('Failed to save view', 500)
+
+    logger.info(f"View created: {view_id} (key_id={key_id})")
+    return jsonify({'view_id': view_id}), 201
+
+
+@api.route('/views/<view_id>', methods=['PUT'])
+@validate_request(SaveViewSchema)
+def update_view(validated_data, view_id):
+    """
+    Update an existing view blob in place.
+    Returns 404 if the view_id does not exist.
+
+    Body: { "data": { ...any JSON... } }
+    """
+    import json
+
+    user   = getattr(g, 'user', {})
+    key_id = int(user.get('id', 0))
+
+    existing = db_manager.get_view(view_id)
+    if existing is None:
+        return _error(f"View '{view_id}' not found", 404)
+
+    data_str = json.dumps(validated_data['data'], separators=(',', ':'))
+
+    try:
+        db_manager.save_view(view_id, key_id, data_str)
+    except Exception as e:
+        logger.error(f"update_view error: {e}")
+        return _error('Failed to update view', 500)
+
+    logger.info(f"View updated: {view_id} (key_id={key_id})")
+    return jsonify({'view_id': view_id})
+
+
+@api.route('/views', methods=['GET'])
+def get_view():
+    """
+    Retrieve a saved view by UUID. No authentication required.
+    Query string: ?v=<uuid>
+    """
+    import json
+
+    view_id = request.args.get('v', '').strip()
+    if not view_id:
+        return _error('Query parameter v (view UUID) is required', 400)
+
+    record = db_manager.get_view(view_id)
+    if record is None:
+        return _error(f"View '{view_id}' not found", 404)
+
+    try:
+        data = json.loads(record['data'])
+    except Exception:
+        return _error('Stored view data is malformed', 500)
+
+    return jsonify({
+        'view_id':    record['view_id'],
+        'data':       data,
+        'created_at': record['created_at'],
+        'updated_at': record['updated_at'],
     })
 
 

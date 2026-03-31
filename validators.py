@@ -336,6 +336,18 @@ class EphemerisSchema(Schema):
 
 
 
+class RegisterDomainSchema(Schema):
+    domain         = fields.Str(required=True, validate=validate.Length(min=3, max=200))
+    name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    contact_email  = fields.Email(required=True)
+    reason         = fields.Str(load_default=None, validate=validate.Length(max=1000), allow_none=True)
+
+
+class RegisterUserSchema(Schema):
+    email          = fields.Email(required=True)
+    name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+
+
 class EclipseSchema(Schema):
     """Schema for eclipses endpoint"""
     reference_date = fields.Str(
@@ -349,17 +361,9 @@ class EclipseSchema(Schema):
     )
 
 
-
-class RegisterDomainSchema(Schema):
-    domain         = fields.Str(required=True, validate=validate.Length(min=3, max=200))
-    name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))
-    contact_email  = fields.Email(required=True)
-    reason         = fields.Str(load_default=None, validate=validate.Length(max=1000), allow_none=True)
-
-
-class RegisterUserSchema(Schema):
-    email          = fields.Email(required=True)
-    name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+class SaveViewSchema(Schema):
+    """Schema for POST /views and PUT /views/<id> — saves an opaque JSON blob."""
+    data = fields.Dict(required=True, error_messages={'required': 'data is required'})
 
 
 class AdminReviewSchema(Schema):

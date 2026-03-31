@@ -1126,7 +1126,7 @@ curl -X POST https://api.yourdomain.com/me/output \
 
 #### `POST /me/rotate`
 
-Generate a new API key. Your current key stops working immediately. The new key is returned in the response **and emailed to your registered address** — save it immediately.
+Generate a new API key. Your current key stops working immediately and cannot be recovered. The new key is returned in the response — save it immediately.
 
 ```bash
 curl -X POST https://api.yourdomain.com/me/rotate \
@@ -1264,124 +1264,103 @@ curl -X POST https://api.yourdomain.com/register/domain \
 
 ---
 
-#### `POST /register/user`
-
-Register a personal user key tied to your email address. No authentication required. A verification email is sent immediately — no admin approval is needed.
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `email` | string | Yes | Your email address — becomes your key identifier |
-| `name` | string | Yes | Your name |
-
-```bash
-curl -X POST https://api.yourdomain.com/register/user \
-  -H "Content-Type: application/json" \
-  -d '{
-    "email": "jane@example.com",
-    "name": "Jane Smith"
-  }'
-```
-
-```json
-{
-  "message": "If this email is not already registered, a verification email has been sent"
-}
-```
-
-The response is intentionally generic to avoid leaking whether a given email is already registered. Check your inbox for a verification link. The link leads to `verify.php` on the admin portal and expires after 24 hours.
-
----
-
 #### `GET /register/verify?t=<token>`
 
-Activate a user key via the email verification token. This endpoint is called automatically when the user clicks the link in their verification email — it is not normally called directly.
+Activate a user key via email verification link. This endpoint is typically called by clicking the link in the verification email rather than directly.
 
 ```bash
 curl "https://api.yourdomain.com/register/verify?t=your-verification-token"
 ```
 
-On success, the key is activated and emailed to the registered address. The key is **never returned in the JSON response** — it is delivered by email only.
-
-```json
-{
-  "message": "Email verified. Your API key has been sent to your email address.",
-  "email": "jane@example.com",
-  "key_active": true
-}
-```
-
-If the token is invalid, expired, or already used, a `400` error is returned. The admin portal's `verify.php` page handles both the redirect from this endpoint and the display of a user-facing result page.
+On success, returns the API key. **This is the only time the key is ever shown** — copy it immediately.
 
 ---
 
-### Eclipses
+---
 
-#### `POST /eclipses`
+### Views
 
-Find all solar and lunar eclipses within a time window. Results are sorted chronologically and include the eclipse type, disc obscuration, magnitude, and Saros series data for each event.
+A view is a saved JSON blob identified by a UUID. Views exist to enable clean share URLs for chart states — instead of encoding all chart parameters in a long querystring, the client saves the relevant state to a view and shares a minimal URL such as `https://example.com?v=<uuid>`. When someone opens that URL, the client fetches the view by UUID and restores whatever state it stored.
+
+The structure of the JSON is entirely defined by the client application. ephemeralREST stores and returns it opaquely without inspecting or validating its contents.
+
+#### `POST /views`
+
+Save a new view. Always generates a fresh UUID. Returns the UUID to include in share URLs.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `reference_date` | string | Yes | Start of the search window |
-| `years_ahead` | integer | No | How many years forward to search. Range 1–50. Default: 5 |
+| `data` | object | Yes | Any valid JSON object — the client defines the structure |
 
 ```bash
-curl -X POST https://api.yourdomain.com/eclipses \
+curl -X POST https://api.yourdomain.com/views \
   -H "Content-Type: application/json" \
   -H "X-API-Key: eph_your_key_here" \
   -d '{
-    "reference_date": "2026-03-29",
-    "years_ahead": 5
+    "data": {
+      "chart_id": "a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d",
+      "dial_orb": 1.5,
+      "bodies": ["sun", "moon", "mars"],
+      "mode": "bidial"
+    }
   }'
 ```
 
 ```json
-{
-  "reference_date": "2026-03-29",
-  "years_ahead": 5,
-  "count": 22,
-  "eclipses": [
-    {
-      "type": "solar",
-      "eclipse_type": "total",
-      "datetime_utc": "2026-08-12T17:45:59",
-      "julian_day": 2461265.240269,
-      "magnitude": 1.038,
-      "obscuration": 1.0,
-      "saros_series": 126,
-      "saros_member": 54
-    },
-    {
-      "type": "lunar",
-      "eclipse_type": "partial",
-      "datetime_utc": "2026-08-28T04:12:57",
-      "julian_day": 2461280.675671,
-      "magnitude": 1.9394,
-      "umbral_magnitude": 0.9048,
-      "obscuration": 0.9408,
-      "saros_series": null,
-      "saros_member": null
+{ "view_id": "f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d" }
+```
+
+The response is a `201 Created`. The `view_id` is what you embed in a share URL — e.g. `https://yourapp.com?v=f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d`.
+
+---
+
+#### `PUT /views/<view_id>`
+
+Update an existing view in place. The blob is replaced entirely. Returns `404` if the UUID does not exist.
+
+```bash
+curl -X PUT https://api.yourdomain.com/views/f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: eph_your_key_here" \
+  -d '{
+    "data": {
+      "chart_id": "a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d",
+      "dial_orb": 2.0,
+      "bodies": ["sun", "moon", "mars", "saturn"],
+      "mode": "bidial"
     }
-  ]
+  }'
+```
+
+```json
+{ "view_id": "f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d" }
+```
+
+---
+
+#### `GET /views?v=<view_id>`
+
+Retrieve a saved view by UUID. **No authentication required** — this endpoint is public so that share URLs work without a key. Anyone with the UUID can retrieve the view.
+
+```bash
+curl "https://api.yourdomain.com/views?v=f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d"
+```
+
+```json
+{
+  "view_id": "f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d",
+  "data": {
+    "chart_id": "a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d",
+    "dial_orb": 1.5,
+    "bodies": ["sun", "moon", "mars"],
+    "mode": "bidial"
+  },
+  "created_at": "2026-03-31T08:10:00",
+  "updated_at": "2026-03-31T08:10:00"
 }
 ```
 
-**Eclipse types**
-
-| `type` | `eclipse_type` values |
-|---|---|
-| `solar` | `total`, `annular`, `hybrid`, `partial` |
-| `lunar` | `total`, `partial`, `penumbral` |
-
-**Field descriptions**
-
-| Field | Description |
-|---|---|
-| `magnitude` | Solar: eclipse magnitude (Moon/Sun diameter ratio at maximum). Lunar: penumbral magnitude |
-| `umbral_magnitude` | Lunar only: umbral magnitude. Positive means the Moon enters the umbra; present only for total and partial lunar eclipses |
-| `obscuration` | Fraction of the disc covered at maximum (0.0–1.0). For total eclipses this is always 1.0 |
-| `saros_series` | Saros series number. Solar only — populated when available |
-| `saros_member` | Member number within the Saros series. Solar only |
+Returns `404` if the UUID does not exist.
 
 ---
 
@@ -1414,3 +1393,6 @@ curl -X POST https://api.yourdomain.com/eclipses \
 | `POST` | `/apsides/next` | Yes | Next apside events |
 | `POST` | `/lunations` | Yes | Lunation events |
 | `POST` | `/eclipses` | Yes | Solar and lunar eclipses |
+| `POST` | `/views` | Yes | Save a new view |
+| `PUT` | `/views/<id>` | Yes | Update an existing view |
+| `GET` | `/views?v=` | No | Retrieve a view by UUID |

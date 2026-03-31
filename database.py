@@ -368,7 +368,56 @@ class DatabaseManager:
                 )
             ''')
 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS views
+                (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    view_id    TEXT UNIQUE NOT NULL,
+                    key_id     INTEGER NOT NULL REFERENCES api_keys(id),
+                    data       TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
             logger.info("Database initialized successfully")
+
+    # ==========================================================================
+    # View methods
+    # ==========================================================================
+
+    def save_view(self, view_id: str, key_id: int, data: str) -> bool:
+        """
+        Insert or replace a view blob. data is a raw JSON string.
+        Returns True on success.
+        """
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT INTO views (view_id, key_id, data, created_at, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(view_id) DO UPDATE SET
+                    data       = excluded.data,
+                    updated_at = CURRENT_TIMESTAMP
+            ''', (view_id, key_id, data))
+        return True
+
+    def get_view(self, view_id: str) -> Optional[Dict[str, Any]]:
+        """Return a view record by UUID, or None if not found."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                'SELECT view_id, key_id, data, created_at, updated_at '
+                'FROM views WHERE view_id = ?',
+                (view_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            'view_id':    row['view_id'],
+            'key_id':     row['key_id'],
+            'data':       row['data'],
+            'created_at': row['created_at'],
+            'updated_at': row['updated_at'],
+        }
 
     # ==========================================================================
     # Email template methods
