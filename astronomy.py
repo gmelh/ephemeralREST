@@ -133,6 +133,11 @@ class AstronomyService:
 
         Returns:
             Tuple of (result_dict, error_message)
+            result_dict keys:
+                planetary_positions:
+                    geocentric:   dict of body_name -> position (if geocentric enabled)
+                    heliocentric: dict of body_name -> position (if heliocentric enabled)
+                house_cusps: list of house cusp longitudes, or None
         """
         if output_config is None:
             from output_config import OutputConfig
@@ -237,12 +242,16 @@ class AstronomyService:
                 heliocentric_positions['asc'] = None
                 heliocentric_positions['mc']  = None
 
-            result = {}
+            planetary_positions = {}
             if cfg.get('geocentric', True):
-                result['geocentric']  = geocentric_positions
+                planetary_positions['geocentric']  = geocentric_positions
             if cfg.get('heliocentric', True):
-                result['heliocentric'] = heliocentric_positions
-            result['house_cusps'] = house_cusps
+                planetary_positions['heliocentric'] = heliocentric_positions
+
+            result = {
+                'planetary_positions': planetary_positions,
+                'house_cusps':         house_cusps,
+            }
 
             return result, None
 
@@ -455,7 +464,7 @@ class AstronomyService:
 
         Returns:
             Tuple of (result_dict, error_message)
-            result_dict keys: geocentric, heliocentric, house_cusps,
+            result_dict keys: planetary_positions (geocentric, heliocentric), house_cusps,
                               progressed_jd, natal_jd, days_elapsed
         """
         if output_config is None:
@@ -557,7 +566,7 @@ class AstronomyService:
 
         Returns:
             Tuple of (result_dict, error_message)
-            result_dict keys: geocentric, heliocentric, house_cusps,
+            result_dict keys: planetary_positions (geocentric, heliocentric), house_cusps,
                               solar_arc_geo, solar_arc_helio,
                               progressed_jd, natal_jd, days_elapsed, method
         """

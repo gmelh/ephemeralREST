@@ -204,10 +204,7 @@ def calculate(validated_data):
             'house_cusps':    result.get('house_cusps'),
         }
 
-        if output_cfg.get('geocentric', True):
-            response['planetary_positions'] = result.get('geocentric')
-        if output_cfg.get('heliocentric', True):
-            response['heliocentric'] = result.get('heliocentric')
+        response['planetary_positions'] = result.get('planetary_positions')
 
         meta = output_cfg.get('meta', {})
         if meta.get('from_cache', True):
@@ -238,8 +235,7 @@ def get_chart(chart_id):
             'datetime_utc':        chart_data['datetime_utc'],
             'datetime_local':      chart_data['datetime_local'],
             'location':            chart_data['location'],
-            'planetary_positions': stored.get('geocentric'),
-            'heliocentric':        stored.get('heliocentric'),
+            'planetary_positions': stored.get('planetary_positions'),
             'house_cusps':         stored.get('house_cusps'),
             'access_count':        chart_data['access_count'],
             'from_cache':          True
@@ -385,14 +381,16 @@ def secondary_progressions(validated_data, chart_id):
             return _error(error, 500)
 
         # Filter positions to natal bodies only
-        natal_data = natal_chart['chart_data']
-        if result.get('geocentric'):
-            result['geocentric'] = _filter_to_natal_bodies(
-                result['geocentric'], natal_data.get('geocentric', {})
+        natal_data      = natal_chart['chart_data']
+        positions       = result.get('planetary_positions', {})
+        natal_positions = natal_data.get('planetary_positions', {})
+        if positions.get('geocentric'):
+            positions['geocentric'] = _filter_to_natal_bodies(
+                positions['geocentric'], natal_positions.get('geocentric', {})
             )
-        if result.get('heliocentric'):
-            result['heliocentric'] = _filter_to_natal_bodies(
-                result['heliocentric'], natal_data.get('heliocentric', {})
+        if positions.get('heliocentric'):
+            positions['heliocentric'] = _filter_to_natal_bodies(
+                positions['heliocentric'], natal_positions.get('heliocentric', {})
             )
 
         # Auto-name and save as derived chart
@@ -421,10 +419,7 @@ def secondary_progressions(validated_data, chart_id):
             'house_cusps':        result.get('house_cusps'),
         }
 
-        if output_cfg.get('geocentric', True):
-            response['planetary_positions'] = result.get('geocentric')
-        if output_cfg.get('heliocentric', True):
-            response['heliocentric'] = result.get('heliocentric')
+        response['planetary_positions'] = result.get('planetary_positions')
         if prog_location_info:
             response['location'] = {k: v for k, v in prog_location_info.items() if k != 'id'}
 
@@ -479,8 +474,9 @@ def solar_arc_directions(validated_data, chart_id):
         # Strip timezone info — astronomy.py works with naive UTC datetimes
         natal_dt_utc = datetime.fromisoformat(natal_chart['datetime_utc']).replace(tzinfo=None)
 
-        # Natal positions from stored chart data
-        natal_positions = natal_chart['chart_data']
+        # Natal positions from stored chart data — pass the inner planetary_positions
+        # dict so astronomy.py can access .get('geocentric') / .get('heliocentric') directly
+        natal_positions = natal_chart['chart_data'].get('planetary_positions', {})
 
         # Geocode location for directed ASC/MC if provided
         obs_lat = obs_lon = dir_location_info = None
@@ -513,14 +509,16 @@ def solar_arc_directions(validated_data, chart_id):
             return _error(error, 500)
 
         # Filter positions to natal bodies only
-        natal_data = natal_chart['chart_data']
-        if result.get('geocentric'):
-            result['geocentric'] = _filter_to_natal_bodies(
-                result['geocentric'], natal_data.get('geocentric', {})
+        natal_data      = natal_chart['chart_data']
+        positions       = result.get('planetary_positions', {})
+        natal_positions = natal_data.get('planetary_positions', {})
+        if positions.get('geocentric'):
+            positions['geocentric'] = _filter_to_natal_bodies(
+                positions['geocentric'], natal_positions.get('geocentric', {})
             )
-        if result.get('heliocentric'):
-            result['heliocentric'] = _filter_to_natal_bodies(
-                result['heliocentric'], natal_data.get('heliocentric', {})
+        if positions.get('heliocentric'):
+            positions['heliocentric'] = _filter_to_natal_bodies(
+                positions['heliocentric'], natal_positions.get('heliocentric', {})
             )
 
         # Auto-name and save as derived chart
@@ -550,10 +548,7 @@ def solar_arc_directions(validated_data, chart_id):
             'house_cusps':        result.get('house_cusps'),
         }
 
-        if output_cfg.get('geocentric', True):
-            response['planetary_positions'] = result.get('geocentric')
-        if output_cfg.get('heliocentric', True):
-            response['heliocentric'] = result.get('heliocentric')
+        response['planetary_positions'] = result.get('planetary_positions')
         if dir_location_info:
             response['location'] = {k: v for k, v in dir_location_info.items() if k != 'id'}
 
@@ -648,10 +643,7 @@ def solar_return(validated_data, chart_id):
             'house_cusps':        result.get('house_cusps'),
         }
 
-        if output_cfg.get('geocentric', True):
-            response['planetary_positions'] = result.get('geocentric')
-        if output_cfg.get('heliocentric', True):
-            response['heliocentric'] = result.get('heliocentric')
+        response['planetary_positions'] = result.get('planetary_positions')
         if location_info:
             response['location'] = {k: v for k, v in location_info.items() if k != 'id'}
 
@@ -757,10 +749,7 @@ def lunar_return(validated_data, chart_id):
             'house_cusps':         result.get('house_cusps'),
         }
 
-        if output_cfg.get('geocentric', True):
-            response['planetary_positions'] = result.get('geocentric')
-        if output_cfg.get('heliocentric', True):
-            response['heliocentric'] = result.get('heliocentric')
+        response['planetary_positions'] = result.get('planetary_positions')
         if location_info:
             response['location'] = {k: v for k, v in location_info.items() if k != 'id'}
 
@@ -807,8 +796,7 @@ def get_derived_chart(derived_id):
             return _error(f'Derived chart {derived_id} not found', 404)
 
         chart_data = derived.pop('chart_data')
-        derived['planetary_positions'] = chart_data.get('geocentric')
-        derived['heliocentric']        = chart_data.get('heliocentric')
+        derived['planetary_positions'] = chart_data.get('planetary_positions')
         derived['house_cusps']         = chart_data.get('house_cusps')
 
         # Include return-specific metadata if present
