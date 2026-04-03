@@ -159,6 +159,10 @@ class CalculateSchema(Schema):
     # in place, preserving its UUID. chart_id is required when recalc=True.
     recalc   = fields.Bool(load_default=False)
     chart_id = fields.Str(load_default=None, allow_none=True)
+    # Optional note explaining why a recalculation was performed.
+    # Stored in chart_recalculations for audit purposes.
+    # e.g. "Birth time confirmed from birth certificate"
+    recalc_note = fields.Str(load_default=None, allow_none=True, validate=validate.Length(max=500))
 
 
 class AutocompleteSchema(Schema):

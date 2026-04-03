@@ -368,17 +368,119 @@ class DatabaseManager:
                 )
             ''')
 
+            # ------------------------------------------------------------------
+            # Permanent chart archive — never cleaned up, append-only
+            # Records every chart ever calculated for potential recalculation.
+            # INSERT OR IGNORE on chart_id means the first calculation wins;
+            # recalcs update the live charts table but never touch this record.
+            # ------------------------------------------------------------------
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chart_archive
+                (
+                    chart_id            TEXT PRIMARY KEY,
+                    chart_name          TEXT NOT NULL,
+                    datetime_utc        TEXT NOT NULL,
+                    datetime_local      TEXT NOT NULL,
+                    location            TEXT NOT NULL,
+                    first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_archive_name ON chart_archive(chart_name)'
+            )
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_archive_datetime ON chart_archive(datetime_utc)'
+            )
+
+            # ------------------------------------------------------------------
+            # Chart recalculation history — linked to chart_archive
+            # Records every recalculation of a chart, preserving what changed.
+            # A note field allows the reason to be recorded (e.g. "Birth time
+            # confirmed from birth certificate").
+            # ------------------------------------------------------------------
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS chart_recalculations
+                (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chart_id        TEXT NOT NULL
+                                        REFERENCES chart_archive(chart_id),
+                    chart_name      TEXT NOT NULL,
+                    datetime_utc    TEXT NOT NULL,
+                    datetime_local  TEXT NOT NULL,
+                    location        TEXT NOT NULL,
+                    note            TEXT,
+                    recalculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_recalc_chart_id '
+                'ON chart_recalculations(chart_id)'
+            )
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_recalc_at '
+                'ON chart_recalculations(recalculated_at)'
+            )
+
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS views
                 (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    view_id    TEXT UNIQUE NOT NULL,
-                    key_id     INTEGER NOT NULL REFERENCES api_keys(id),
-                    data       TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    view_id       TEXT UNIQUE NOT NULL,
+                    key_id        INTEGER NOT NULL REFERENCES api_keys(id),
+                    data          TEXT NOT NULL,
+                    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+
+            # Migration: add last_accessed to views if missing from older databases
+            cursor.execute("PRAGMA table_info(views)")
+            view_columns = [column[1] for column in cursor.fetchall()]
+            if 'last_accessed' not in view_columns:
+                cursor.execute(
+                    "ALTER TABLE views ADD COLUMN last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                )
+                # Back-fill from updated_at so existing rows get a sensible value
+                cursor.execute(
+                    "UPDATE views SET last_accessed = updated_at WHERE last_accessed IS NULL"
+                )
+                logger.info("Migration: added last_accessed column to views table")
+
+            # ------------------------------------------------------------------
+            # GeoNames cities5000 — offline geocoding / autocomplete source
+            # ------------------------------------------------------------------
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cities
+                (
+                    geoname_id   INTEGER PRIMARY KEY,
+                    name         TEXT NOT NULL,
+                    ascii_name   TEXT NOT NULL,
+                    country_code TEXT NOT NULL,
+                    admin1_code  TEXT,
+                    latitude     REAL NOT NULL,
+                    longitude    REAL NOT NULL,
+                    timezone_id  TEXT NOT NULL,
+                    population   INTEGER
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cities_import_meta
+                (
+                    id          INTEGER PRIMARY KEY CHECK (id = 1),
+                    filename    TEXT NOT NULL,
+                    row_count   INTEGER NOT NULL,
+                    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_ascii  ON cities(ascii_name)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_name   ON cities(name)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_cc     ON cities(country_code)')
 
             logger.info("Database initialized successfully")
 
@@ -402,21 +504,28 @@ class DatabaseManager:
         return True
 
     def get_view(self, view_id: str) -> Optional[Dict[str, Any]]:
-        """Return a view record by UUID, or None if not found."""
+        """Return a view record by UUID, or None if not found.
+        Stamps last_accessed on every successful read for expiry tracking.
+        """
         with self.get_connection() as conn:
             row = conn.execute(
-                'SELECT view_id, key_id, data, created_at, updated_at '
+                'SELECT view_id, key_id, data, created_at, updated_at, last_accessed '
                 'FROM views WHERE view_id = ?',
                 (view_id,)
             ).fetchone()
-        if not row:
-            return None
+            if not row:
+                return None
+            conn.execute(
+                'UPDATE views SET last_accessed = CURRENT_TIMESTAMP WHERE view_id = ?',
+                (view_id,)
+            )
         return {
-            'view_id':    row['view_id'],
-            'key_id':     row['key_id'],
-            'data':       row['data'],
-            'created_at': row['created_at'],
-            'updated_at': row['updated_at'],
+            'view_id':       row['view_id'],
+            'key_id':        row['key_id'],
+            'data':          row['data'],
+            'created_at':    row['created_at'],
+            'updated_at':    row['updated_at'],
+            'last_accessed': row['last_accessed'],
         }
 
     # ==========================================================================
@@ -1094,8 +1203,154 @@ class DatabaseManager:
                 logger.info(f"Deleted derived chart {derived_id}")
             return deleted
 
+    def delete_chart(self, chart_id: str) -> bool:
+        """
+        Delete a natal chart and all its derived charts in a single transaction.
+        Derived charts are removed first to satisfy the FK constraint.
+        Returns True if the natal chart was found and deleted.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM derived_charts WHERE chart_id = ?', (chart_id,))
+            derived_count = cursor.rowcount
+            cursor.execute('DELETE FROM charts WHERE id = ?', (chart_id,))
+            deleted = cursor.rowcount > 0
+            if deleted:
+                logger.info(
+                    f"Deleted chart {chart_id} and {derived_count} derived chart(s)"
+                )
+        return deleted
 
 
+
+
+    def archive_chart(
+        self,
+        chart_id:       str,
+        chart_name:     str,
+        datetime_utc:   str,
+        datetime_local: str,
+        location:       str,
+    ) -> bool:
+        """
+        Permanently record a chart in the archive.
+
+        Uses INSERT OR IGNORE so that recalculations (which reuse the same
+        chart_id) never overwrite the original entry. The archive reflects
+        the first time a chart was calculated, not the most recent.
+
+        Call this from the route layer where the resolved location string
+        (formatted_address) is already available.
+
+        Returns True if a new archive record was created, False if one
+        already existed for this chart_id (i.e. a recalculation).
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO chart_archive
+                (chart_id, chart_name, datetime_utc, datetime_local, location)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (chart_id, chart_name, datetime_utc, datetime_local, location)
+            )
+            created = cursor.rowcount > 0
+        if created:
+            logger.info(f"Chart archived: {chart_id} ('{chart_name}', {location})")
+        return created
+
+    def record_recalculation(
+        self,
+        chart_id:       str,
+        chart_name:     str,
+        datetime_utc:   str,
+        datetime_local: str,
+        location:       str,
+        note:           str = None,
+    ) -> int:
+        """
+        Record a recalculation against an existing chart_archive entry.
+
+        Every call appends a new row — the full history of recalculations
+        is preserved in insertion order. The note field should describe why
+        the recalculation was performed (e.g. "Birth time confirmed from
+        birth certificate", "Location corrected to suburb level").
+
+        Returns the new recalculation row id.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO chart_recalculations
+                (chart_id, chart_name, datetime_utc, datetime_local, location, note)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (chart_id, chart_name, datetime_utc, datetime_local, location, note)
+            )
+            row_id = cursor.lastrowid
+        logger.info(
+            f"Recalculation recorded: chart={chart_id} "
+            f"(name='{chart_name}', location={location})"
+        )
+        return row_id
+
+    def get_recalculations(self, chart_id: str) -> list:
+        """
+        Return all recalculation records for a given chart_id,
+        ordered chronologically (oldest first).
+        """
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, chart_id, chart_name, datetime_utc, datetime_local,
+                       location, note, recalculated_at
+                FROM chart_recalculations
+                WHERE chart_id = ?
+                ORDER BY recalculated_at ASC
+                """,
+                (chart_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def search_archive(
+        self,
+        chart_name: str = None,
+        location:   str = None,
+        limit:      int = 50,
+    ) -> list:
+        """
+        Search the chart archive by name and/or location (both optional,
+        case-insensitive LIKE match). Returns records ordered by
+        first_calculated_at DESC.
+        """
+        clauses = []
+        params  = []
+        if chart_name:
+            clauses.append("chart_name LIKE ?")
+            params.append(f"%{chart_name}%")
+        if location:
+            clauses.append("location LIKE ?")
+            params.append(f"%{location}%")
+
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT chart_id, chart_name, datetime_utc, datetime_local,
+                       location, first_calculated_at
+                FROM chart_archive
+                {where}
+                ORDER BY first_calculated_at DESC
+                LIMIT ?
+                """,
+                params
+            ).fetchall()
+
+        return [dict(r) for r in rows]
 
     # ==========================================================================
     # SMTP configuration methods
@@ -1437,6 +1692,109 @@ class DatabaseManager:
         return d
 
     # ==========================================================================
+    # Cities (GeoNames cities5000) methods
+    # ==========================================================================
+
+    def clear_cities(self) -> None:
+        """Delete all rows from cities and cities_import_meta (pre-import wipe)."""
+        with self.get_connection() as conn:
+            conn.execute('DELETE FROM cities')
+            conn.execute('DELETE FROM cities_import_meta')
+        logger.info("Cities table cleared")
+
+    def bulk_insert_cities(self, rows: list) -> int:
+        """
+        Bulk-insert a list of city tuples into the cities table.
+        Each tuple: (geoname_id, name, ascii_name, country_code,
+                     admin1_code, latitude, longitude, timezone_id, population)
+        Returns the number of rows inserted.
+        """
+        with self.get_connection() as conn:
+            conn.executemany('''
+                INSERT OR REPLACE INTO cities
+                (geoname_id, name, ascii_name, country_code,
+                 admin1_code, latitude, longitude, timezone_id, population)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', rows)
+        return len(rows)
+
+    def save_cities_import_meta(self, filename: str, row_count: int) -> None:
+        """Record metadata about the most recent cities import (single row, id=1)."""
+        with self.get_connection() as conn:
+            conn.execute('''
+                INSERT INTO cities_import_meta (id, filename, row_count, imported_at)
+                VALUES (1, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    filename    = excluded.filename,
+                    row_count   = excluded.row_count,
+                    imported_at = CURRENT_TIMESTAMP
+            ''', (filename, row_count))
+
+    def get_cities_import_meta(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent cities import metadata, or None if not yet imported."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                'SELECT filename, row_count, imported_at FROM cities_import_meta WHERE id = 1'
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            'filename':    row['filename'],
+            'row_count':   row['row_count'],
+            'imported_at': row['imported_at'],
+        }
+
+    def search_cities(self, query: str, limit: int = 10) -> list:
+        """
+        Prefix-match on ascii_name for autocomplete suggestions.
+        Orders by population DESC so major cities surface first.
+        Returns a list of dicts.
+        """
+        normalised = query.strip().lower()
+        pattern    = normalised + '%'
+        with self.get_connection() as conn:
+            rows = conn.execute('''
+                SELECT geoname_id, name, ascii_name, country_code,
+                       admin1_code, latitude, longitude, timezone_id, population
+                FROM cities
+                WHERE ascii_name LIKE ?
+                ORDER BY population DESC
+                LIMIT ?
+            ''', (pattern, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_city(self, query: str) -> Optional[Dict[str, Any]]:
+        """
+        Best-match city for a query string — used for offline geocoding.
+        Tries exact ascii_name match first, then prefix match.
+        Returns the highest-population match, or None if no results.
+        """
+        normalised = query.strip().lower()
+        with self.get_connection() as conn:
+            # Exact match first
+            row = conn.execute('''
+                SELECT geoname_id, name, ascii_name, country_code,
+                       admin1_code, latitude, longitude, timezone_id, population
+                FROM cities
+                WHERE ascii_name = ?
+                ORDER BY population DESC
+                LIMIT 1
+            ''', (normalised,)).fetchone()
+
+            if not row:
+                # Prefix match fallback
+                row = conn.execute('''
+                    SELECT geoname_id, name, ascii_name, country_code,
+                           admin1_code, latitude, longitude, timezone_id, population
+                    FROM cities
+                    WHERE ascii_name LIKE ?
+                    ORDER BY population DESC
+                    LIMIT 1
+                ''', (normalised + '%',)).fetchone()
+
+        return dict(row) if row else None
+
+    # ==========================================================================
     # Stats and cleanup
     # ==========================================================================
 
@@ -1468,6 +1826,11 @@ class DatabaseManager:
             cursor.execute('SELECT COUNT(*) FROM derived_charts')
             derived_count = cursor.fetchone()[0]
 
+            cursor.execute('SELECT COUNT(*) FROM cities')
+            cities_count = cursor.fetchone()[0]
+
+            cities_meta = self.get_cities_import_meta()
+
             return {
                 'locations_cached':     location_count,
                 'charts_cached':        chart_count,
@@ -1477,19 +1840,58 @@ class DatabaseManager:
                 'place_aliases':        alias_count,
                 'place_cache_active':   active_cache_count,
                 'place_cache_expired':  expired_cache_count,
+                'cities_loaded':        cities_count,
+                'cities_import':        cities_meta,
             }
 
     def cleanup_old_cache(self, days: int = 90) -> int:
-        """Remove old chart and location cache entries"""
+        """
+        Remove stale entries across charts, derived charts, views, and locations.
+        All deletions run in a single transaction — if any step fails the whole
+        cleanup rolls back, leaving the database in its previous state.
+
+        Order of operations (FK constraints require this sequence):
+            1. Derived charts whose parent chart is expiring (cascade)
+            2. Derived charts that are stale independently
+            3. Natal charts that are stale
+            4. Views not accessed within the expiry window
+            5. Locations no longer referenced by any remaining chart
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
+            # 1. Cascade-delete derived charts belonging to expiring natal charts
+            cursor.execute('''
+                DELETE FROM derived_charts
+                WHERE chart_id IN (
+                    SELECT id FROM charts
+                    WHERE last_accessed < datetime('now', '-' || ? || ' days')
+                )
+            ''', (days,))
+            deleted_derived_cascade = cursor.rowcount
+
+            # 2. Derived charts that are themselves stale (parent chart still active)
+            cursor.execute('''
+                DELETE FROM derived_charts
+                WHERE last_accessed < datetime('now', '-' || ? || ' days')
+            ''', (days,))
+            deleted_derived_stale = cursor.rowcount
+
+            # 3. Natal charts
             cursor.execute('''
                 DELETE FROM charts
                 WHERE last_accessed < datetime('now', '-' || ? || ' days')
             ''', (days,))
             deleted_charts = cursor.rowcount
 
+            # 4. Views not accessed within the expiry window
+            cursor.execute('''
+                DELETE FROM views
+                WHERE last_accessed < datetime('now', '-' || ? || ' days')
+            ''', (days,))
+            deleted_views = cursor.rowcount
+
+            # 5. Orphaned locations (no remaining chart references them)
             cursor.execute('''
                 DELETE FROM locations
                 WHERE last_used < datetime('now', '-' || ? || ' days')
@@ -1497,5 +1899,14 @@ class DatabaseManager:
             ''', (days,))
             deleted_locations = cursor.rowcount
 
-            logger.info(f"Cleaned up {deleted_charts} charts and {deleted_locations} locations")
-            return deleted_charts + deleted_locations
+            total = (
+                deleted_derived_cascade + deleted_derived_stale +
+                deleted_charts + deleted_views + deleted_locations
+            )
+            logger.info(
+                f"Cache cleanup complete: {deleted_charts} charts, "
+                f"{deleted_derived_cascade + deleted_derived_stale} derived charts "
+                f"({deleted_derived_cascade} cascade, {deleted_derived_stale} stale), "
+                f"{deleted_views} views, {deleted_locations} locations — {total} total"
+            )
+            return total

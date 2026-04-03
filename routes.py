@@ -80,12 +80,15 @@ def autocomplete(validated_data):
     if len(query) < 2:
         return jsonify({'predictions': []})
 
-    if not usage_tracker.check_and_increment():
-        stats = usage_tracker.get_usage_stats()
-        return jsonify({
-            'error': 'Google API usage limit exceeded for this month',
-            'usage_stats': stats
-        }), 429
+    # Usage tracking only applies when Google is the geocoding backend.
+    # In cities5000 mode autocomplete is fully offline — no counter needed.
+    if geocoding_service.use_google:
+        if not usage_tracker.check_and_increment():
+            stats = usage_tracker.get_usage_stats()
+            return jsonify({
+                'error': 'Google API usage limit exceeded for this month',
+                'usage_stats': stats
+            }), 429
 
     result = geocoding_service.autocomplete(query)
     return jsonify(result)
@@ -183,14 +186,32 @@ def calculate(validated_data):
             db_manager.update_chart_data_by_id(
                 recalc_chart_id, result, dt_utc, dt_local
             )
-            chart_id = recalc_chart_id
+            chart_id    = recalc_chart_id
+            recalc_note = validated_data.get('recalc_note')
+            db_manager.record_recalculation(
+                chart_id       = chart_id,
+                chart_name     = chart_name,
+                datetime_utc   = dt_utc.isoformat(),
+                datetime_local = dt_local.isoformat(),
+                location       = location_info['formatted_address'],
+                note           = recalc_note,
+            )
             logger.info(
                 f"[{user.get('name', 'unknown')}] Recalculated chart {chart_id}"
+                + (f" — note: {recalc_note}" if recalc_note else "")
             )
         else:
             chart_id = db_manager.save_chart_to_cache(
                 dt_utc, dt_local, location_info['id'], result, chart_name,
                 house_system=house_system
+            )
+            # Archive every new chart permanently — survives cache cleanup
+            db_manager.archive_chart(
+                chart_id       = chart_id,
+                chart_name     = chart_name,
+                datetime_utc   = dt_utc.isoformat(),
+                datetime_local = dt_local.isoformat(),
+                location       = location_info['formatted_address'],
             )
 
         # Build response
@@ -1206,6 +1227,69 @@ def get_view():
         'data':       data,
         'created_at': record['created_at'],
         'updated_at': record['updated_at'],
+    })
+
+
+
+# ---------------------------------------------------------------------------
+# Chart archive and recalculation history
+# ---------------------------------------------------------------------------
+
+@api.route('/archive', methods=['GET'])
+def search_archive():
+    # Search the permanent chart archive.
+    # Query parameters (all optional):
+    #   chart_name — partial name match (case-insensitive)
+    #   location   — partial location match (case-insensitive)
+    #   limit      — max results (default 50, max 200)
+    # Returns records ordered by first_calculated_at DESC.
+    # Use chart_id from any result to fetch its full recalculation
+    # history via GET /archive/<chart_id>.
+    chart_name = request.args.get('chart_name', '').strip() or None
+    location   = request.args.get('location',   '').strip() or None
+    try:
+        limit = min(int(request.args.get('limit', 50)), 200)
+    except (ValueError, TypeError):
+        limit = 50
+
+    results = db_manager.search_archive(
+        chart_name=chart_name,
+        location=location,
+        limit=limit,
+    )
+    return jsonify({
+        'count':   len(results),
+        'results': results,
+    })
+
+
+@api.route('/archive/<chart_id>', methods=['GET'])
+def get_archive_entry(chart_id):
+    # Retrieve a single archive entry and its full recalculation history.
+    # Returns the original chart record plus every recalculation ever
+    # performed, ordered oldest to newest.
+    with db_manager.get_connection() as conn:
+        row = conn.execute(
+            'SELECT chart_id, chart_name, datetime_utc, datetime_local, '
+            'location, first_calculated_at '
+            'FROM chart_archive WHERE chart_id = ?',
+            (chart_id,)
+        ).fetchone()
+
+    if not row:
+        return _error(f"Archive entry '{chart_id}' not found", 404)
+
+    recalculations = db_manager.get_recalculations(chart_id)
+
+    return jsonify({
+        'chart_id':            row['chart_id'],
+        'chart_name':          row['chart_name'],
+        'datetime_utc':        row['datetime_utc'],
+        'datetime_local':      row['datetime_local'],
+        'location':            row['location'],
+        'first_calculated_at': row['first_calculated_at'],
+        'recalculation_count': len(recalculations),
+        'recalculations':      recalculations,
     })
 
 

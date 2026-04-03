@@ -34,20 +34,116 @@
 Configuration module for ephemeralREST
 Handles environment variables and application settings.
 
-User API keys are NOT stored here — they are stored in .env and referenced
-by the api_key_env field in each user's cfg file under ./users/.
+API keys are stored encrypted in the database. Use key_manager.py to create
+and manage keys — no key values belong in .env or config files.
 
 Required .env entries:
-    GOOGLE_MAPS_API_KEY=...
-    SECRET_KEY=...
-    API_KEY_ADMIN=...
-    API_KEY_COSMOBIOLOGY_ONLINE=...
-    API_KEY_MINDFORGE=...
-    (one API_KEY_<NAME> entry per user cfg file)
+    SECRET_KEY=...              — used for API key encryption (Fernet/AES-128)
+    GOOGLE_MAPS_API_KEY=...     — required when USE_GOOGLE=true, omit otherwise
+
+Optional .env entries:
+    USE_GOOGLE=true             — set false for fully offline (cities5000) mode
+    CITIES_FOLDER=./cities      — drop cities5000.txt here to trigger a reload
 """
 import os
+import sys
 from dotenv import load_dotenv
 
+
+_ENV_TEMPLATE = """\
+# =============================================================================
+# ephemeralREST — environment configuration
+# Edit this file then restart the service.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Flask
+# -----------------------------------------------------------------------------
+FLASK_HOST=0.0.0.0
+FLASK_PORT=5000
+FLASK_DEBUG=false
+SECRET_KEY=                         # required — generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+
+# -----------------------------------------------------------------------------
+# Geocoding mode
+# USE_GOOGLE=true  → cities5000 autocomplete + Google geocoding (hybrid)
+# USE_GOOGLE=false → fully offline, cities5000 for everything, no API key needed
+# -----------------------------------------------------------------------------
+USE_GOOGLE=true
+GOOGLE_MAPS_API_KEY=                # required when USE_GOOGLE=true
+
+# -----------------------------------------------------------------------------
+# GeoNames cities5000 auto-import
+# Drop a cities5000.txt file into this folder and restart to reload city data.
+# Download from: https://download.geonames.org/export/dump/cities5000.zip
+# -----------------------------------------------------------------------------
+CITIES_FOLDER=./cities
+
+# -----------------------------------------------------------------------------
+# Database and ephemeris
+# -----------------------------------------------------------------------------
+DATABASE_PATH=ephemeral.db
+SWISS_EPHEMERIS_PATH=./sweph
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+LOG_FILE=ephemeral.log
+LOG_LEVEL=INFO
+
+# -----------------------------------------------------------------------------
+# Google API usage cap (ignored when USE_GOOGLE=false)
+# -----------------------------------------------------------------------------
+USAGE_COUNT_FILE=api_usage_count.json
+MAX_MONTHLY_REQUESTS=10000
+
+# -----------------------------------------------------------------------------
+# CORS
+# -----------------------------------------------------------------------------
+CORS_ORIGINS=*
+CORS_METHODS=GET,POST,PUT,DELETE,OPTIONS
+CORS_HEADERS=Content-Type,Authorization,X-Requested-With,X-API-Key
+
+# -----------------------------------------------------------------------------
+# Rate limiting
+# -----------------------------------------------------------------------------
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_PER_MINUTE=10
+RATE_LIMIT_PER_HOUR=50
+RATE_LIMIT_PER_DAY=200
+
+# -----------------------------------------------------------------------------
+# Cache
+# -----------------------------------------------------------------------------
+CACHE_EXPIRY_DAYS=90
+"""
+
+
+def _bootstrap_env_if_missing(env_path: str = '.env') -> None:
+    """
+    If no .env file exists, write out a pre-filled template and exit.
+    Runs before load_dotenv() so the template is always written from scratch
+    rather than merging with a partial file.
+    """
+    if os.path.exists(env_path):
+        return
+
+    with open(env_path, 'w', encoding='utf-8') as fh:
+        fh.write(_ENV_TEMPLATE)
+
+    msg = (
+        f"\n"
+        f"  ephemeralREST — first-run setup\n"
+        f"  --------------------------------\n"
+        f"  No .env file was found. A template has been written to '{env_path}'.\n"
+        f"  Please edit it — at minimum set SECRET_KEY and (if USE_GOOGLE=true)\n"
+        f"  GOOGLE_MAPS_API_KEY — then restart the service.\n"
+    )
+    print(msg, file=sys.stderr)
+    sys.exit(0)
+
+
+_bootstrap_env_if_missing()
 load_dotenv()
 
 
@@ -60,12 +156,18 @@ class Config:
     FLASK_DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     SECRET_KEY  = os.environ.get('SECRET_KEY', os.urandom(24).hex())
 
-    # Google Maps API key (for geocoding and timezone)
-    GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY')
+    # Geocoding mode
+    # USE_GOOGLE=true  → hybrid: cities5000 autocomplete + Google geocoding
+    # USE_GOOGLE=false → fully offline: cities5000 for both autocomplete and geocoding
+    USE_GOOGLE = os.environ.get('USE_GOOGLE', 'true').lower() == 'true'
 
-    # Note: individual API_KEY_* entries are no longer used.
-    # API keys are stored encrypted in the database.
-    # Use key_manager.py to create and manage keys.
+    # Folder watched on startup for a GeoNames cities5000 .txt file.
+    # If a .txt file is present, the cities table is wiped, the file is
+    # imported, and the file is deleted on completion.
+    CITIES_FOLDER = os.environ.get('CITIES_FOLDER', './cities')
+
+    # Google Maps API key (for geocoding and timezone) — required when USE_GOOGLE=true
+    GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY')
 
     # Database
     DATABASE_PATH = os.environ.get('DATABASE_PATH', 'ephemeral.db')
@@ -101,13 +203,22 @@ class Config:
         errors   = []
         warnings = []
 
-        # Google Maps API key
-        if not cls.GOOGLE_MAPS_API_KEY:
-            errors.append("GOOGLE_MAPS_API_KEY is required")
-        elif cls.GOOGLE_MAPS_API_KEY == 'your-google-maps-api-key':
-            errors.append("GOOGLE_MAPS_API_KEY must not be the placeholder value")
-        elif len(cls.GOOGLE_MAPS_API_KEY) < 20:
-            warnings.append("GOOGLE_MAPS_API_KEY looks suspicious — verify it is valid")
+        # Google Maps API key — only required when USE_GOOGLE=true
+        if cls.USE_GOOGLE:
+            if not cls.GOOGLE_MAPS_API_KEY:
+                errors.append(
+                    "GOOGLE_MAPS_API_KEY is required when USE_GOOGLE=true. "
+                    "Set USE_GOOGLE=false to run in fully offline (cities5000) mode."
+                )
+            elif cls.GOOGLE_MAPS_API_KEY == 'your-google-maps-api-key':
+                errors.append("GOOGLE_MAPS_API_KEY must not be the placeholder value")
+            elif len(cls.GOOGLE_MAPS_API_KEY) < 20:
+                warnings.append("GOOGLE_MAPS_API_KEY looks suspicious — verify it is valid")
+        else:
+            if cls.GOOGLE_MAPS_API_KEY:
+                warnings.append(
+                    "USE_GOOGLE=false but GOOGLE_MAPS_API_KEY is set — key will be ignored"
+                )
 
         # Check SECRET_KEY is set — required for API key encryption
         if not cls.SECRET_KEY or cls.SECRET_KEY == 'your-secret-key-here':
@@ -143,6 +254,8 @@ class Config:
             'cors_origins':          cls.CORS_ORIGINS,
             'rate_limiting_enabled': cls.RATE_LIMIT_ENABLED,
             'google_maps_key_set':  bool(cls.GOOGLE_MAPS_API_KEY),
+            'use_google':           cls.USE_GOOGLE,
+            'cities_folder':        cls.CITIES_FOLDER,
             'key_store':            'database',
             'encryption':           'Fernet (AES-128)',
         }

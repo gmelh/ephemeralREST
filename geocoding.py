@@ -33,109 +33,155 @@
 """
 Geocoding and location services module.
 
-geocode_location() now routes through the canonical place system:
-    1. PlaceRepository.resolve() does alias lookup, cache check, Google call
-    2. The resolved lat/lon/timezone is saved to the locations table
-       (which is the FK target for chart records — unchanged)
-    3. Returns the same dict shape the rest of the API expects
+Behaviour is controlled by the USE_GOOGLE config flag:
 
-The autocomplete method is unchanged.
+    USE_GOOGLE=false  (fully offline)
+        autocomplete  → CitiesService.search()
+        geocode       → CitiesService.resolve() → pytz offsets → locations cache
+
+    USE_GOOGLE=true  (hybrid)
+        autocomplete  → CitiesService.search()  (clean vocabulary, no Google)
+        geocode       → existing PlaceRepository chain (alias → cache → Google)
+                        Input arrives clean from cities5000 autocomplete, keeping
+                        the canonical_places table tidy.
+
+In both modes the locations table and the dict shape returned to callers are
+identical, so the rest of the API is unaffected.
 """
 import logging
-import googlemaps
-from datetime import datetime
 from typing import Tuple, Optional, Dict, Any
 
-from place_repository import PlaceRepository
+from cities_service import CitiesService
 
 logger = logging.getLogger(__name__)
 
 
 class GeocodingService:
-    """Handles geocoding and timezone lookups"""
+    """Handles geocoding and timezone lookups."""
 
-    def __init__(self, api_key: str, db_manager, usage_tracker):
-        self.api_key       = api_key
-        self.gmaps         = googlemaps.Client(key=api_key)
+    def __init__(self, api_key: str, db_manager, usage_tracker, use_google: bool = True):
+        self.use_google    = use_google
         self.db            = db_manager
         self.usage_tracker = usage_tracker
-        self.place_repo    = PlaceRepository(db_manager, api_key, usage_tracker)
+        self.cities_svc    = CitiesService(db_manager)
+
+        if use_google:
+            import googlemaps
+            from place_repository import PlaceRepository
+            self.gmaps       = googlemaps.Client(key=api_key)
+            self.place_repo  = PlaceRepository(db_manager, api_key, usage_tracker)
+            logger.info("GeocodingService initialised in Google (hybrid) mode")
+        else:
+            self.gmaps      = None
+            self.place_repo = None
+            logger.info("GeocodingService initialised in offline (cities5000) mode")
+
+    # -------------------------------------------------------------------------
+    # Public interface
+    # -------------------------------------------------------------------------
 
     def geocode_location(self, location: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """
         Resolve a location string to lat/lon/timezone.
 
-        Flow:
-            1. Check the simple locations cache (keyed by query string)
-               — fast path for repeated identical strings
-            2. Run canonical resolution via PlaceRepository
-               — handles aliases, canonical deduplication, 30-day Google cache
-            3. Save result to the locations table for chart FK references
-            4. Return {id, latitude, longitude, formatted_address, timezone, from_cache}
+        USE_GOOGLE=false:
+            locations cache → CitiesService.resolve() → save to locations cache
+
+        USE_GOOGLE=true:
+            locations cache → PlaceRepository.resolve() → save to locations cache
 
         Returns:
-            Tuple of (location_info, error_message)
+            Tuple of (location_info dict, error_message)
         """
-        # --- Fast path: exact query string already in locations cache ---
+        # Fast path: exact query string already in locations cache
         cached = self.db.get_location_from_cache(location)
         if cached:
             logger.info(f"Location '{location}' found in locations cache (id={cached['id']})")
             return cached, None
 
-        # --- Canonical resolution ---
-        place, error = self.place_repo.resolve(location)
-        if error:
-            return None, error
-
-        # Build the location_info dict the rest of the API expects
-        location_info = {
-            'latitude':          place['latitude'],
-            'longitude':         place['longitude'],
-            'formatted_address': place['formatted_name'],
-            'timezone':          place['timezone_id'],
-            'utc_offset_seconds': place['utc_offset_seconds'],
-            'dst_offset_seconds': place['dst_offset_seconds'],
-            'daylight_saving':   place['daylight_saving'],
-            'from_cache':        place['cache_hit'],
-        }
-
-        # Save to the locations table so chart FK references work
-        location_id = self.db.save_location_to_cache(location, location_info)
-        location_info['id'] = location_id
-
-        logger.info(
-            f"Location '{location}' resolved to '{place['formatted_name']}' "
-            f"(canonical_place_id={place['canonical_place_id']}, "
-            f"locations_id={location_id}, cache_hit={place['cache_hit']})"
-        )
-        return location_info, None
+        if self.use_google:
+            return self._geocode_via_google(location)
+        else:
+            return self._geocode_via_cities(location)
 
     def resolve_place(self, place_name: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """
         Full canonical place resolution — returns the rich place dict.
         Used by the /locations/resolve endpoint.
+        In offline mode, delegates to CitiesService.resolve().
         """
-        return self.place_repo.resolve(place_name)
+        if self.use_google:
+            return self.place_repo.resolve(place_name)
+        return self.cities_svc.resolve(place_name)
 
     def autocomplete(self, query: str) -> Dict[str, Any]:
-        """Perform autocomplete search for locations via Google Places."""
-        try:
-            result = self.gmaps.places_autocomplete(
-                input_text=query,
-                types=['(cities)']
-            )
-            predictions = [
-                {
-                    'description': place['description'],
-                    'place_id':    place['place_id']
-                } for place in result
-            ]
-            logger.info(f"Autocomplete for '{query}' returned {len(predictions)} results")
-            return {'predictions': predictions}
+        """
+        Autocomplete search for locations.
 
-        except googlemaps.exceptions.ApiError as e:
-            logger.error(f"Autocomplete API error: {str(e)}")
-            return {'error': f'Autocomplete API error: {str(e)}'}
-        except Exception as e:
-            logger.error(f"Autocomplete error: {str(e)}")
-            return {'error': f'Autocomplete failed: {str(e)}'}
+        Always uses CitiesService (both modes) — this replaces Google Places
+        autocomplete entirely. In USE_GOOGLE=true mode the benefit is that
+        every selected city produces a consistent, canonical string that
+        arrives clean at PlaceRepository, reducing alias proliferation.
+
+        Returns {'predictions': [...]} matching the shape callers expect,
+        where each prediction has at minimum a 'description' key.
+        """
+        results = self.cities_svc.search(query, limit=10)
+
+        if not results:
+            logger.info(f"Autocomplete '{query}' — no cities results")
+            return {'predictions': []}
+
+        logger.info(f"Autocomplete '{query}' → {len(results)} predictions (cities5000)")
+        return {'predictions': results}
+
+    # -------------------------------------------------------------------------
+    # Internal geocoding paths
+    # -------------------------------------------------------------------------
+
+    def _geocode_via_cities(self, location: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Offline resolution via CitiesService."""
+        place, error = self.cities_svc.resolve(location)
+        if error:
+            return None, error
+        return self._save_and_return(location, place)
+
+    def _geocode_via_google(self, location: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """
+        Resolution via PlaceRepository (alias → canonical → Google cache).
+        Unchanged from the original geocode_location() implementation.
+        """
+        place, error = self.place_repo.resolve(location)
+        if error:
+            return None, error
+        return self._save_and_return(location, place)
+
+    def _save_and_return(
+        self,
+        location: str,
+        place: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], None]:
+        """
+        Build the location_info dict, save it to the locations cache, and return it.
+        Common to both resolution paths.
+        """
+        location_info = {
+            'latitude':           place['latitude'],
+            'longitude':          place['longitude'],
+            'formatted_address':  place['formatted_name'],
+            'timezone':           place['timezone_id'],
+            'utc_offset_seconds': place['utc_offset_seconds'],
+            'dst_offset_seconds': place['dst_offset_seconds'],
+            'daylight_saving':    place.get('daylight_saving', False),
+            'from_cache':         place['cache_hit'],
+        }
+
+        location_id = self.db.save_location_to_cache(location, location_info)
+        location_info['id'] = location_id
+
+        logger.info(
+            f"Location '{location}' resolved to '{place['formatted_name']}' "
+            f"(source={place.get('source', 'google')}, "
+            f"locations_id={location_id}, cache_hit={place['cache_hit']})"
+        )
+        return location_info, None
