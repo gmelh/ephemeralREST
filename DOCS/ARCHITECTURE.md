@@ -1,6 +1,6 @@
 # ephemeralREST — Architecture & Developer Guide
 
-This document describes how the codebase is structured, how the components relate to each other, and how to navigate and modify the code. It is written for developers who are new to the project, or who want to understand how something works before changing it.
+This document describes how the codebase is structured, how the components relate to each other, and how to navigate and modify the code.
 
 ---
 
@@ -9,47 +9,21 @@ This document describes how the codebase is structured, how the components relat
 1. [System overview](#1-system-overview)
 2. [Directory structure](#2-directory-structure)
 3. [The API backend](#3-the-api-backend)
-   - Application factory
-   - Configuration
-   - Request lifecycle
-   - Rate limiting
-   - Middleware
 4. [Authentication and key management](#4-authentication-and-key-management)
-   - How keys are stored
-   - How keys are verified
-   - The user object
-   - Key class limits
-5. [Astronomy calculations](#5-astronomy-calculations)
-   - AstronomyService
-   - Swiss Ephemeris integration
-   - Chart calculation flow
-   - Derived charts
-   - Apsides and lunations
-6. [Database layer](#6-database-layer)
-   - Schema overview
-   - DatabaseManager
-   - Table reference
-7. [Output configuration system](#7-output-configuration-system)
-   - How the three-level merge works
-   - OutputConfig class
-   - Storing and retrieving per-key config
-8. [Location resolution](#8-location-resolution)
-   - Resolution pipeline
-   - Caching strategy
-9. [Email service](#9-email-service)
-   - Configuration priority
-   - Adding a new email type
-10. [Routes reference](#10-routes-reference)
-11. [The admin portal (PHP)](#11-the-admin-portal-php)
-    - File structure
-    - Authentication flow
-    - AJAX pattern
-    - Adding a new page
-12. [Registration and key provisioning](#12-registration-and-key-provisioning)
-13. [Key manager CLI](#13-key-manager-cli)
-14. [Adding a new endpoint](#14-adding-a-new-endpoint)
-15. [Common patterns and conventions](#15-common-patterns-and-conventions)
-16. [Configuration reference](#16-configuration-reference)
+5. [Login, 2FA, and trusted devices](#5-login-2fa-and-trusted-devices)
+6. [Astronomy calculations](#6-astronomy-calculations)
+7. [Database layer](#7-database-layer)
+8. [Output configuration system](#8-output-configuration-system)
+9. [Location resolution](#9-location-resolution)
+10. [Email service](#10-email-service)
+11. [Portal settings](#11-portal-settings)
+12. [Routes reference](#12-routes-reference)
+13. [The admin portal (PHP)](#13-the-admin-portal-php)
+14. [Registration and key provisioning](#14-registration-and-key-provisioning)
+15. [Key manager CLI](#15-key-manager-cli)
+16. [Adding a new endpoint](#16-adding-a-new-endpoint)
+17. [Common patterns and conventions](#17-common-patterns-and-conventions)
+18. [Configuration reference](#18-configuration-reference)
 
 ---
 
@@ -57,11 +31,9 @@ This document describes how the codebase is structured, how the components relat
 
 ephemeralREST is licensed under the **GNU Affero General Public License v3 (AGPL v3)**. This licence was selected for compatibility with the Swiss Ephemeris library, which is itself AGPL v3. Because the Swiss Ephemeris is linked at runtime, the combined work must be distributed under the AGPL v3.
 
-The critical difference between GPL v3 and AGPL v3 is the **network service clause**. Under AGPL v3, users who interact with the software over a network (i.e., anyone who calls the API) are legally entitled to receive the source code of the running application. A public GitHub repository satisfies this obligation.
+The critical difference between GPL v3 and AGPL v3 is the **network service clause**. Under AGPL v3, users who interact with the software over a network are legally entitled to receive the source code of the running application. A public GitHub repository satisfies this obligation.
 
-Every Python source file includes the standard AGPL v3 notice in its header, including a separate notice about the Swiss Ephemeris dependency and the Astrodienst AGPL obligation.
-
-The full licence text lives in `LICENSE` at the repository root.
+Every Python source file includes the standard AGPL v3 notice in its header.
 
 ---
 
@@ -92,15 +64,15 @@ ephemeralREST consists of two separate applications that communicate over HTTP:
                 │
          ┌──────▼──────────────┐
          │  SQLite database    │
-         │  ephemeral.db           │
+         │  ephemeral.db       │
          └─────────────────────┘
 ```
 
-**The Flask API** does all computation. It validates requests, calls the Swiss Ephemeris, stores results, and returns JSON.
+**The Flask API** does all computation and data storage. It validates requests, calls the Swiss Ephemeris, manages users and keys, and returns JSON.
 
-**The PHP admin portal** is a thin client. It never touches the database directly — it makes HTTP requests to the Flask API using an admin API key, and renders the responses as HTML. This means the portal can run on a completely different server if needed.
+**The PHP admin portal** is a thin client. It never touches the database directly — it makes HTTP requests to the Flask API using the logged-in user's session key, and renders the responses as HTML.
 
-**SQLite** stores everything: charts, keys, locations, SMTP config, registration requests. There is no separate database server — the database is a single file (`ephemeral.db`).
+**SQLite** stores everything: charts, keys, locations, SMTP config, portal settings. There is no separate database server.
 
 ---
 
@@ -111,29 +83,29 @@ ephemeralREST consists of two separate applications that communicate over HTTP:
 ```
 /srv/ephemeral/app/
 │
-├── app.py                  Application factory, rate limiter setup
+├── app.py                  Application factory, rate limiter, protected endpoint list
 ├── config.py               All configuration, loaded from .env
-├── routes.py               All 44 API endpoints
+├── routes.py               All API endpoints (~55 routes)
 ├── astronomy.py            Swiss Ephemeris wrapper (AstronomyService)
 ├── database.py             SQLite wrapper (DatabaseManager)
 ├── auth.py                 API key authentication (AuthManager)
 ├── users.py                Builds the g.user object from a key record
-├── key_crypto.py           Fernet encryption for stored keys (KeyCrypto)
+├── key_crypto.py           Fernet encryption for stored API keys (KeyCrypto)
 ├── key_manager.py          CLI tool for key administration
 ├── output_config.py        Output config defaults and merge logic (OutputConfig)
 ├── validators.py           Marshmallow request schemas
 ├── middleware.py           Request logging, error handling
 ├── email_service.py        SMTP transactional email (EmailService)
-├── geocoding.py            Google Maps geocoding (GeocodingService)
+├── geocoding.py            Google Maps geocoding wrapper
 ├── location_normaliser.py  Normalises location strings for cache keys
 ├── place_repository.py     Location lookup and cache coordination
-├── api_usage.py            Google API budget tracker (APIUsageTracker)
+├── api_usage.py            Google API budget tracker
 ├── cleanup.py              Cache maintenance utilities
 ├── gunicorn_config.py      Gunicorn worker configuration
 │
 ├── sweph/                  Swiss Ephemeris data files (*.se1, *.eph)
 ├── .env                    Environment configuration (not committed)
-├── ephemeral.db                SQLite database (not committed)
+├── ephemeral.db            SQLite database (not committed)
 └── requirements.txt
 ```
 
@@ -142,32 +114,38 @@ ephemeralREST consists of two separate applications that communicate over HTTP:
 ```
 /srv/ephemeral/admin/
 │
-├── landing.php             Public marketing page + inline key request form
-├── login.php               API key sign-in → session
-├── logout.php              Clear session
+├── landing.php             Public home page
+├── login.php               Email + password sign-in
+├── logout.php              Clear session and redirect
+├── setup.php               First-run admin account creation (disabled after first use)
+├── 2fa.php                 Two-factor authentication code entry
+├── forgot-password.php     Request a password reset email
+├── set-password.php        Set or reset a password (token or current-password flows)
+├── verify.php              Email verification landing page
+├── register-user.php       Self-service account registration form
 │
-├── portal-admin.php        Admin dashboard (server status, pending count)
-├── portal-domain.php       Domain key holder self-service
-├── portal-user.php         User key holder self-service
+├── portal-admin.php        Admin dashboard
+├── portal-user.php         Standard user self-service
 │
-├── registrations.php       List and approve/reject registrations
-├── keys.php                List all keys, edit limits and status
-├── key-detail.php          Single key detail view
-├── key-output.php          Per-key output configuration editor
-├── class-limits.php        Edit key class rate limit defaults
-├── smtp.php                SMTP server configuration
-├── register-key.php        Public key request form (standalone page)
+├── keys.php                List and manage all API keys (admin)
+├── key-detail.php          Single key detail, limits, admin flag (admin)
+├── key-output.php          Per-key output configuration editor (admin + user)
+├── class-limits.php        Default rate limit settings (admin)
+├── smtp.php                SMTP configuration (admin)
+├── email-templates.php     Customise transactional email templates (admin)
+├── portal-settings.php     Portal behaviour settings (admin)
+├── api-tester.php          Interactive API explorer
 │
-├── config.php              API_BASE, ADMIN_API_KEY, SITE_NAME constants
+├── config.php              API_BASE and SITE_NAME only — two lines
 │
 ├── includes/
-│   ├── api.php             cURL wrappers: api_get(), api_post()
-│   ├── auth.php            Session helpers, my_api_get(), my_api_post()
-│   ├── header.php          HTML <head>, sidebar nav, flash messages
-│   └── footer.php          Closing HTML, shared JS (confirm, copy, flash)
+│   ├── api.php             HTTP client: api_get/post(), portal_setting() helpers
+│   ├── auth.php            Session auth, 2FA, trusted-device cookie management
+│   ├── header.php          HTML head, sidebar nav, flash messages
+│   └── footer.php          Closing HTML, shared JS
 │
 └── assets/
-    └── style.css           Full dark-mode stylesheet (CSS variables)
+    └── style.css           Dark-mode stylesheet
 ```
 
 ---
@@ -176,819 +154,653 @@ ephemeralREST consists of two separate applications that communicate over HTTP:
 
 ### Application factory
 
-The API uses Flask's application factory pattern. Nothing is initialised at import time — everything is created inside `create_app()`:
+The API uses Flask's application factory pattern. Everything is initialised inside `create_app()`:
 
 ```python
-# app.py
 def create_app(config_class=Config):
     app = Flask(__name__)
-    app.config.from_object(config_class)
-    # ... register blueprint, limiter, middleware ...
+    # register Blueprint, Limiter, middleware
     return app
 ```
 
-Gunicorn calls it as:
+Gunicorn calls it as `gunicorn "app:create_app()"`.
 
-```
-gunicorn "app:create_app()"
-```
-
-This pattern makes it easy to pass a different config class for testing.
-
-The application is a single Flask **Blueprint** (`api`) registered on the app. All 44 routes live in `routes.py` and are attached to this blueprint.
+All routes live in `routes.py`, attached to a single Blueprint (`api`).
 
 ### Configuration
 
-All configuration is loaded from the `.env` file via `config.py`. The `Config` class reads environment variables and exposes them as class attributes. A `validate()` method checks required fields at startup and raises a clear error if anything is missing.
+All configuration is loaded from `.env` via `config.py`. The `Config` class reads environment variables and exposes them as class attributes. Never read `os.environ` directly in application code — always go through `Config`.
 
-```python
-# config.py
-class Config:
-    SECRET_KEY          = os.environ.get('SECRET_KEY')
-    DATABASE_PATH       = os.environ.get('DATABASE_PATH', 'ephemeral.db')
-    SWISS_EPHEMERIS_PATH = os.environ.get('SWISS_EPHEMERIS_PATH', '')
-    RATE_LIMIT_ENABLED  = os.environ.get('RATE_LIMIT_ENABLED', 'true').lower() == 'true'
-    # ...
-
-    @classmethod
-    def validate(cls):
-        if not cls.SECRET_KEY:
-            raise ValueError("SECRET_KEY must be set in .env")
-```
-
-**To add a new configuration value:** add a class attribute to `Config`, then read it where needed. Never read `os.environ` directly in application code — always go through `Config`.
+A bootstrap function writes a `.env` template on first run if none exists, then exits so the operator can fill it in before starting the service.
 
 ### Request lifecycle
 
-Every authenticated API request goes through this sequence:
+Every authenticated API request goes through:
 
 ```
-1. nginx receives HTTPS request
-2. nginx forwards to Gunicorn (HTTP, port 5000)
-3. Flask-Limiter checks rate limits
-4. Middleware (middleware.py) logs the request
-5. AuthManager.require_api_key() decorator runs (if protected endpoint):
+1. nginx → Gunicorn (port 5000)
+2. Flask-Limiter checks rate limits
+3. Middleware logs the request
+4. AuthManager.require_api_key() runs (if protected endpoint):
    a. Reads X-API-Key header
    b. Looks up key by 8-char prefix in database
-   c. Decrypts and compares candidate keys
-   d. Loads key record and builds g.user dict via users.py
-   e. Rejects (401/403) if key is invalid or inactive
-6. Route handler runs (routes.py)
-7. Handler calls into astronomy.py, database.py, etc.
-8. Handler returns jsonify(result)
-9. Middleware logs the response
-10. Flask returns JSON response
+   c. Decrypts candidate keys and compares with secrets.compare_digest
+   d. Builds g.user dict via users.py
+   e. Returns 401/403 if key is invalid, inactive, or must_change_password is set
+5. Route handler runs
+6. Middleware logs the response
 ```
 
-The `g.user` object (Flask's per-request global) is available in every route handler after authentication. It contains the key's identity, rate limits, and output configuration.
+The `g.user` object is available in every route handler after authentication.
 
 ### Rate limiting
 
-Rate limiting uses **Flask-Limiter** with a per-user key function. The limiter is set up in `create_app()`:
+Flask-Limiter with per-user key function. Admin keys are effectively unlimited (limit set to `999999`). Per-key overrides take priority over class defaults.
 
-```python
-limiter = Limiter(
-    app=app,
-    key_func=_get_rate_limit_key,   # "user:42" or "ip:1.2.3.4"
-    default_limits=[
-        _per_user_limit('per_day',  config_class.RATE_LIMIT_PER_DAY),
-        _per_user_limit('per_hour', config_class.RATE_LIMIT_PER_HOUR),
-    ],
-    storage_uri="memory://"
-)
-```
-
-The `_per_user_limit()` function returns a callable that Flask-Limiter calls for each request. It checks `g.user` and returns either the key's specific limit or the class default:
-
-- Admin keys always get `"999999 per <unit>"` — effectively unlimited
-- Keys with a per-key limit use that value
-- All other keys fall back to the class default from `key_class_limits` table
-
-**Important:** Rate limits are stored in memory. They reset when the server restarts. For production multi-worker deployments, switch `storage_uri` to Redis.
-
-### Middleware
-
-`middleware.py` provides:
-
-- **Request logging** — logs method, path, response status, and duration
-- **Error handlers** — catches unhandled exceptions and returns consistent JSON error shapes with a `status` field
-
-The `_error()` helper in `routes.py` should be used for all error returns:
-
-```python
-def _error(message: str, status: int) -> tuple:
-    return jsonify({'error': message, 'status': status}), status
-```
+**Important:** Rate limits are stored in memory and reset on server restart. Switch to Redis for multi-worker production.
 
 ---
 
 ## 4. Authentication and key management
 
-### How keys are stored
+### Key storage
 
-API keys are **never stored in plaintext**. The storage flow is:
+API keys use **Fernet (AES-128) symmetric encryption** — not one-way hashing. This means the plaintext key can be recovered server-side when needed (e.g. to deliver it to the user after email verification or to include it in the login response).
 
 ```
-Plaintext key (shown to user once)
-        │
-        ▼
-KeyCrypto.encrypt()   — Fernet AES-128 symmetric encryption
-        │
-        ▼
-key_enc column        — encrypted ciphertext stored in api_keys table
-key_prefix column     — first 8 characters stored plaintext for fast lookup
+Plaintext key (shown once to user)
+    │
+    ▼
+KeyCrypto.encrypt()   ← Fernet, keyed from SECRET_KEY
+    │
+    ▼
+key_enc column        ← encrypted ciphertext
+key_prefix column     ← first 8 chars, plaintext, for fast prefix lookup
 ```
 
-The Fernet key is derived from `SECRET_KEY` in `.env`. **If `SECRET_KEY` changes, all stored keys become unreadable.** Never change it on a running system.
+**If `SECRET_KEY` changes, all stored keys become unreadable.** Never change it on a live system.
 
-`key_crypto.py` exposes three methods:
+### Key verification (X-API-Key flow)
 
 ```python
-crypto = KeyCrypto(secret_key)
-
-plaintext = KeyCrypto.generate_key()          # generate a new random key
-encrypted = crypto.encrypt(plaintext)          # encrypt for storage
-decrypted = crypto.decrypt(encrypted)          # decrypt for comparison
-prefix    = crypto.prefix(plaintext)           # first 8 chars for lookup
-```
-
-### How keys are verified
-
-Lookup is a two-step process designed to avoid decrypting every key on every request:
-
-```python
-# auth.py — simplified
-prefix   = api_key[:8]
-candidates = db_manager.get_api_keys_by_prefix(prefix)
-# candidates is usually 0 or 1 records
-
+prefix     = api_key[:8]
+candidates = db_manager.get_api_keys_by_prefix(prefix)   # usually 0 or 1
 for record in candidates:
     decrypted = crypto.decrypt(record['key_enc'])
     if secrets.compare_digest(decrypted, api_key):
-        return record  # authenticated
+        return record
 ```
 
-`secrets.compare_digest` is used instead of `==` to prevent timing attacks.
+### Password authentication
 
-### The user object
+Alongside the API key, every user account now has a **bcrypt password** (via `werkzeug.security`). The password is used to authenticate through the portal's login flow. The API key itself is never entered by the user — it is decrypted server-side on successful login and stored in the PHP session.
 
-After successful authentication, `users.py` converts the raw database record into a clean dict and stores it in `g.user`:
+Schema additions to `api_keys`:
+
+| Column | Type | Purpose |
+|---|---|---|
+| `password_hash` | TEXT nullable | werkzeug password hash |
+| `must_change_password` | INTEGER (default 1) | Forces set-password flow before login completes |
+
+### The g.user object
 
 ```python
 g.user = {
-    'id':          '42',
-    'name':        'Jane Smith',
-    'identifier':  'myapp.com',
-    'key_type':    'domain',      # 'domain', 'user', or 'wildcard'
-    'is_domain':   True,
-    'is_user':     False,
-    'admin':       False,
-    'active':      True,
+    'id':                   '42',
+    'name':                 'Jane Smith',
+    'identifier':           'jane@example.com',   # always an email address
+    'admin':                False,
+    'active':               True,
+    'must_change_password': False,
     'rate_limits': {
         'per_minute': 20,
         'per_hour':   200,
         'per_day':    1000,
     },
-    'output':      { ... },       # stored output_config JSON, may be empty dict
+    'output': { ... },    # sparse JSON, may be empty dict
 }
 ```
 
-Route handlers access this as `user = getattr(g, 'user', {})`.
+Admin keys have `rate_limits` nulled — they bypass rate limiting entirely.
 
 ### Key class limits
 
-The `key_class_limits` table stores default rate limits for each key class (`domain`, `user`, `wildcard`). When resolving limits for a specific key, the priority is:
-
-```
-key_record.rate_per_minute  (per-key override, may be NULL)
-    └─► falls back to class_limits.rate_per_minute  (class default)
-```
-
-Class limits are editable via the admin portal (Class Limits page) and via `POST /admin/class-limits`.
+The `key_class_limits` table holds a single `'user'` row with default rate limits. Per-key overrides take priority. Editable via `POST /admin/class-limits` or the portal's Rate Limits page.
 
 ---
 
-## 5. Astronomy calculations
+## 5. Login, 2FA, and trusted devices
 
-All Swiss Ephemeris work is encapsulated in `astronomy.py`. Nothing else in the codebase calls `swisseph` (pyswisseph) directly — everything goes through `AstronomyService`.
+The portal uses a multi-step login flow. The API provides the endpoints; the portal handles the UI.
+
+### Login flow
+
+```
+POST /login  (email + password + optional device_token)
+    │
+    ├─ must_change_password = true
+    │   └─ Response: { must_change_password: true }
+    │      Portal → set-password.php
+    │
+    ├─ Admin + SMTP not configured
+    │   └─ Skip 2FA (avoids chicken-and-egg on fresh install)
+    │      Response: identity + decrypted API key
+    │
+    ├─ Valid trusted-device token in cookie
+    │   └─ Skip 2FA
+    │      Response: identity + decrypted API key
+    │
+    └─ Normal case
+        └─ Send 2FA code via email
+           Response: { 2fa_required: true }
+
+POST /login/2fa  (email + code + remember_device)
+    └─ Verify code
+       Response: identity + decrypted API key
+                 + device_token (if remember_device was true)
+```
+
+The decrypted API key is stored in `$_SESSION['user']['api_key']` and used for all subsequent `my_api_*` portal calls. It is never sent to the browser.
+
+### Trusted devices
+
+When a user ticks "Remember this device", the API creates a `trusted_devices` row and returns a `device_token`. The portal stores this in the `epht_device` cookie as a **JSON map keyed by email address**, allowing multiple accounts on the same browser:
+
+```json
+{
+  "alice@example.com": "token_abc...",
+  "bob@example.com":   "token_xyz..."
+}
+```
+
+On subsequent logins, the token for the signing-in email is extracted and sent to `POST /login`. If the token is valid and unexpired (default 28 days, configurable via portal settings), 2FA is skipped.
+
+**Logout does not revoke the trusted-device token** — the device remains trusted for future logins. To explicitly forget a device, `auth_forget_device()` can be called, which revokes the token via `POST /me/forget-device` and removes it from the cookie map.
+
+### 2FA bypass for admin without SMTP
+
+If the account is an admin and the SMTP `host` field is not set in the database, the 2FA step is skipped entirely. This prevents a catch-22 on fresh installs where the admin cannot log in to configure SMTP because 2FA requires SMTP.
+
+### Password reset flow
+
+```
+POST /password/forgot  (email)
+    └─ Generates token, sends password-reset-required email
+       Always returns the same generic message (no enumeration)
+
+GET /set-password.php?t=TOKEN  (portal)
+    └─ Calls POST /password/set with { token, new_password }
+       Sets password_hash, clears must_change_password
+       Invalidates all trusted devices for the account
+```
+
+### First-run setup
+
+`GET /setup/status` — public endpoint, returns `{ setup_required: true }` when the database is empty. The portal checks this on every page load and redirects to `setup.php` if true.
+
+`POST /setup` — creates the first admin account (name, email, password). Returns the decrypted API key in the response — shown once on the success screen. Only works when zero keys exist.
+
+---
+
+## 6. Astronomy calculations
+
+All Swiss Ephemeris work is encapsulated in `astronomy.py`. Nothing else calls `swisseph` directly.
 
 ### AstronomyService
 
-```python
-svc = AstronomyService(ephemeris_path='/srv/ephemeral/app/sweph')
-```
-
-The service is instantiated once in `routes.py` at module load time and reused for every request. It holds no per-request state.
+Instantiated once in `routes.py` at module load time. Stateless — holds no per-request state.
 
 ### Swiss Ephemeris integration
 
-The Swiss Ephemeris (`swe`) operates on **Julian Day Numbers** (JD) — a continuous count of days since noon on 1 January 4713 BCE. All internal calculations use JD. Conversion between calendar dates and JD happens at the entry and exit points of `AstronomyService`.
-
-Key `swe` functions used:
+The Swiss Ephemeris operates on **Julian Day Numbers (JD)** — a continuous day count since noon on 1 January 4713 BCE. All internal calculations use JD. Conversion between calendar dates and JD happens at entry/exit points only.
 
 | Function | Purpose |
 |---|---|
-| `swe.calc_ut(jd, body, flags)` | Calculate position of a body at a JD |
-| `swe.houses(jd, lat, lon, system)` | Calculate house cusps |
-| `swe.julday(year, month, day, hour)` | Convert calendar date to JD |
-| `swe.revjul(jd)` | Convert JD back to calendar date |
-| `swe.nod_aps_ut(jd, body, method)` | Calculate lunar apsides |
-
-The `FLG_SPEED` flag must be passed to `swe.calc_ut()` to get velocity data. Without it, speed fields are always zero. This is set on all calls in `_calculate_position()`.
+| `swe.calc_ut(jd, body, FLG_SPEED)` | Position + velocity (speed flag is mandatory) |
+| `swe.houses(jd, lat, lon, system)` | House cusps |
+| `swe.julday(year, month, day, hour)` | Date → JD |
+| `swe.revjul(jd)` | JD → date |
+| `swe.nod_aps_ut(jd, body, method)` | Lunar apsides |
 
 ### Chart calculation flow
 
-When `POST /calculate` is called:
-
 ```
-1. Validate request (validators.py — Marshmallow schema)
-2. Check cache: does a chart with this datetime + location already exist?
-   └─ Yes → return cached chart
-3. Resolve location (geocoding / place_repository.py)
-4. Convert datetime to UTC, then to Julian Day
-5. Call AstronomyService.calculate_planetary_positions()
-   a. _get_active_bodies() → filters bodies list from output config
-   b. For each active body: _calculate_position(jd, body_id, flags)
-   c. _calculate_houses(jd, lat, lon, system) → house cusps
-   d. _angle_position() for ASC, MC, Vertex, East Point
-   e. _derived_point() for Part of Fortune, nodes, Lilith
-6. Build response dict
-7. Save to cache (database.py)
-8. Return JSON
+POST /calculate
+    1. Validate request (Marshmallow)
+    2. Check cache (chart_hash lookup)
+       └─ Cache hit → return cached chart
+    3. Resolve location (place_repository.py)
+    4. Convert datetime → UTC → Julian Day
+    5. AstronomyService.calculate_planetary_positions()
+       a. Filter bodies from output config
+       b. _calculate_position() for each body
+       c. _calculate_houses() for house cusps
+       d. Angles (ASC, MC, Vertex, East Point)
+       e. Derived points (Part of Fortune, nodes, Lilith)
+    6. Build response dict
+    7. Save to cache + chart_archive
+    8. Return JSON
 ```
-
-`_calculate_position()` handles the swe flag arithmetic and assembles the position dict. All positions are returned in ecliptic coordinates with optional equatorial coordinates appended.
 
 ### Derived charts
 
-Secondary progressions, solar arc, solar return, and lunar return all follow the same pattern:
+Secondary progressions, solar arc, solar return, and lunar return all:
+1. Load the natal chart by `chart_id`
+2. Calculate the derived data
+3. Save as a `derived_charts` record
+4. Return data + `derived_chart_id`
 
-1. Load the natal chart from the database using `chart_id`
-2. Calculate the derived chart data
-3. Save as a `derived_charts` record linked to the natal chart
-4. Return the derived chart data plus a `derived_chart_id`
-
-**Secondary progressions** advance each natal body by one day per year of life. The progressed Julian day is `natal_jd + age_in_days`, then `calculate_planetary_positions()` is called on that JD.
-
-**Solar arc** first calculates the secondary progression to find the progressed Sun's longitude, then applies the arc `(progressed_sun - natal_sun)` uniformly to every natal body.
-
-**Solar and lunar returns** use Newton's method to find the exact JD when the Sun/Moon returns to its natal longitude:
-
-```python
-# astronomy.py — _find_return_jd() simplified
-jd = start_jd
-for _ in range(50):              # max iterations
-    pos  = swe.calc_ut(jd, body, flags)[0][0]   # current longitude
-    diff = target_longitude - pos
-    if abs(diff) < 0.0001:       # ~0.36 arc seconds — close enough
-        return jd
-    speed = swe.calc_ut(jd, body, flags)[0][3]  # longitude speed
-    jd   += diff / speed         # Newton step
-```
+**Solar and lunar returns** use Newton's method to find the exact JD when the body returns to its natal longitude (converges in ≤50 iterations to ~0.36 arc-second precision).
 
 ### Apsides and lunations
 
-**Apside finding** (`calculate_next_apsides`) uses a distance speed sign-change approach: scan forward in time at coarse intervals, detect when `distance_speed` changes sign (the distance is at a minimum or maximum), then refine with `_refine_apside_jd()` using bisection.
+**Apsides** — scan for `distance_speed` sign changes at coarse intervals, refine with bisection.
 
-**Lunation finding** (`find_lunations`) scans for when `sun_moon_angle mod 360` crosses the target angle (0°, 90°, 180°, 270°), then refines with Newton's method.
+**Lunations** — scan for `sun_moon_angle mod 360` crossing target angles (0°, 90°, 180°, 270°), refine with Newton's method.
 
 ---
 
-## 6. Database layer
+## 7. Database layer
 
 ### DatabaseManager
 
-`DatabaseManager` is a wrapper around Python's built-in `sqlite3` module. There is no ORM — all queries are raw SQL. The manager is instantiated once in `routes.py` and injected into route handlers via closure.
+Raw SQL wrapper around Python's `sqlite3`. No ORM. Instantiated once in `routes.py`. Uses `sqlite3.Row` as row factory so columns are accessible by name.
 
-```python
-# routes.py
-db_manager = DatabaseManager(config.DATABASE_PATH)
-```
+Schema is initialised by `_init_db()` on startup using `CREATE TABLE IF NOT EXISTS`. Migrations run inline: `PRAGMA table_info` checks column presence, then `ALTER TABLE ADD COLUMN` adds missing columns.
 
-The `get_connection()` method uses a context manager that ensures connections are always closed:
-
-```python
-with db_manager.get_connection() as conn:
-    cursor = conn.cursor()
-    cursor.execute(...)
-```
-
-`sqlite3.Row` is used as the row factory, which allows columns to be accessed by name (`row['column_name']`) as well as by index.
+**Special migration:** the `api_keys.key_type` column had a `NOT NULL CHECK (key_type IN ('domain','user'))` constraint in older databases with no default. `_init_db()` detects this and recreates the table (preserving all data) with the corrected constraint before adding new columns.
 
 ### Schema overview
 
-```
-api_keys ──────────────────────┐
-  id, key_type, name,          │
-  identifier, key_enc,         │
-  key_prefix, admin, active,   │
-  rate_per_minute/hour/day,    │
-  output_config                │
-                               │
-key_class_limits               │
-  key_type (domain/user/wildcard)
-  rate_per_minute/hour/day     │
-                               │
-registration_requests          │
-  id, api_key_id ──────────────┘
-  domain, name, contact_email,
-  reason, status, admin_note
-
-email_verifications
-  token, api_key_id, used, expires_at
-
-smtp_config
-  key, value  (key-value store)
-
-charts ─────────────────────────┐
-  id (UUID), chart_type,        │
-  chart_name, datetime_utc,     │
-  location_id, chart_data (JSON)│
-  chart_hash                    │
-                                │
-derived_charts                  │
-  id (UUID), chart_id ──────────┘
-  secondary_chart_id,
-  chart_type, chart_name,
-  chart_data (JSON)
-
-locations
-  id, query_text, latitude,
-  longitude, timezone_id,
-  formatted_address
-
-canonical_places ───────────────┐
-  id, google_place_id,          │
-  normalized_key, formatted_name│
-                                │
-place_aliases                   │
-  alias → canonical_place_id ───┘
-
-place_cache
-  canonical_place_id, geo_data (JSON),
-  expires_at
-
-place_lookup_log
-  query, result_type, duration_ms
-```
-
-### Table reference
+**Core keys:**
 
 | Table | Purpose |
 |---|---|
-| `api_keys` | All API keys — encrypted ciphertext, prefix, rate limits, output config |
-| `key_class_limits` | Default rate limits per key class |
-| `registration_requests` | Domain key registration submissions awaiting admin review |
-| `email_verifications` | One-time tokens for email verification (user key activation) |
-| `smtp_config` | SMTP server settings (key/value rows) |
-| `charts` | Cached natal and event charts |
-| `derived_charts` | Secondary progressions, returns, solar arc results |
-| `locations` | Geocoded location records (legacy) |
-| `canonical_places` | Deduplicated place records from Google |
-| `place_aliases` | Multiple query strings mapping to the same canonical place |
-| `place_cache` | Cached place resolution responses with expiry |
-| `place_lookup_log` | Performance and usage logging for geocoding |
+| `api_keys` | All accounts. `key_enc` (Fernet), `key_prefix`, `password_hash`, `must_change_password`, `admin`, `active`, rate overrides, output config |
+| `key_class_limits` | Single `'user'` row — default rate limits applied when key has no override |
+
+**Authentication:**
+
+| Table | Purpose |
+|---|---|
+| `email_verifications` | One-time tokens for email verification and password set/reset. `used` flag, `expires_at` |
+| `login_2fa_codes` | Short-lived 6-digit codes for the 2FA login step. `used` flag, `expires_at` |
+| `trusted_devices` | Long-lived device tokens that skip 2FA. `api_key_id` FK, `expires_at` |
+
+**Charts:**
+
+| Table | Purpose |
+|---|---|
+| `charts` | Cached natal/event charts. UUID PK, `chart_data` JSON |
+| `derived_charts` | Progressions, returns, solar arc. FK → `charts` |
+| `chart_archive` | Append-only permanent record (`INSERT OR IGNORE`) |
+| `chart_recalculations` | Audit trail of recalculations with optional note |
+
+**Views:**
+
+| Table | Purpose |
+|---|---|
+| `views` | UUID-keyed opaque JSON blobs for sharing. `GET /views?v=UUID` is public |
+
+**Location:**
+
+| Table | Purpose |
+|---|---|
+| `canonical_places` | Deduplicated place records |
+| `place_aliases` | Query strings → canonical place |
+| `place_cache` | Geocoding + timezone data (30-day expiry) |
+| `place_lookup_log` | Performance and usage logging |
+| `locations` | Legacy simple geocode cache |
+
+**Configuration:**
+
+| Table | Purpose |
+|---|---|
+| `smtp_config` | Key/value SMTP settings. Loaded fresh on each email send |
+| `portal_settings` | Key/value portal behaviour settings. Cached in PHP session |
+| `email_templates` | Per-template styling and content overrides |
 
 ---
 
-## 7. Output configuration system
+## 8. Output configuration system
 
-### How the three-level merge works
-
-Every calculation endpoint resolves an output configuration before touching the Swiss Ephemeris. The resolution happens in three layers, with later layers overriding earlier ones:
+Three-level merge applied at the start of every calculation:
 
 ```
-Layer 1:  OutputConfig.as_dict()     ← server-wide defaults (output_config.py)
-Layer 2:  g.user['output']           ← per-key stored overrides (api_keys.output_config)
-Layer 3:  request_body.get('output') ← per-request overrides (from the API caller)
+Layer 1: OutputConfig.as_dict()      ← server-wide defaults
+Layer 2: g.user['output']            ← per-key stored overrides
+Layer 3: request_body.get('output')  ← per-request overrides
 ```
 
-The merge is applied in routes.py at the start of each calculation handler:
+`api_keys.output_config` stores only the diffs from server defaults (sparse JSON). `NULL` means use all defaults.
 
-```python
-user_output       = user.get('output', {})
-request_overrides = data.get('output', {})
-
-output_cfg = OutputConfig.merge(user_output)           # Layer 1 + Layer 2
-output_cfg = OutputConfig.merge_onto(output_cfg, request_overrides)  # + Layer 3
-```
-
-**`OutputConfig.merge(overrides)`** starts from server defaults and applies `overrides` on top. Only keys present in `overrides` are changed.
-
-**`OutputConfig.merge_onto(base, overrides)`** applies `overrides` on top of an already-merged dict. Same logic, but the starting point is `base` not the class defaults.
-
-### OutputConfig class
-
-`output_config.py` is a class of class attributes (no instance needed) plus classmethods:
-
-```python
-class OutputConfig:
-    GEOCENTRIC   = True
-    HELIOCENTRIC = True
-    SUN          = True
-    # ... all defaults ...
-
-    @classmethod
-    def as_dict(cls) -> dict:       # returns full nested dict of defaults
-    @classmethod
-    def merge(cls, overrides) -> dict:      # server defaults + overrides
-    @classmethod
-    def merge_onto(cls, base, overrides) -> dict:  # base dict + overrides
-    @classmethod
-    def from_cfg(cls, cfg_dict) -> dict:    # import from .cfg flat format
-    @classmethod
-    def to_cfg_dict(cls, stored) -> dict:   # export to flat format for forms
-```
-
-### Storing and retrieving per-key config
-
-The `output_config` column in `api_keys` stores a **sparse JSON object** — only the values that differ from server defaults are saved. This means:
-
-- If a key has `output_config = NULL`, it uses server defaults for everything
-- If a key has `output_config = {"heliocentric": false}`, only heliocentric is overridden — everything else uses defaults
-- The full effective config is always computed fresh by merging, never stored
-
-When a user saves output config via the portal or `POST /me/output`, the full form state is sent but can be reduced to just the diffs. The current implementation stores whatever the user sends, which may include fields that match the server default — this is harmless since merge logic handles it correctly.
+Users can manage their own output config via `GET/POST /me/output` and the Output Config page in the portal. Admins can manage any key's config via `GET/POST /admin/keys/<id>/output`.
 
 ---
 
-## 8. Location resolution
-
-### Resolution pipeline
-
-When a location string arrives in a request, `place_repository.py` coordinates the lookup:
+## 9. Location resolution
 
 ```
-1. Normalise the query string (location_normaliser.py)
-   └─ lowercase, strip punctuation, canonical form
-
-2. Check place_aliases table
-   └─ Has this exact normalised string been looked up before?
-   └─ Yes → get canonical_place_id → go to step 5
-
-3. Check canonical_places table
-   └─ Does a canonical place with this normalised key exist?
-   └─ Yes → go to step 5
-
-4. Google Maps geocoding (geocoding.py)
-   └─ Call Maps Geocoding API
-   └─ Track usage (api_usage.py)
-   └─ Save to canonical_places
-   └─ Save alias mapping
-
-5. Check place_cache table
-   └─ Is there a non-expired cache entry for this canonical place?
-   └─ Yes → return cached data
-
-6. Google Maps timezone lookup (geocoding.py)
-   └─ Call Maps Timezone API
-   └─ Save result to place_cache (expires 30 days)
-
-7. Return location dict with lat, lon, timezone, UTC offset, DST flag
+Query string
+    → location_normaliser.py (lowercase, strip punctuation)
+    → place_aliases (alias → canonical_place_id?)
+    → canonical_places (normalised key match?)
+    → Google Maps Geocoding API (if no hit)
+        → save canonical_places + alias
+    → place_cache (non-expired entry?)
+    → Google Maps Timezone API (if cache miss)
+        → save place_cache (expires 30 days)
+    → return {lat, lon, timezone, utc_offset, dst_flag}
 ```
 
-### Caching strategy
-
-Two caches operate at different levels:
-
-**Alias cache** (`place_aliases`): maps normalised query strings to `canonical_place_id`. This is permanent — "London" always resolves to the same canonical place.
-
-**Place cache** (`place_cache`): stores the full geocoding + timezone data for a canonical place. Expires after 30 days. This handles DST changes — a place's UTC offset might change between summer and winter, so the full resolution is refreshed periodically.
-
-The `cleanup.py` module has functions for removing expired cache entries. It can be run as a cron job.
+With `USE_GOOGLE=false`, Google calls are replaced by cities5000 lookups.
 
 ---
 
-## 9. Email service
+## 10. Email service
 
-### Configuration priority
+`EmailService` loads SMTP config fresh on each instantiation. Database values override environment variables. If `host`, `user`, or `password` are missing, `self.enabled = False` and sending is silently skipped.
 
-`EmailService` loads its configuration fresh on each instantiation (i.e., each time an email is sent). This means admin changes to SMTP settings via the portal take effect immediately without a server restart.
+### portal_url resolution
 
-The load order:
+Email links to the portal (`verify.php`, `set-password.php`) use `self.portal_url`, resolved in this order:
 
-```python
-# 1. Try database (smtp_config table)
-db_cfg = db_manager.get_smtp_config()
+1. `smtp_config` table `portal_url` field
+2. `portal_settings` table `portal_url` field
+3. `PORTAL_URL` environment variable
+4. `self.base_url` fallback — **wrong for portal links** — logs a warning
 
-# 2. Fall back to environment variable for any missing key
-for key, (env_var, default) in _ENV_MAP.items():
-    db_val = db_cfg.get(key, '').strip()
-    cfg[key] = db_val if db_val else os.environ.get(env_var, default)
-```
+Always configure `portal_url` via Settings → Portal Settings, or set `PORTAL_URL` in `.env`.
 
-If `host`, `user`, and `password` are all set, `self.enabled = True` and email sending is active. If any are missing, sending is silently skipped with a warning log — this is intentional so the server can run without email configured (e.g. during development).
+### Template system
+
+Every email type (except raw 2FA codes) can be customised via the Email Templates admin page. Templates support `{variable}` substitution. The `_render_template_html()` method:
+- Splits `body_text` into `<p>` blocks
+- Auto-links bare `https://` URLs with `<a href>` tags
+- Applies styling from the template's appearance fields (bg colour, panel colour, content width, etc.)
+
+### Email types and their template names
+
+| Template name | Sent when |
+|---|---|
+| `registration-verification` | User registers — contains `{verify_url}` |
+| `set-password` | Email verified — contains `{set_password_url}` |
+| `password-reset-required` | Admin forces reset or user requests forgot-password — contains `{set_password_url}` |
+| `user-activated` | User sets password for first time — contains `{api_key}` |
+| `2fa-code` | Login requires 2FA — contains `{code}`, `{expiry_minutes}` |
+| `key-rotated` | Key rotated — contains `{api_key}` |
+| `test` | SMTP test send |
 
 ### Adding a new email type
 
-1. Add a new method to `EmailService` following the existing pattern:
-
-```python
-def send_my_notification(self, to_email: str, name: str, data: str) -> bool:
-    subject = "ephemeralREST — Your notification"
-    text = f"""Hello {name},\n\n{data}\n\nephemeralREST\n"""
-    html = f"""<!DOCTYPE html><html><body>
-      <h2>Your notification</h2>
-      <p>{data}</p>
-    </body></html>"""
-    return self._send(to_email, subject, text, html)
-```
-
-2. Call it from `routes.py` where the event occurs:
-
-```python
-svc = EmailService()
-svc.send_my_notification(to_email=record['contact_email'], name=record['name'], data=some_data)
-```
-
-The `_send()` method handles the SMTP connection, TLS/SSL selection, and error logging.
+1. Add a `send_*` method to `EmailService` following the existing pattern — accept `template: dict = None`, use `_substitute()` and `_render_template_html()` for the template path, and provide hardcoded fallback HTML.
+2. Add the template name and defaults to `_TEMPLATE_CONTENT_DEFAULTS` in `routes.py`.
+3. Add the template definition (label, desc, vars, defaults) to the `$templates` array in `email-templates.php`.
+4. Call the method from `routes.py` at the appropriate point, passing `template=_resolve_template('template-name')`.
 
 ---
 
-## 10. Routes reference
+## 11. Portal settings
 
-All 44 routes are in `routes.py`. They are organised in this order in the file:
+Portal behaviour is configurable at runtime without touching files. Settings are stored in the `portal_settings` database table (key/value) with built-in defaults in `DatabaseManager.PORTAL_SETTINGS_DEFAULTS`.
 
-| Section | Routes |
-|---|---|
-| Location | `/autocomplete`, `/locations/resolve` |
-| Charts | `/calculate`, `/chart/<id>`, `/cache/stats`, `/cache/cleanup`, `/health`, `/cors-test` |
-| Derived charts | `/chart/<id>/progressions`, `/chart/<id>/solar-arc`, `/chart/<id>/solar-return`, `/chart/<id>/lunar-return`, `/chart/<id>/derived`, `/derived/<id>` (GET + DELETE) |
-| Ephemeris | `/apsides`, `/lunations`, `/apsides/next`, `/ephemeris` |
-| Registration | `/register/domain`, `/register/user`, `/register/verify` |
-| Admin registrations | `/admin/registrations`, `/admin/registrations/<id>/approve`, `/admin/registrations/<id>/reject` |
-| Self-service | `/me`, `/me/output` (GET + POST), `/me/rotate` |
-| Admin keys | `/admin/keys` (GET), `/admin/keys/<id>` (GET + DELETE), `/admin/keys/<id>/disable`, `/admin/keys/<id>/enable`, `/admin/keys/<id>/rotate`, `/admin/keys/<id>/limits`, `/admin/keys/<id>/output` (GET + POST) |
-| Admin class limits | `/admin/class-limits/<type>`, `/admin/class-limits` |
-| Admin SMTP | `/admin/smtp` (GET + POST + DELETE), `/admin/smtp/test` |
+| Setting | Default | Description |
+|---|---|---|
+| `site_name` | `ephemeralREST` | Displayed in browser title and sidebar |
+| `site_version` | `1.0` | Shown in sidebar footer |
+| `session_timeout` | `1800` | PHP session idle timeout in seconds |
+| `trusted_device_days` | `28` | Trusted-device cookie lifetime |
+| `allow_admin_promotion` | `true` | Whether admins can promote/demote other admins via portal |
+| `logout_redirect_url` | `/login.php` | Where to redirect after sign-out |
+| `portal_url` | `''` | Public URL of the portal (used in email links) |
 
-The route handler for `/calculate` is the most complex in the codebase. It is worth reading through it in full to understand the calculation and caching flow before modifying anything in that area.
+The PHP portal reads these via `portal_settings_get()` (in `includes/api.php`), which caches the result in `$_SESSION['portal_settings']` for the duration of the session. After saving via the portal's Settings page, the cache is immediately busted with `unset($_SESSION['portal_settings'])`.
 
----
+Endpoints: `GET /admin/portal-settings`, `POST /admin/portal-settings`, `DELETE /admin/portal-settings/<key>`.
 
-## 11. The admin portal (PHP)
-
-### File structure
-
-The portal is a set of standalone PHP scripts. There is no framework, router, or ORM. Each `.php` file is a complete page: it handles POST actions at the top, fetches data from the API, then includes `header.php`, outputs its HTML, and includes `footer.php`.
-
+`config.php` in the portal now contains **only two values**:
 ```php
-<?php
-require_once __DIR__ . '/config.php';
-require_once __DIR__ . '/includes/api.php';
-require_once __DIR__ . '/includes/auth.php';
-auth_require('admin');        // redirect to login if not authenticated
-
-$page_title = 'My Page';
-
-// Handle POST at the top
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ...) {
-    // ...
-}
-
-// Fetch data
-$result = my_api_get('/some/endpoint');
-
-// Render
-require_once __DIR__ . '/includes/header.php';
-?>
-
-<!-- HTML here -->
-
-<?php require_once __DIR__ . '/includes/footer.php'; ?>
+define('API_BASE',  'https://api.yourdomain.com');
+define('SITE_NAME', 'ephemeralREST');
 ```
+Everything else is controlled via the portal settings UI.
+
+---
+
+## 12. Routes reference
+
+Routes are organised in this order in `routes.py`:
+
+| Section | Key routes |
+|---|---|
+| First-run setup | `GET /setup/status`, `POST /setup` |
+| Registration | `POST /register`, `GET /register/verify` |
+| Login / auth | `POST /login`, `POST /login/2fa`, `POST /password/forgot`, `POST /password/set` |
+| Infrastructure | `GET /ping`, `GET /health`, `GET /cache/stats`, `POST /cache/cleanup` |
+| Location | `GET /autocomplete`, `POST /locations/resolve` |
+| Charts | `POST /calculate`, `GET /chart/<id>` |
+| Derived charts | `/chart/<id>/progressions`, `/solar-arc`, `/solar-return`, `/lunar-return`, `/derived` |
+| Ephemeris | `POST /apsides`, `/apsides/next`, `/lunations`, `/ephemeris`, `/eclipses` |
+| Views | `POST /views`, `PUT /views/<uuid>`, `GET /views?v=<uuid>` |
+| Archive | `GET /archive`, `GET /archive/<chart_id>` |
+| Self-service | `GET /me`, `GET/POST /me/output`, `POST /me/rotate`, `POST /me/forget-device` |
+| Admin — keys | `GET /admin/keys`, `GET/DELETE /admin/keys/<id>`, `/disable`, `/enable`, `/rotate`, `/limits`, `/output`, `/force-password-reset` |
+| Admin — config | `GET/POST /admin/class-limits`, `GET/POST/DELETE /admin/smtp`, `POST /admin/smtp/test` |
+| Admin — portal | `GET/POST /admin/portal-settings`, `DELETE /admin/portal-settings/<key>` |
+| Admin — templates | `GET/POST /admin/email-templates/<name>`, `POST /admin/email-templates/<name>/reset` |
+
+**Public endpoints** (no `X-API-Key` required): `/setup/status`, `/setup`, `/register`, `/register/verify`, `/login`, `/login/2fa`, `/password/forgot`, `/password/set`, `/ping`, `/autocomplete`, `/chart/<id>` (public for sharing), `GET /views?v=<uuid>`.
+
+---
+
+## 13. The admin portal (PHP)
 
 ### Authentication flow
 
-The portal has its own session-based authentication separate from the API key authentication:
-
 ```
-1. User visits any protected page
-2. auth_require() in auth.php checks $_SESSION['logged_in']
-3. Not logged in → redirect to /login.php
-4. User enters API key in login.php
-5. login.php calls auth_login($api_key)
-6. auth_login() makes GET /me with the supplied key
-7. /me returns the user's identity and key type
-8. Identity stored in $_SESSION['user'], $_SESSION['api_key']
-9. Redirected to appropriate portal:
-   - admin    → portal-admin.php
-   - domain   → portal-domain.php
-   - user     → portal-user.php
+1. Any page → auth_require() → checks $_SESSION['logged_in']
+2. Not logged in → /login.php
+3. Also checks /setup/status → redirects to setup.php if DB is empty
+4. User submits email + password
+5. auth_attempt_login() → POST /login
+6. Response:
+   - must_change_password → /set-password.php
+   - 2fa_required → /2fa.php
+   - logged_in (trusted device or admin+no SMTP) → portal
+7. If 2FA required: user enters code → POST /login/2fa
+8. On success: identity + decrypted API key stored in $_SESSION['user']
+9. Admin → portal-admin.php, user → portal-user.php
 ```
 
-Every subsequent API call uses `my_api_get()` / `my_api_post()` from `auth.php`, which reads `$_SESSION['api_key']` and includes it as `X-API-Key`. This means the portal always operates with the permissions of the signed-in user's key.
+`my_api_get()` / `my_api_post()` in `includes/auth.php` use `$_SESSION['user']['api_key']` for all subsequent calls.
+
+`api_get()` / `api_post()` in `includes/api.php` can optionally authenticate with the session key (`$auth=true`, default) or make unauthenticated calls (`$auth=false`) for public endpoints.
 
 ### AJAX pattern
 
-All modal saves and in-page updates use a consistent AJAX pattern. The PHP file handles both regular page loads and AJAX requests, distinguished by the `X-Requested-With: XMLHttpRequest` header:
+PHP files handle both page loads and AJAX requests distinguished by `X-Requested-With: XMLHttpRequest`:
 
 ```php
-// PHP side — detect AJAX
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_SERVER['HTTP_X_REQUESTED_WITH'])) {
     header('Content-Type: application/json');
-    $input  = json_decode(file_get_contents('php://input'), true) ?? [];
-    $action = $input['action'] ?? '';
-    // ... handle and echo json_encode([...])
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
+    // handle, echo json_encode([...])
     exit;
 }
 ```
 
-```javascript
-// JS side — make request
-const res  = await fetch('/page.php', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
-    body: JSON.stringify({ action: 'save', ...data })
-});
-const data = await res.json();
-data.status = data.status ?? res.status;  // ensure status is always present
-```
-
-All JS error display uses the `apiError(data)` function (defined inline per page) which handles 429 specially and falls back through `data.error → data.message → 'HTTP N'`.
-
 ### Adding a new page
 
-1. Copy the pattern from an existing page (e.g. `class-limits.php`)
-2. Add it to the nav arrays in `includes/header.php`:
+1. Create `my-page.php` following the pattern of an existing page (e.g. `class-limits.php`)
+2. Start with: `require_once __DIR__ . '/config.php';` → `api.php` → `auth.php` → `auth_require('admin');`
+3. Add to the appropriate nav array in `includes/header.php`:
 
 ```php
-// In the $admin_nav array:
-'my-page' => ['label' => 'My Page', 'icon' => '◎'],
-
-// In the nav loop:
-<?php foreach (['portal-admin','registrations','keys','class-limits','smtp','my-page'] as $page): ?>
+$admin_nav['my-page'] = ['label' => 'My Page', 'icon' => '◎', 'section' => null];
 ```
 
-3. Add any new API endpoints it needs to `routes.py` and the protected endpoints list in `app.py`
+4. Add any new API endpoints to `routes.py` and the `_protected` list in `app.py`
 
 ---
 
-## 12. Registration and key provisioning
+## 14. Registration and key provisioning
 
-### Domain key registration flow
+### Self-serve registration flow
 
 ```
-User fills form → POST /register/domain
-    │
-    ├─ Creates api_keys record (active=0, key generated and encrypted)
-    ├─ Creates registration_requests record (status='pending')
-    └─ Sends confirmation email to registrant
-       Sends notification email to admin
+POST /register  (name + email)
+    └─ Creates api_keys record (active=0, must_change_password=1)
+       Creates email_verifications token
+       Sends registration-verification email → {portal_url}/verify.php?t=TOKEN
 
-Admin reviews in portal → POST /admin/registrations/<id>/approve
-    │
-    ├─ Sets api_keys.active = 1
-    ├─ Sets registration_requests.status = 'approved'
-    └─ Sends approval email containing plaintext key
-       (key is re-decrypted from database for this email only)
+User clicks link → verify.php?t=TOKEN (portal)
+    └─ Portal calls GET /register/verify?t=TOKEN
+       API activates account, issues set-password token
+       Sends set-password email → {portal_url}/set-password.php?t=TOKEN
+       Portal renders success page
+
+User clicks link → set-password.php?t=TOKEN (portal)
+    └─ User sets password → POST /password/set { token, new_password }
+       API sets password_hash, clears must_change_password
+       Sends user-activated email containing decrypted API key
+       User can now log in
 ```
 
-The key is generated at registration time and stored encrypted. The plaintext key is not stored anywhere after the initial creation — it is re-derived from the ciphertext using Fernet decryption when needed for the approval email.
+### Forgot password flow
+
+```
+POST /password/forgot  (email)
+    └─ Generates token, sends password-reset-required email
+       Generic response regardless of whether email is registered
+
+User clicks reset link → set-password.php?t=TOKEN (portal)
+    └─ Same set-password flow as above
+       does NOT resend user-activated email (is_new_account = False)
+```
+
+### Admin-forced password reset
+
+```
+POST /admin/keys/<id>/force-password-reset
+    └─ Sets must_change_password=1
+       Deletes all trusted_devices for key
+       Generates token, sends password-reset-required email
+```
 
 ### Key rotation
 
-When a key is rotated (by admin via `POST /admin/keys/<id>/rotate`, or by the user via `POST /me/rotate`):
+```
+POST /me/rotate  or  POST /admin/keys/<id>/rotate
+    1. Generate new plaintext key
+    2. Encrypt with KeyCrypto
+    3. Update key_enc and key_prefix in api_keys
+    4. Return plaintext in response (once only)
+    5. Send key-rotated email if SMTP configured
+```
+
+### First-run admin setup
 
 ```
-1. Generate new random plaintext key
-2. Encrypt with KeyCrypto
-3. Update api_keys.key_enc and api_keys.key_prefix
-4. Return plaintext key in response (once only)
-5. Old key is immediately invalid — Fernet decryption of the old
-   ciphertext would produce a different string
+POST /setup  (name + email + password)
+    └─ Only works when api_keys table is empty
+       Creates admin account: active=1, admin=1, must_change_password=0
+       Returns plaintext API key in response (shown once on setup.php)
+       After this, /setup always returns 403
 ```
 
 ---
 
-## 13. Key manager CLI
+## 15. Key manager CLI
 
-`key_manager.py` is a command-line tool for managing keys without using the API. It connects directly to the database. Use it for initial setup and emergency administration.
+`key_manager.py` connects directly to the database for emergency administration without needing the API.
 
 ```bash
 source .venv/bin/activate
-python3 key_manager.py --help
 
-# Create an admin key
-python3 key_manager.py create --type domain --identifier admin.local --name "Admin" --admin
+# Create an admin key (prompts for password)
+python3 key_manager.py create --identifier admin@example.com --name "Admin" --admin
 
-# List all active keys
+# List all keys
 python3 key_manager.py list
 
-# Show a key's details (including decrypted prefix confirmation)
-python3 key_manager.py show --identifier myapp.com
+# Rotate a key
+python3 key_manager.py rotate --identifier admin@example.com
 
-# Rotate a key (prints new plaintext key)
-python3 key_manager.py rotate --identifier myapp.com
-
-# Set rate limits
-python3 key_manager.py set-limits --identifier myapp.com --per-minute 30 --per-hour 400
+# Set per-key rate limits
+python3 key_manager.py set-limits --identifier user@example.com --per-minute 30
 
 # Set class defaults
-python3 key_manager.py class-limits --type domain --per-minute 20 --per-hour 200 --per-day 1000
-
-# Import from legacy .cfg files
-python3 key_manager.py migrate
+python3 key_manager.py class-limits --per-minute 10 --per-hour 100 --per-day 500
 ```
 
-The CLI creates an `EmailService` instance on commands that send email (approval, rotation). If SMTP is not configured, the email step is skipped and a warning is printed.
+`create` now prompts for an optional password during key creation. If left blank, `must_change_password=1` is set and the user must set a password via the portal before they can log in.
 
 ---
 
-## 14. Adding a new endpoint
-
-This section walks through the full process of adding a new endpoint to the API.
+## 16. Adding a new endpoint
 
 ### Step 1: Define the route in routes.py
 
 ```python
 @api.route('/my-endpoint', methods=['POST'])
 def my_endpoint():
-    """
-    Short description of what this does.
-    """
+    """Short description."""
     user = getattr(g, 'user', {})
-    # Optional: admin check
     if not user.get('admin'):
         return _error('Admin access required', 403)
 
-    data = request.get_json(silent=True) or {}
-
-    # Validate
+    data     = request.get_json(silent=True) or {}
     my_field = data.get('my_field', '').strip()
     if not my_field:
         return _error('my_field is required', 400)
 
-    # Do the work
-    result = some_service.do_something(my_field)
-
+    result = db_manager.some_method(my_field)
     return jsonify({'result': result})
 ```
 
-### Step 2: Add to the protected endpoints list in app.py
-
-If the endpoint requires authentication, add it:
+### Step 2: Add to _protected in app.py (if authenticated)
 
 ```python
 _protected = [
-    # ... existing endpoints ...
+    # ...
     'api.my_endpoint',
 ]
 ```
 
-If it is a public endpoint, do not add it — unauthenticated requests will pass through.
+Public endpoints (login, register, setup, etc.) must NOT be in `_protected`.
 
 ### Step 3: Add a validator if needed
 
-For complex request bodies, add a Marshmallow schema in `validators.py`:
-
 ```python
+# validators.py
 class MyEndpointSchema(Schema):
-    my_field   = fields.Str(required=True)
-    optional   = fields.Int(load_default=10)
+    my_field = fields.Str(required=True, validate=validate.Length(max=100))
 
-    @validates('my_field')
-    def validate_my_field(self, value):
-        if len(value) > 100:
-            raise ValidationError('my_field must be 100 characters or less')
-```
-
-Then use the `@validate_request` decorator in `routes.py`:
-
-```python
+# routes.py
 @api.route('/my-endpoint', methods=['POST'])
 @validate_request(MyEndpointSchema)
 def my_endpoint(validated_data):
     my_field = validated_data['my_field']
 ```
 
-### Step 4: Update the documentation
+### Step 4: Update the docs
 
-Update `api-reference.md` with:
-- A description of the endpoint
-- The request field table
-- A `curl` example
-- The response structure
+Update `API_REFERENCE.md` with a description, field table, curl example, and response structure.
 
 ---
 
-## 15. Common patterns and conventions
+## 17. Common patterns and conventions
 
 ### Error returns
 
 Always use `_error()`:
-
 ```python
 return _error('chart_name is required', 400)
 return _error('Chart not found', 404)
 return _error('Admin access required', 403)
 ```
 
-Never return raw strings or non-JSON bodies.
-
 ### Admin checks
-
-Every admin endpoint starts with:
 
 ```python
 user = getattr(g, 'user', {})
@@ -996,66 +808,65 @@ if not user.get('admin'):
     return _error('Admin access required', 403)
 ```
 
-### Database access in routes
+### Public endpoint pattern
 
-`db_manager` and `astro_service` are module-level objects in `routes.py`, available to all route handlers by closure.
+Public endpoints (no auth) simply omit the admin/user check. They must not be added to `_protected` in `app.py`.
 
-### JSON column handling
-
-The `output_config` and `chart_data` columns store JSON as text. `DatabaseManager` handles serialisation/deserialisation automatically in its methods. Do not call `json.dumps` or `json.loads` manually when using `db_manager` methods.
-
-### UUIDs for chart IDs
-
-Charts and derived charts use UUID4 as their primary key (stored as text). Generate with:
-
-```python
-import uuid
-chart_id = str(uuid.uuid4())
-```
-
-### PHP: always use htmlspecialchars
-
-All user-provided data rendered in PHP HTML must be escaped:
+### PHP: always escape output
 
 ```php
 <?= htmlspecialchars($value) ?>
 ```
 
-Never echo unescaped strings.
-
 ### PHP: my_api_* vs api_*
 
-- `my_api_get()` / `my_api_post()` — use the logged-in session key. Use for all authenticated pages.
-- `api_get()` / `api_post()` — use `ADMIN_API_KEY` from `config.php`. Use only for public endpoints or in scripts that run without a session.
+- `my_api_get()` / `my_api_post()` — use the session key. For all authenticated pages.
+- `api_get()` / `api_post($url, $body, $auth=false)` — use `$auth=false` for public endpoints.
+
+### PHP: portal_setting()
+
+Read portal settings instead of PHP constants:
+```php
+$timeout = (int)portal_setting('session_timeout', 1800);
+$days    = (int)portal_setting('trusted_device_days', 28);
+```
 
 ---
 
-## 16. Configuration reference
+## 18. Configuration reference
 
-All values are set in `.env`. The `Config` class in `config.py` exposes them.
+All values set in `.env`. The `Config` class in `config.py` exposes them.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SECRET_KEY` | Yes | — | Used to derive Fernet encryption key. Never change on a live system |
+| `SECRET_KEY` | Yes | — | Fernet encryption key derivation. Never change on a live system |
 | `DATABASE_PATH` | No | `ephemeral.db` | Path to SQLite database file |
 | `SWISS_EPHEMERIS_PATH` | Yes | — | Path to directory containing `.se1` data files |
-| `GOOGLE_MAPS_API_KEY` | Yes | — | Google Maps API key (Geocoding + Timezone APIs must be enabled) |
+| `GOOGLE_MAPS_API_KEY` | If `USE_GOOGLE=true` | — | Google Maps API key |
+| `USE_GOOGLE` | No | `true` | `false` = offline mode using cities5000 only |
 | `FLASK_HOST` | No | `127.0.0.1` | Host to bind to |
 | `FLASK_PORT` | No | `5000` | Port to bind to |
-| `FLASK_DEBUG` | No | `false` | Enable Flask debug mode — never true in production |
+| `FLASK_DEBUG` | No | `false` | Never true in production |
 | `RATE_LIMIT_ENABLED` | No | `true` | Enable rate limiting |
-| `RATE_LIMIT_PER_MINUTE` | No | `30` | Global fallback per-minute limit |
-| `RATE_LIMIT_PER_HOUR` | No | `300` | Global fallback per-hour limit |
-| `RATE_LIMIT_PER_DAY` | No | `2000` | Global fallback per-day limit |
+| `RATE_LIMIT_PER_MINUTE` | No | `30` | Global fallback rate limit |
+| `RATE_LIMIT_PER_HOUR` | No | `300` | Global fallback rate limit |
+| `RATE_LIMIT_PER_DAY` | No | `2000` | Global fallback rate limit |
 | `CORS_ORIGINS` | No | `*` | Allowed CORS origins (comma-separated) |
-| `MAX_MONTHLY_REQUESTS` | No | `5000` | Google API monthly budget cap |
-| `USAGE_COUNT_FILE` | No | `api_usage.json` | Path for usage tracking file |
-| `SMTP_HOST` | No | — | SMTP server hostname (can be set via portal instead) |
-| `SMTP_PORT` | No | `587` | SMTP port |
-| `SMTP_USER` | No | — | SMTP username |
-| `SMTP_PASSWORD` | No | — | SMTP password |
-| `SMTP_FROM` | No | — | From address (defaults to SMTP_USER) |
-| `SMTP_TLS` | No | `true` | Enable STARTTLS |
-| `SMTP_SSL` | No | `false` | Use SSL connection (port 465) |
-| `ADMIN_EMAIL` | No | — | Receives new registration notifications |
-| `API_BASE_URL` | No | `http://localhost:5000` | Used in email links |
+| `CACHE_EXPIRY_DAYS` | No | `90` | Chart cache TTL |
+| `TRUSTED_DEVICE_DAYS` | No | `28` | Trusted-device token lifetime (database value takes precedence) |
+| `TWO_FACTOR_CODE_EXPIRY_MINUTES` | No | `10` | 2FA code validity window |
+| `PORTAL_URL` | Recommended | — | Public URL of the admin portal. Used in email links. Set this or use portal settings. |
+| `API_BASE_URL` | No | `http://localhost:5000` | Used in verification email links |
+
+SMTP settings can be set via `.env` or via the admin portal's SMTP Settings page. Database values take precedence.
+
+| SMTP Variable | Default | Description |
+|---|---|---|
+| `SMTP_HOST` | — | Mail server hostname |
+| `SMTP_PORT` | `587` | SMTP port |
+| `SMTP_USER` | — | SMTP username |
+| `SMTP_PASSWORD` | — | SMTP password |
+| `SMTP_FROM` | SMTP_USER | From address |
+| `SMTP_TLS` | `true` | Enable STARTTLS |
+| `SMTP_SSL` | `false` | Use SSL (port 465) |
+| `SMTP_ADMIN_EMAIL` | — | Receives admin notifications |

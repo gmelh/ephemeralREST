@@ -38,7 +38,7 @@ import logging
 import pytz
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
-from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterDomainSchema, RegisterUserSchema, AdminReviewSchema, SaveViewSchema
+from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterSchema, AdminReviewSchema, SaveViewSchema, LoginSchema, Login2FASchema, SetPasswordSchema, SetupSchema
 from output_config import OutputConfig
 from email_service import EmailService
 import secrets as _secrets
@@ -295,6 +295,83 @@ def cache_cleanup():
     except Exception as e:
         logger.error(f"Cache cleanup error: {str(e)}", exc_info=True)
         return _error(f'Cache cleanup failed: {str(e)}', 500)
+
+
+@api.route('/setup/status', methods=['GET'])
+def setup_status():
+    """
+    Return whether the system needs initial setup.
+
+    Public endpoint — safe to call before any keys exist.
+    Response: { "setup_required": true|false }
+    """
+    return jsonify({'setup_required': db_manager.is_database_empty()})
+
+
+@api.route('/setup', methods=['POST'])
+@validate_request(SetupSchema)
+def setup(validated_data):
+    """
+    First-run setup — create the initial administrator account.
+
+    Only works when the database contains no API keys at all. Once any
+    key exists this endpoint returns 403, permanently.
+
+    Body: { "name": "...", "email": "...", "password": "..." }
+
+    On success, the account is immediately active (no email verification
+    required) with admin=True and must_change_password=False. The
+    decrypted API key is returned once in the response so the portal
+    can store it in the session — the user does not need to see or
+    record it.
+    """
+    from werkzeug.security import generate_password_hash
+    from key_crypto import KeyCrypto
+    from config import Config
+
+    if not db_manager.is_database_empty():
+        return _error('Setup has already been completed', 403)
+
+    name     = validated_data['name'].strip()
+    email    = validated_data['email'].strip().lower()
+    password = validated_data['password']
+
+    crypto    = KeyCrypto(Config.SECRET_KEY)
+    plaintext = KeyCrypto.generate_key()
+    key_enc   = crypto.encrypt(plaintext)
+    prefix    = crypto.prefix(plaintext)
+
+    key_id = db_manager.create_api_key(
+        name=name,
+        identifier=email,
+        key_enc=key_enc,
+        key_prefix=prefix,
+        admin=True,
+        active=True,
+    )
+
+    db_manager.update_api_key(
+        key_id,
+        password_hash=generate_password_hash(password),
+        must_change_password=0,
+    )
+
+    logger.info(f"Setup: initial admin account created for '{email}' (key_id={key_id})")
+
+    return jsonify({
+        'message':    'Setup complete. Administrator account created.',
+        'id':         key_id,
+        'name':       name,
+        'identifier': email,
+        'admin':      True,
+        'api_key':    plaintext,
+    }), 201
+
+
+@api.route('/ping', methods=['GET'])
+def ping():
+    """Public availability check — no auth required."""
+    return jsonify({'status': 'ok'})
 
 
 @api.route('/health', methods=['GET'])
@@ -1293,118 +1370,47 @@ def get_archive_entry(chart_id):
     })
 
 
-# ---------------------------------------------------------------------------
-# Registration — Domain
-# ---------------------------------------------------------------------------
-
-@api.route('/register/domain', methods=['POST'])
-@validate_request(RegisterDomainSchema)
-def register_domain(validated_data):
-    """
-    Submit a domain API key registration request.
-
-    The key is created immediately but left inactive (active=0).
-    An admin must approve it via POST /admin/registrations/<id>/approve.
-    The contact_email receives a confirmation that the request was received,
-    and a second email when approved or rejected.
-
-    Body: domain, name, contact_email, reason (optional)
-    """
-    domain        = validated_data['domain'].lower().strip()
-    name          = validated_data['name'].strip()
-    contact_email = validated_data['contact_email'].strip()
-    reason        = validated_data.get('reason')
-
-    # Reject duplicate domain
-    if db_manager.domain_registration_exists(domain):
-        return _error(f"A registration request for '{domain}' already exists", 409)
-
-    # Also check api_keys table for an existing active/inactive key
-    all_keys = db_manager.get_all_api_keys(include_inactive=True)
-    if any(k['identifier'] == domain for k in all_keys):
-        return _error(f"An API key for '{domain}' already exists", 409)
-
-    from key_crypto import KeyCrypto
-    from config import Config
-
-    crypto    = KeyCrypto(Config.SECRET_KEY)
-    plaintext = KeyCrypto.generate_key()
-    key_enc   = crypto.encrypt(plaintext)
-    prefix    = crypto.prefix(plaintext)
-
-    # Create key — inactive until approved
-    key_id = db_manager.create_api_key(
-        key_type='domain',
-        name=name,
-        identifier=domain,
-        key_enc=key_enc,
-        key_prefix=prefix,
-        admin=False,
-        active=False,
-    )
-
-    # Create registration request record
-    request_id = db_manager.create_registration_request(
-        api_key_id=key_id,
-        domain=domain,
-        name=name,
-        reason=reason,
-        contact_email=contact_email,
-    )
-
-    # Emails
-    email_svc = EmailService()
-    email_svc.send_domain_registration_received(contact_email, name, domain, template=_resolve_template('register-domain'))
-    email_svc.send_admin_new_registration(domain, name, contact_email, reason, request_id)
-
-    logger.info(f"Domain registration request: '{domain}' (request_id={request_id}, key_id={key_id})")
-
-    return jsonify({
-        'message':    'Registration request received and pending admin review',
-        'domain':     domain,
-        'request_id': request_id,
-        'status':     'pending',
-    }), 201
-
 
 # ---------------------------------------------------------------------------
-# Registration — User
+# Registration — self-serve, email verification
 # ---------------------------------------------------------------------------
 
-@api.route('/register/user', methods=['POST'])
-@validate_request(RegisterUserSchema)
-def register_user(validated_data):
+@api.route('/register', methods=['POST'])
+@validate_request(RegisterSchema)
+def register(validated_data):
     """
-    Submit a user API key registration request.
+    Register for an account.
 
-    The key is created inactive. A verification email is sent — clicking
-    the link activates the key and returns the plaintext key once.
+    Accepts a name and email address. Sends a verification email containing
+    a link the user must click to confirm their address. Once verified, the
+    user is emailed a link to set a password — the account becomes usable
+    once that's done. The underlying API key is generated immediately but
+    is never shown to the user; it is decrypted transparently on login.
 
-    Body: email, name
+    Body: { "name": "...", "email": "..." }
     """
+    import secrets as _secrets
+
     email = validated_data['email'].strip().lower()
     name  = validated_data['name'].strip()
 
-    # Reject duplicates
+    # Don't reveal whether the email is already registered
     all_keys = db_manager.get_all_api_keys(include_inactive=True)
     if any(k['identifier'] == email for k in all_keys):
-        # Return 200 with generic message — don't leak whether email exists
         return jsonify({
-            'message': 'If this email is not already registered, a verification email has been sent'
+            'message': 'If this email is not already registered, a verification email has been sent.'
         })
+
+    token = _secrets.token_urlsafe(32)
 
     from key_crypto import KeyCrypto
     from config import Config
-
     crypto    = KeyCrypto(Config.SECRET_KEY)
     plaintext = KeyCrypto.generate_key()
     key_enc   = crypto.encrypt(plaintext)
     prefix    = crypto.prefix(plaintext)
 
-    # Store plaintext encrypted separately so we can return it after verification
-    # We re-encrypt the plaintext under a one-time token for safe retrieval
     key_id = db_manager.create_api_key(
-        key_type='user',
         name=name,
         identifier=email,
         key_enc=key_enc,
@@ -1413,13 +1419,6 @@ def register_user(validated_data):
         active=False,
     )
 
-    # Store plaintext encrypted in output_config temporarily for post-verify reveal
-    # It is cleared after verification completes
-    reveal_enc = crypto.encrypt(plaintext)
-    db_manager.update_api_key(key_id, output_config={'_pending_reveal': reveal_enc})
-
-    # Create verification token
-    token = _secrets.token_urlsafe(32)
     db_manager.create_email_verification(
         api_key_id=key_id,
         email=email,
@@ -1427,12 +1426,15 @@ def register_user(validated_data):
     )
 
     email_svc = EmailService()
-    email_svc.send_user_verification(email, name, token, template=_resolve_template('user-verify'))
+    email_svc.send_registration_verification(
+        email, name, token,
+        template=_resolve_template('registration-verification')
+    )
 
-    logger.info(f"User registration: '{email}' (key_id={key_id}) — verification sent")
+    logger.info(f"Registration: '{email}' (key_id={key_id}) — verification sent")
 
     return jsonify({
-        'message': 'Verification email sent. Click the link in the email to activate your API key.',
+        'message': 'Verification email sent. Click the link in the email to verify your address.',
         'email':   email,
     }), 201
 
@@ -1440,13 +1442,17 @@ def register_user(validated_data):
 @api.route('/register/verify', methods=['GET'])
 def verify_email():
     """
-    Activate a user API key from an email verification link.
+    Verify an email address from the link in the registration email.
 
-    Query param: t — the verification token from the email
+    Query param: t — the verification token
 
-    The plaintext API key is returned once in the response.
-    The token is marked used and the key activated.
+    Activates the account and sends a follow-up email containing a link
+    to the "set your password" page. The API key itself is never emailed —
+    it remains encrypted server-side until the user authenticates via the
+    portal (email + password + 2FA).
     """
+    import secrets as _secrets
+
     token = request.args.get('t', '').strip()
     if not token:
         return _error('Verification token is required', 400)
@@ -1458,164 +1464,342 @@ def verify_email():
     key_id = record['api_key_id']
     email  = record['email']
 
-    # Retrieve and decrypt the pending plaintext key
-    all_keys    = db_manager.get_all_api_keys(include_inactive=True)
-    key_record  = next((k for k in all_keys if k['id'] == key_id), None)
+    key_record = db_manager.get_api_key_by_id(key_id)
     if not key_record:
-        return _error('Key record not found', 500)
+        return _error('Account not found', 500)
 
-    from key_crypto import KeyCrypto
-    from config import Config
-    crypto = KeyCrypto(Config.SECRET_KEY)
-
-    # Retrieve pending reveal, activate key, clear reveal field
-    output_cfg  = key_record.get('output_config') or {}
-    reveal_enc  = output_cfg.pop('_pending_reveal', None)
-    plaintext   = crypto.decrypt(reveal_enc) if reveal_enc else None
-
-    db_manager.update_api_key(key_id, active=1, output_config=output_cfg or None)
+    # Activate the account. The plaintext key stays encrypted in key_enc —
+    # it never needs to be shown to the user, since login decrypts it
+    # transparently once a password has been set.
+    db_manager.update_api_key(key_id, active=1)
     db_manager.mark_email_verification_used(token)
 
-    logger.info(f"Email verified: '{email}' (key_id={key_id}) — key activated")
+    logger.info(f"Email verified: '{email}' (key_id={key_id}) — account activated")
 
-    # Email the API key to the user — this is the one and only time it is delivered
-    if plaintext:
-        email_svc = EmailService()
-        email_svc.send_user_key_activated(email, key_record.get('name', ''), plaintext, template=_resolve_template('user-activated'))
-        logger.info(f"API key emailed to '{email}' (key_id={key_id})")
+    # Issue a set-password token (reuses the email_verifications table)
+    set_password_token = _secrets.token_urlsafe(32)
+    db_manager.create_email_verification(
+        api_key_id=key_id,
+        email=email,
+        token=set_password_token,
+    )
+
+    email_svc = EmailService()
+    email_svc.send_set_password(
+        email, key_record.get('name', ''), set_password_token,
+        template=_resolve_template('set-password')
+    )
+    logger.info(f"Set-password link emailed to '{email}' (key_id={key_id})")
 
     return jsonify({
-        'message':    'Email verified. Your API key has been sent to your email address.',
+        'message':    'Email verified. Check your email for a link to set your password.',
         'email':      email,
         'key_active': True,
     })
 
 
 # ---------------------------------------------------------------------------
-# Admin — Registration management
+# Login — email + password, 2FA, trusted devices
 # ---------------------------------------------------------------------------
 
-@api.route('/admin/registrations', methods=['GET'])
-def admin_list_registrations():
+def _user_identity_response(key_record, plaintext_key):
+    """Build the identity + decrypted API key payload returned on full login."""
+    class_limits = db_manager.get_key_class_limits('user')
+    rate_limits = {
+        'per_minute': key_record.get('rate_per_minute') or class_limits['rate_per_minute'],
+        'per_hour':   key_record.get('rate_per_hour')   or class_limits['rate_per_hour'],
+        'per_day':    key_record.get('rate_per_day')    or class_limits['rate_per_day'],
+    }
+    if key_record.get('admin'):
+        rate_limits = {'per_minute': None, 'per_hour': None, 'per_day': None}
+
+    return {
+        'id':          key_record['id'],
+        'name':        key_record['name'],
+        'identifier':  key_record['identifier'],
+        'admin':       bool(key_record.get('admin')),
+        'active':      bool(key_record.get('active')),
+        'rate_limits': rate_limits,
+        'output':      key_record.get('output_config') or {},
+        'api_key':     plaintext_key,
+    }
+
+
+@api.route('/login', methods=['POST'])
+@validate_request(LoginSchema)
+def login(validated_data):
     """
-    List domain registration requests.
-    Optional query param: status — pending | approved | rejected
-    Requires admin API key.
+    Log in with email and password.
+
+    Body: { "email": "...", "password": "...", "device_token": "..." (optional) }
+
+    Responses:
+      - { "must_change_password": true, "email": "..." }
+        — the account has no password set yet, or an admin has required a
+          reset. The client should direct the user to /password/set.
+
+      - { "2fa_required": true, "email": "..." }
+        — credentials are correct but no valid trusted-device token was
+          supplied. A verification code has been emailed; call /login/2fa
+          to complete the login.
+
+      - { identity fields..., "api_key": "..." }
+        — login complete (credentials correct AND a valid device_token was
+          supplied). The decrypted API key is included for the portal
+          session; it is not stored anywhere new.
     """
-    user = getattr(g, 'user', {})
-    if not user.get('admin'):
-        return _error('Admin access required', 403)
+    email    = validated_data['email'].strip().lower()
+    password = validated_data['password']
+    device_token = validated_data.get('device_token')
 
-    status   = request.args.get('status')
-    requests = db_manager.get_registration_requests(status=status)
-    return jsonify({
-        'count':    len(requests),
-        'status':   status or 'all',
-        'requests': requests,
-    })
+    # Generic error to avoid revealing whether an email is registered
+    invalid = lambda: _error('Invalid email or password', 401)
 
+    key_record = db_manager.get_api_key_by_identifier(email)
+    if not key_record or not key_record.get('active'):
+        return invalid()
 
-@api.route('/admin/registrations/<int:request_id>/approve', methods=['POST'])
-@validate_request(AdminReviewSchema)
-def admin_approve_registration(validated_data, request_id):
-    """
-    Approve a domain registration request.
-    Activates the key and emails the plaintext key to the contact.
-    Requires admin API key.
+    if not key_record.get('password_hash'):
+        # No password set yet — this account is awaiting /password/set
+        # (either fresh registration, or admin-forced reset already
+        # cleared the old hash).
+        return invalid()
 
-    Body: admin_note (optional)
-    """
-    user = getattr(g, 'user', {})
-    if not user.get('admin'):
-        return _error('Admin access required', 403)
+    from werkzeug.security import check_password_hash
+    if not check_password_hash(key_record['password_hash'], password):
+        return invalid()
 
-    reg = db_manager.get_registration_request_by_id(request_id)
-    if not reg:
-        return _error(f'Registration request {request_id} not found', 404)
+    key_id = key_record['id']
 
-    if reg['status'] != 'pending':
-        return _error(f"Request is already '{reg['status']}'", 409)
+    if key_record.get('must_change_password'):
+        return jsonify({
+            'must_change_password': True,
+            'email': email,
+        })
 
-    admin_note = validated_data.get('admin_note')
-    key_id     = reg['api_key_id']
-
-    # Activate the key
-    db_manager.update_api_key(key_id, active=1)
-    db_manager.update_registration_request(request_id, status='approved', admin_note=admin_note)
-
-    # Decrypt and email the plaintext key to the registrant
     from key_crypto import KeyCrypto
     from config import Config
     crypto = KeyCrypto(Config.SECRET_KEY)
+    plaintext_key = crypto.decrypt(key_record['key_enc'])
 
-    all_keys   = db_manager.get_all_api_keys(include_inactive=False)
-    key_record = next((k for k in all_keys if k['id'] == key_id), None)
-    plaintext  = None
+    # Check trusted-device token
+    if device_token:
+        device = db_manager.get_trusted_device(device_token)
+        if device and device['api_key_id'] == key_id:
+            logger.info(f"Login: '{email}' (key_id={key_id}) — trusted device, 2FA skipped")
+            return jsonify(_user_identity_response(key_record, plaintext_key))
 
-    if key_record:
-        # We need key_enc — fetch directly
-        with db_manager.get_connection() as conn:
-            row = conn.execute(
-                'SELECT key_enc FROM api_keys WHERE id = ?', (key_id,)
-            ).fetchone()
-            if row:
-                plaintext = crypto.decrypt(row['key_enc'])
+    # Skip 2FA for admins when SMTP is not configured — avoids a catch-22
+    # where the admin cannot log in to set up SMTP because 2FA needs SMTP.
+    if key_record.get('admin'):
+        smtp_cfg = db_manager.get_smtp_config()
+        if not smtp_cfg.get('host'):
+            logger.info(
+                f"Login: '{email}' (key_id={key_id}) — admin, SMTP not configured, 2FA skipped"
+            )
+            return jsonify(_user_identity_response(key_record, plaintext_key))
+
+    # No valid trusted device — send 2FA code
+    import secrets as _secrets
+    code = f"{_secrets.randbelow(1000000):06d}"
+
+    db_manager.invalidate_2fa_codes(key_id)
+    db_manager.create_2fa_code(key_id, code, expiry_minutes=Config.TWO_FACTOR_CODE_EXPIRY_MINUTES)
 
     email_svc = EmailService()
-    if plaintext and reg.get('contact_email'):
-        email_svc.send_domain_approved(
-            reg['contact_email'], reg['name'], reg['domain'],
-            plaintext, admin_note, template=_resolve_template('register-approved')
-        )
-
-    logger.info(f"Domain registration approved: '{reg['domain']}' (request_id={request_id})")
+    email_svc.send_2fa_code(
+        email, key_record.get('name', ''), code,
+        expiry_minutes=Config.TWO_FACTOR_CODE_EXPIRY_MINUTES,
+        template=_resolve_template('2fa-code')
+    )
+    logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA code sent")
 
     return jsonify({
-        'message':   f"Registration for '{reg['domain']}' approved and key activated",
-        'domain':    reg['domain'],
-        'key_id':    key_id,
-        'email_sent': bool(plaintext and reg.get('contact_email')),
+        '2fa_required': True,
+        'email': email,
     })
 
 
-@api.route('/admin/registrations/<int:request_id>/reject', methods=['POST'])
-@validate_request(AdminReviewSchema)
-def admin_reject_registration(validated_data, request_id):
+@api.route('/login/2fa', methods=['POST'])
+@validate_request(Login2FASchema)
+def login_2fa(validated_data):
     """
-    Reject a domain registration request.
-    The key remains inactive. An email is sent to the contact.
-    Requires admin API key.
+    Complete login by verifying a 2FA code.
 
-    Body: admin_note (optional)
+    Body: { "email": "...", "code": "...", "remember_device": true|false }
+
+    On success, returns identity fields plus the decrypted API key. If
+    remember_device is true, also returns a device_token to be stored as a
+    long-lived cookie (TRUSTED_DEVICE_DAYS, default 28) — supplying this
+    token on a future /login call will skip the 2FA step.
     """
-    user = getattr(g, 'user', {})
-    if not user.get('admin'):
-        return _error('Admin access required', 403)
+    email = validated_data['email'].strip().lower()
+    code  = validated_data['code'].strip()
+    remember_device = validated_data.get('remember_device', False)
 
-    reg = db_manager.get_registration_request_by_id(request_id)
-    if not reg:
-        return _error(f'Registration request {request_id} not found', 404)
+    key_record = db_manager.get_api_key_by_identifier(email)
+    if not key_record or not key_record.get('active'):
+        return _error('Invalid email or code', 401)
 
-    if reg['status'] != 'pending':
-        return _error(f"Request is already '{reg['status']}'", 409)
+    key_id = key_record['id']
 
-    admin_note = validated_data.get('admin_note')
+    code_record = db_manager.get_valid_2fa_code(key_id, code)
+    if not code_record:
+        return _error('Invalid or expired verification code', 401)
 
-    db_manager.update_registration_request(request_id, status='rejected', admin_note=admin_note)
+    db_manager.mark_2fa_code_used(code_record['id'])
 
-    email_svc = EmailService()
-    if reg.get('contact_email'):
-        email_svc.send_domain_rejected(
-            reg['contact_email'], reg['name'], reg['domain'],
-            admin_note, template=_resolve_template('register-rejected')
+    from key_crypto import KeyCrypto
+    from config import Config
+    crypto = KeyCrypto(Config.SECRET_KEY)
+    plaintext_key = crypto.decrypt(key_record['key_enc'])
+
+    response = _user_identity_response(key_record, plaintext_key)
+
+    if remember_device:
+        import secrets as _secrets
+        device_token = _secrets.token_urlsafe(32)
+        db_manager.create_trusted_device(key_id, device_token, expiry_days=Config.TRUSTED_DEVICE_DAYS)
+        response['device_token'] = device_token
+        response['device_token_expires_days'] = Config.TRUSTED_DEVICE_DAYS
+
+    logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA verified")
+    return jsonify(response)
+
+
+@api.route('/password/forgot', methods=['POST'])
+def password_forgot():
+    """
+    Request a password reset email.
+
+    Body: { "email": "..." }
+
+    Always returns the same success response regardless of whether the
+    email is registered — prevents account enumeration.
+
+    If the email is found and active, a reset token is generated and the
+    password-reset-required email is sent containing a link to
+    /set-password.php?t=TOKEN on the portal.
+    """
+    import secrets as _secrets
+
+    data  = request.get_json(silent=True) or {}
+    email = data.get('email', '').strip().lower()
+
+    # Validate email format minimally
+    if not email or '@' not in email:
+        return _error('A valid email address is required', 400)
+
+    _generic_response = jsonify({
+        'message': 'If that email address is registered, a password reset link has been sent.'
+    })
+
+    key_record = db_manager.get_api_key_by_identifier(email)
+    if not key_record or not key_record.get('active'):
+        return _generic_response
+
+    key_id = key_record['id']
+
+    token = _secrets.token_urlsafe(32)
+    db_manager.create_email_verification(
+        api_key_id=key_id,
+        email=email,
+        token=token,
+    )
+
+    try:
+        email_svc = EmailService()
+        email_svc.send_password_reset_required(
+            email,
+            key_record.get('name', ''),
+            token,
+            template=_resolve_template('password-reset-required'),
         )
+        logger.info(f"Password reset requested for '{email}' (key_id={key_id})")
+    except Exception as e:
+        logger.error(f"Failed to send password reset email to '{email}': {e}")
 
-    logger.info(f"Domain registration rejected: '{reg['domain']}' (request_id={request_id})")
+    return _generic_response
+
+
+@api.route('/password/set', methods=['POST'])
+@validate_request(SetPasswordSchema)
+def set_password(validated_data):
+    """
+    Set or change a password.
+
+    Either:
+      - token        — from a set-password / password-reset email
+                       (used for first-time setup or admin-forced resets)
+      - email + current_password — normal in-portal password change
+
+    Body always includes new_password (min 8 characters).
+
+    On success, clears must_change_password and invalidates any trusted
+    devices for the account (a password change should require fresh 2FA).
+    """
+    from werkzeug.security import generate_password_hash, check_password_hash
+
+    token            = validated_data.get('token')
+    email            = validated_data.get('email')
+    current_password = validated_data.get('current_password')
+    new_password     = validated_data['new_password']
+
+    key_record = None
+
+    if token:
+        record = db_manager.get_email_verification(token)
+        if not record:
+            return _error('Invalid or expired token', 400)
+        key_record = db_manager.get_api_key_by_id(record['api_key_id'])
+        if not key_record:
+            return _error('Key record not found', 500)
+        db_manager.mark_email_verification_used(token)
+
+    elif email and current_password:
+        email = email.strip().lower()
+        key_record = db_manager.get_api_key_by_identifier(email)
+        if not key_record or not key_record.get('active'):
+            return _error('Invalid email or password', 401)
+        if not key_record.get('password_hash') or not check_password_hash(key_record['password_hash'], current_password):
+            return _error('Invalid email or password', 401)
+
+    else:
+        return _error('Either token, or email and current_password, are required', 400)
+
+    key_id          = key_record['id']
+    is_new_account  = token is not None  # token path = first-time setup
+
+    new_hash = generate_password_hash(new_password)
+    db_manager.update_api_key(key_id, password_hash=new_hash, must_change_password=0)
+    db_manager.delete_trusted_devices_for_key(key_id)
+
+    logger.info(f"Password set for key_id={key_id} ('{key_record.get('identifier')}')")
+
+    # For first-time account setup (token path), send the Account Activated email
+    # containing the decrypted API key. This is the one and only time the key is
+    # delivered to the user — after this it lives encrypted in the database and is
+    # decrypted transparently on login.
+    if is_new_account:
+        try:
+            from key_crypto import KeyCrypto
+            from config import Config
+            crypto    = KeyCrypto(Config.SECRET_KEY)
+            plaintext = crypto.decrypt(key_record['key_enc'])
+
+            email_svc = EmailService()
+            email_svc.send_user_key_activated(
+                key_record['identifier'],
+                key_record.get('name', ''),
+                plaintext,
+                template=_resolve_template('user-activated'),
+            )
+            logger.info(f"Account activated email sent to '{key_record['identifier']}' (key_id={key_id})")
+        except Exception as e:
+            logger.error(f"Failed to send account activated email (key_id={key_id}): {e}")
 
     return jsonify({
-        'message':    f"Registration for '{reg['domain']}' rejected",
-        'domain':     reg['domain'],
-        'email_sent': bool(reg.get('contact_email')),
+        'message': 'Password set successfully. Please log in.',
     })
 
 
@@ -1630,28 +1814,10 @@ _TEMPLATE_CONTENT_DEFAULTS = {
         'body_text':   'This is a test email from ephemeralREST.\n\nYour SMTP configuration is working correctly.',
         'footer_text': 'ephemeralREST',
     },
-    'register-domain': {
-        'subject':     'Domain registration received — {domain}',
-        'header_text': 'Registration Received',
-        'body_text':   'Hi {name},\n\nThank you for registering {domain}. Your request is under review.',
-        'footer_text': 'ephemeralREST',
-    },
-    'register-approved': {
-        'subject':     'Domain registration approved — {domain}',
-        'header_text': 'Registration Approved',
-        'body_text':   'Hi {name},\n\nYour registration for {domain} has been approved.\n\nYour API key:\n\n{api_key}\n\nSave this key — it will not be shown again.\n\n{admin_note}',
-        'footer_text': 'ephemeralREST',
-    },
-    'register-rejected': {
-        'subject':     'Domain registration update — {domain}',
-        'header_text': 'Registration Update',
-        'body_text':   'Hi {name},\n\nYour registration for {domain} was not approved at this time.\n\n{admin_note}',
-        'footer_text': 'ephemeralREST',
-    },
-    'user-verify': {
+    'registration-verification': {
         'subject':     'Verify your email address',
         'header_text': 'Verify Your Email',
-        'body_text':   'Hi {name},\n\nPlease verify your email address to activate your API key:\n\n{verify_url}\n\nThis link expires in 24 hours.',
+        'body_text':   'Hi {name},\n\nThank you for registering. Click the link below to verify your email address:\n\n{verify_url}\n\nThis link expires in 24 hours.\n\nIf you did not request this, you can safely ignore this email.',
         'footer_text': 'ephemeralREST',
     },
     'key-rotated': {
@@ -1664,6 +1830,24 @@ _TEMPLATE_CONTENT_DEFAULTS = {
         'subject':     'Your API key is ready',
         'header_text': 'API Key Activated',
         'body_text':   'Hi {name},\n\nYour email has been verified and your API key is now active.\n\nYour API key:\n\n{api_key}\n\nSave this key — it will not be shown again.',
+        'footer_text': 'ephemeralREST',
+    },
+    'set-password': {
+        'subject':     'Set your password — ephemeralREST',
+        'header_text': 'Set Your Password',
+        'body_text':   'Hi {name},\n\nYour email has been verified. Click the link below to set a password for your account:\n\n{set_password_url}\n\nThis link expires in 24 hours.',
+        'footer_text': 'ephemeralREST',
+    },
+    'password-reset-required': {
+        'subject':     'Please reset your password — ephemeralREST',
+        'header_text': 'Password Reset Required',
+        'body_text':   'Hi {name},\n\nAn administrator has requested that you set a new password for your account.\n\nClick the link below to set a new password:\n\n{set_password_url}\n\nThis link expires in 24 hours.',
+        'footer_text': 'ephemeralREST',
+    },
+    '2fa-code': {
+        'subject':     'Your login verification code',
+        'header_text': 'Verification Code',
+        'body_text':   'Hi {name},\n\nYour verification code is:\n\n{code}\n\nThis code expires in {expiry_minutes} minutes. If you did not attempt to log in, you can ignore this email.',
         'footer_text': 'ephemeralREST',
     },
 }
@@ -1763,14 +1947,11 @@ def me():
         return _error('Unauthorized', 401)
 
     return jsonify({
-        'id':         user.get('id'),
-        'name':       user.get('name'),
-        'identifier': user.get('identifier'),
-        'key_type':   user.get('key_type'),
-        'is_domain':  user.get('is_domain'),
-        'is_user':    user.get('is_user'),
-        'admin':      user.get('admin'),
-        'active':     user.get('active'),
+        'id':          user.get('id'),
+        'name':        user.get('name'),
+        'identifier':  user.get('identifier'),
+        'admin':       user.get('admin'),
+        'active':      user.get('active'),
         'rate_limits': user.get('rate_limits'),
     })
 
@@ -1780,53 +1961,18 @@ def me():
 # Admin — Key management endpoints
 # ---------------------------------------------------------------------------
 
-@api.route('/admin/keys/<int:key_id>/set-type', methods=['POST'])
-def admin_set_key_type(key_id):
-    """Change the key_type of an API key between 'domain' and 'user'. Admin only."""
-    user = getattr(g, 'user', None)
-    if not user or not user.get('admin'):
-        return _error('Admin access required', 403)
-
-    data     = request.get_json(silent=True) or {}
-    key_type = data.get('key_type', '').strip().lower()
-
-    if key_type not in ('domain', 'user'):
-        return _error("key_type must be 'domain' or 'user'", 400)
-
-    key_record = db_manager.get_api_key_by_id(key_id)
-    if not key_record:
-        return _error('Key not found', 404)
-
-    if key_record.get('key_type') == key_type:
-        return _error(f'Key is already of type {key_type!r}', 400)
-
-    db_manager.update_api_key(key_id, key_type=key_type)
-    logger.info(
-        f"Admin [{user.get('identifier')}] changed key_id={key_id} "
-        f"type: {key_record.get('key_type')} → {key_type}"
-    )
-    return jsonify({'message': f"Key type updated to '{key_type}'", 'key_id': key_id, 'key_type': key_type})
-
-
 @api.route('/admin/keys', methods=['GET'])
 def admin_list_keys():
     """
     List all API keys. Admin only.
-    Optional query params:
-        type     — filter by 'domain' or 'user'
-        inactive — include disabled keys if set to '1'
+    Optional query param: inactive — include disabled keys if set to '1'
     """
     user = getattr(g, 'user', {})
     if not user.get('admin'):
         return _error('Admin access required', 403)
 
     include_inactive = request.args.get('inactive', '0') == '1'
-    type_filter      = request.args.get('type')
-
     keys = db_manager.get_all_api_keys(include_inactive=include_inactive)
-
-    if type_filter:
-        keys = [k for k in keys if k.get('key_type') == type_filter]
 
     # Strip key_enc from response — never expose ciphertext
     for k in keys:
@@ -1885,6 +2031,49 @@ def admin_enable_key(key_id):
     return jsonify({'message': f'Key {key_id} enabled'})
 
 
+@api.route('/admin/keys/<int:key_id>/force-password-reset', methods=['POST'])
+def admin_force_password_reset(key_id):
+    """
+    Require a user to set a new password before they can log in again.
+
+    Sets must_change_password=1, clears any trusted-device tokens, and
+    emails the user a link to /password/set. Admin only.
+    """
+    import secrets as _secrets
+
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    key_record = db_manager.get_api_key_by_id(key_id)
+    if not key_record:
+        return _error(f'Key {key_id} not found', 404)
+
+    db_manager.update_api_key(key_id, must_change_password=1)
+    db_manager.delete_trusted_devices_for_key(key_id)
+
+    token = _secrets.token_urlsafe(32)
+    db_manager.create_email_verification(
+        api_key_id=key_id,
+        email=key_record['identifier'],
+        token=token,
+    )
+
+    email_svc = EmailService()
+    sent = email_svc.send_password_reset_required(
+        key_record['identifier'], key_record.get('name', ''), token,
+        template=_resolve_template('password-reset-required')
+    )
+
+    logger.info(f"Admin [{user.get('identifier')}] forced password reset for key_id={key_id}")
+
+    return jsonify({
+        'message':    f'Password reset required for key {key_id}',
+        'key_id':     key_id,
+        'email_sent': bool(sent),
+    })
+
+
 @api.route('/admin/keys/<int:key_id>/rotate', methods=['POST'])
 def admin_rotate_key(key_id):
     """
@@ -1916,16 +2105,7 @@ def admin_rotate_key(key_id):
     # Determine the contact email for this key
     # Domain keys: use registration contact_email; user keys: identifier is the email
     to_email = None
-    if record.get('key_type') == 'user':
-        to_email = record.get('identifier')
-    else:
-        reg = next(
-            (r for r in db_manager.get_registration_requests()
-             if r.get('api_key_id') == key_id),
-            None
-        )
-        if reg:
-            to_email = reg.get('contact_email')
+    to_email = record.get('identifier')  # identifier is always the email address
 
     if to_email:
         email_svc = EmailService()
@@ -2009,18 +2189,14 @@ def admin_delete_key(key_id):
 
 
 
-@api.route('/admin/class-limits/<key_type>', methods=['GET'])
-def admin_get_class_limits(key_type):
-    """Get rate limits for a specific key class. Admin only."""
+@api.route('/admin/class-limits', methods=['GET'])
+def admin_get_class_limits():
+    """Get the default rate limits applied to all keys. Admin only."""
     user = getattr(g, 'user', {})
     if not user.get('admin'):
         return _error('Admin access required', 403)
 
-    if key_type not in ('domain', 'user', 'wildcard'):
-        return _error('Invalid key type. Valid: domain, user, wildcard', 400)
-
-    limits = db_manager.get_key_class_limits(key_type)
-    limits['key_type'] = key_type
+    limits = db_manager.get_key_class_limits('user')
     return jsonify(limits)
 
 
@@ -2034,11 +2210,7 @@ def admin_set_class_limits():
     if not user.get('admin'):
         return _error('Admin access required', 403)
 
-    data     = request.get_json(silent=True) or {}
-    key_type = data.get('key_type', '')
-
-    if key_type not in ('domain', 'user', 'wildcard'):
-        return _error('Invalid key_type. Valid: domain, user, wildcard', 400)
+    data = request.get_json(silent=True) or {}
 
     try:
         rpm = int(data['rate_per_minute'])
@@ -2047,12 +2219,11 @@ def admin_set_class_limits():
     except (KeyError, TypeError, ValueError):
         return _error('rate_per_minute, rate_per_hour, and rate_per_day are required integers', 400)
 
-    db_manager.set_key_class_limits(key_type, rpm, rph, rpd)
-    logger.info(f"Admin updated class limits for '{key_type}': {rpm}/min {rph}/hr {rpd}/day")
+    db_manager.set_key_class_limits('user', rpm, rph, rpd)
+    logger.info(f"Admin updated class limits: {rpm}/min {rph}/hr {rpd}/day")
 
     return jsonify({
-        'message':        f"Class limits for '{key_type}' updated",
-        'key_type':       key_type,
+        'message':         'Class limits updated',
         'rate_per_minute': rpm,
         'rate_per_hour':   rph,
         'rate_per_day':    rpd,
@@ -2115,6 +2286,30 @@ def admin_get_key_output(key_id):
     })
 
 
+@api.route('/me/forget-device', methods=['POST'])
+def me_forget_device():
+    """
+    Forget a trusted-device token for the currently authenticated user.
+
+    Body: { "device_token": "..." }
+
+    Used by the portal on logout to revoke the "remember this device"
+    cookie. Always returns 200 even if the token was already invalid —
+    forgetting an already-forgotten device is not an error.
+    """
+    user = getattr(g, 'user', None)
+    if not user:
+        return _error('Unauthorized', 401)
+
+    data         = request.get_json(silent=True) or {}
+    device_token = data.get('device_token', '').strip()
+
+    if device_token:
+        db_manager.delete_trusted_device(device_token)
+
+    return jsonify({'message': 'Device forgotten'})
+
+
 @api.route('/me/rotate', methods=['POST'])
 def me_rotate():
     """
@@ -2148,16 +2343,7 @@ def me_rotate():
     logger.info(f"Self-rotated key {key_id} (identifier={record['identifier']})")
 
     # Send the new key by email
-    to_email = record.get('identifier') if record.get('key_type') == 'user' else None
-    if not to_email:
-        # Domain key — look up the registration contact email
-        reg = next(
-            (r for r in db_manager.get_registration_requests()
-             if r.get('api_key_id') == key_id),
-            None
-        )
-        if reg:
-            to_email = reg.get('contact_email')
+    to_email = record.get('identifier')  # identifier is always the email address
 
     if to_email:
         email_svc = EmailService()
@@ -2293,6 +2479,79 @@ def admin_clear_smtp():
     return jsonify({'message': 'SMTP configuration cleared'})
 
 
+# ---------------------------------------------------------------------------
+# Admin — Portal settings
+# ---------------------------------------------------------------------------
+
+@api.route('/admin/portal-settings', methods=['GET'])
+def admin_get_portal_settings():
+    """
+    Return all portal settings with their current values and defaults.
+    Admin only.
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    settings  = db_manager.get_portal_settings()
+    defaults  = db_manager.PORTAL_SETTINGS_DEFAULTS
+
+    return jsonify({
+        'settings': settings,
+        'defaults': defaults,
+    })
+
+
+@api.route('/admin/portal-settings', methods=['POST'])
+def admin_set_portal_settings():
+    """
+    Update one or more portal settings. Admin only.
+
+    Body: { "setting_key": value, ... }
+
+    Allowed keys: site_name, site_version, session_timeout,
+    logout_redirect_url, allow_admin_promotion, trusted_device_days,
+    portal_url
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return _error('No settings provided', 400)
+
+    allowed = set(db_manager.PORTAL_SETTINGS_DEFAULTS.keys())
+    unknown = set(data.keys()) - allowed
+    if unknown:
+        return _error(f"Unknown settings: {', '.join(sorted(unknown))}", 400)
+
+    db_manager.set_portal_settings(data)
+    logger.info(f"Admin [{user.get('identifier')}] updated portal settings: {list(data.keys())}")
+
+    return jsonify({
+        'message':  'Portal settings updated',
+        'settings': db_manager.get_portal_settings(),
+    })
+
+
+@api.route('/admin/portal-settings/<key>', methods=['DELETE'])
+def admin_reset_portal_setting(key):
+    """Reset a single portal setting to its built-in default. Admin only."""
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    if not db_manager.reset_portal_setting(key):
+        return _error(f"Unknown setting '{key}'", 400)
+
+    logger.info(f"Admin [{user.get('identifier')}] reset portal setting '{key}' to default")
+    return jsonify({
+        'message':  f"Setting '{key}' reset to default",
+        'settings': db_manager.get_portal_settings(),
+    })
+
+
 @api.route('/locations/resolve', methods=['POST'])
 def locations_resolve():
     """Resolve a place name to its canonical place record with lat/lon and timezone."""
@@ -2315,20 +2574,6 @@ def locations_resolve():
         logger.error(f"Location resolve error: {str(e)}", exc_info=True)
         return jsonify({'success': False, 'error': f'Resolution failed: {str(e)}'}), 500
 
-
-@api.route('/cors-test', methods=['GET', 'POST', 'OPTIONS'])
-def cors_test():
-    """Test endpoint for CORS functionality"""
-    if request.method == 'OPTIONS':
-        return jsonify({'message': 'CORS preflight successful'}), 200
-
-    return jsonify({
-        'message':    'CORS is working correctly',
-        'method':     request.method,
-        'origin':     request.headers.get('Origin', 'No origin header'),
-        'user_agent': request.headers.get('User-Agent', 'No user agent'),
-        'timestamp':  datetime.now().isoformat()
-    })
 
 
 

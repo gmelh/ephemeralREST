@@ -161,7 +161,7 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS api_keys
                 (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key_type        TEXT NOT NULL CHECK (key_type IN ('domain', 'user')),
+                    key_type        TEXT NOT NULL DEFAULT 'user',
                     name            TEXT NOT NULL,
                     identifier      TEXT NOT NULL UNIQUE,
                     key_enc         TEXT NOT NULL,
@@ -172,15 +172,85 @@ class DatabaseManager:
                     rate_per_hour   INTEGER,
                     rate_per_day    INTEGER,
                     output_config   TEXT,
+                    password_hash         TEXT,
+                    must_change_password  INTEGER NOT NULL DEFAULT 1,
                     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
+            # Migrations for api_keys table
+            cursor.execute("PRAGMA table_info(api_keys)")
+            _api_key_cols = {column[1]: column for column in cursor.fetchall()}
+
+            # Fix: if key_type column has a NOT NULL constraint with no default,
+            # SQLite cannot ALTER COLUMN — we must recreate the table.
+            # Detect this by checking whether the column has a dflt_value.
+            # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
+            _needs_recreate = False
+            if 'key_type' in _api_key_cols:
+                _col = _api_key_cols['key_type']
+                # dflt_value is index 4; if NOT NULL (index 3 == 1) and no default
+                if _col[3] == 1 and _col[4] is None:
+                    _needs_recreate = True
+
+            if _needs_recreate:
+                logger.info("Migration: recreating api_keys table to fix key_type constraint")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS api_keys_new
+                    (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        key_type        TEXT NOT NULL DEFAULT 'user',
+                        name            TEXT NOT NULL,
+                        identifier      TEXT NOT NULL UNIQUE,
+                        key_enc         TEXT NOT NULL,
+                        key_prefix      TEXT NOT NULL,
+                        admin           INTEGER NOT NULL DEFAULT 0,
+                        active          INTEGER NOT NULL DEFAULT 1,
+                        rate_per_minute INTEGER,
+                        rate_per_hour   INTEGER,
+                        rate_per_day    INTEGER,
+                        output_config   TEXT,
+                        password_hash         TEXT,
+                        must_change_password  INTEGER NOT NULL DEFAULT 1,
+                        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO api_keys_new
+                        (id, key_type, name, identifier, key_enc, key_prefix,
+                         admin, active, rate_per_minute, rate_per_hour, rate_per_day,
+                         output_config, created_at, updated_at)
+                    SELECT
+                        id,
+                        COALESCE(key_type, 'user'),
+                        name, identifier, key_enc, key_prefix,
+                        admin, active, rate_per_minute, rate_per_hour, rate_per_day,
+                        output_config, created_at, updated_at
+                    FROM api_keys
+                """)
+                cursor.execute("DROP TABLE api_keys")
+                cursor.execute("ALTER TABLE api_keys_new RENAME TO api_keys")
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_identifier ON api_keys(identifier)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
+                logger.info("Migration: api_keys table recreated successfully")
+                # Refresh column info after recreation
+                cursor.execute("PRAGMA table_info(api_keys)")
+                _api_key_cols = {column[1]: column for column in cursor.fetchall()}
+
+            # Add password columns if missing
+            if 'password_hash' not in _api_key_cols:
+                cursor.execute("ALTER TABLE api_keys ADD COLUMN password_hash TEXT")
+                logger.info("Migration: added password_hash column to api_keys")
+            if 'must_change_password' not in _api_key_cols:
+                cursor.execute("ALTER TABLE api_keys ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 1")
+                logger.info("Migration: added must_change_password column to api_keys")
+
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS key_class_limits
                 (
-                    key_type        TEXT PRIMARY KEY CHECK (key_type IN ('domain', 'user', 'wildcard')),
+                    key_type        TEXT PRIMARY KEY,
                     rate_per_minute INTEGER NOT NULL DEFAULT 10,
                     rate_per_hour   INTEGER NOT NULL DEFAULT 50,
                     rate_per_day    INTEGER NOT NULL DEFAULT 200,
@@ -188,9 +258,7 @@ class DatabaseManager:
                 )
             """)
 
-            cursor.execute("INSERT OR IGNORE INTO key_class_limits (key_type, rate_per_minute, rate_per_hour, rate_per_day) VALUES ('domain', 20, 200, 1000)")
             cursor.execute("INSERT OR IGNORE INTO key_class_limits (key_type, rate_per_minute, rate_per_hour, rate_per_day) VALUES ('user', 10, 100, 500)")
-            cursor.execute("INSERT OR IGNORE INTO key_class_limits (key_type, rate_per_minute, rate_per_hour, rate_per_day) VALUES ('wildcard', 5, 30, 100)")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_type   ON api_keys(key_type)")
@@ -201,24 +269,8 @@ class DatabaseManager:
             # Registration and verification tables
             # ------------------------------------------------------------------
 
-            # Domain key registration requests — await admin approval
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS registration_requests
-                (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    api_key_id     INTEGER,
-                    domain         TEXT NOT NULL UNIQUE,
-                    name           TEXT NOT NULL,
-                    contact_email  TEXT NOT NULL,
-                    reason         TEXT,
-                    status      TEXT NOT NULL DEFAULT 'pending'
-                                    CHECK (status IN ('pending','approved','rejected')),
-                    admin_note  TEXT,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
-                )
-            """)
+            # registration_requests table removed — flat self-serve registration,
+            # no admin approval workflow.
 
             # Email verification tokens for user key activation
             cursor.execute("""
@@ -235,9 +287,47 @@ class DatabaseManager:
                 )
             """)
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_reg_requests_status ON registration_requests(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_verif_token   ON email_verifications(token)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_verif_key     ON email_verifications(api_key_id)")
+
+
+            # ------------------------------------------------------------------
+            # Login — 2FA codes and trusted devices
+            # ------------------------------------------------------------------
+
+            # Short-lived numeric codes emailed during the 2FA login step
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS login_2fa_codes
+                (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    api_key_id  INTEGER NOT NULL,
+                    code        TEXT NOT NULL,
+                    used        INTEGER NOT NULL DEFAULT 0,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at  TIMESTAMP NOT NULL,
+                    FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+                )
+            """)
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_login_2fa_key ON login_2fa_codes(api_key_id)")
+
+            # Trusted-device tokens — allow skipping 2FA on recognised machines.
+            # Token is stored as a portal cookie; lifetime is configurable via
+            # TRUSTED_DEVICE_DAYS (default 28).
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS trusted_devices
+                (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    api_key_id  INTEGER NOT NULL,
+                    token       TEXT NOT NULL UNIQUE,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at  TIMESTAMP NOT NULL,
+                    FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+                )
+            """)
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trusted_device_token ON trusted_devices(token)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trusted_device_key   ON trusted_devices(api_key_id)")
 
 
             # ------------------------------------------------------------------
@@ -245,6 +335,21 @@ class DatabaseManager:
             # ------------------------------------------------------------------
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS smtp_config
+                (
+                    key        TEXT PRIMARY KEY,
+                    value      TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # ------------------------------------------------------------------
+            # Portal settings — configurable admin portal behaviour
+            # ------------------------------------------------------------------
+            # Simple key/value store. Defaults are baked into the application;
+            # only values that differ from defaults are stored here.
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS portal_settings
                 (
                     key        TEXT PRIMARY KEY,
                     value      TEXT NOT NULL,
@@ -594,6 +699,12 @@ class DatabaseManager:
                 "SELECT COUNT(*) FROM api_keys WHERE admin = 1 AND active = 1"
             ).fetchone()
             return row[0] if row else 0
+
+    def is_database_empty(self) -> bool:
+        """Return True if no API keys exist at all — used to gate the /setup endpoint."""
+        with self.get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()
+            return (row[0] if row else 0) == 0
 
     # ==========================================================================
     # Existing location cache methods (unchanged — used by charts FK)
@@ -1389,88 +1500,67 @@ class DatabaseManager:
             conn.execute('DELETE FROM smtp_config')
 
     # ==========================================================================
-    # Registration request methods
+    # Portal settings methods
     # ==========================================================================
 
-    def create_registration_request(
-            self,
-            api_key_id: int,
-            domain: str,
-            name: str,
-            contact_email: str = '',
-            reason: str = None
-    ) -> int:
-        """Insert a new domain registration request."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO registration_requests
-                (api_key_id, domain, name, contact_email, reason)
-                VALUES (?, ?, ?, ?, ?)
-            """, (api_key_id, domain, name, contact_email, reason))
-            return cursor.lastrowid
+    # Default values — used when a key is absent from the database.
+    PORTAL_SETTINGS_DEFAULTS: Dict[str, Any] = {
+        'site_name':             'ephemeralREST',
+        'site_version':          '1.0',
+        'session_timeout':       1800,
+        'logout_redirect_url':   '/login.php',
+        'allow_admin_promotion': True,
+        'trusted_device_days':   28,
+        'portal_url':            '',
+    }
 
-    def get_registration_requests(self, status: str = None) -> list:
-        """Return registration requests, optionally filtered by status."""
+    def get_portal_settings(self) -> Dict[str, Any]:
+        """
+        Return all portal settings, merging database values over defaults.
+        Numeric and boolean values are cast to their correct types.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            if status:
-                cursor.execute("""
-                    SELECT r.*, k.key_prefix
-                    FROM registration_requests r
-                    LEFT JOIN api_keys k ON r.api_key_id = k.id
-                    WHERE r.status = ?
-                    ORDER BY r.created_at DESC
-                """, (status,))
+            cursor.execute('SELECT key, value FROM portal_settings')
+            stored = {row['key']: row['value'] for row in cursor.fetchall()}
+
+        result = dict(self.PORTAL_SETTINGS_DEFAULTS)
+        for key, value in stored.items():
+            default = self.PORTAL_SETTINGS_DEFAULTS.get(key)
+            if isinstance(default, bool):
+                result[key] = value.lower() in ('true', '1', 'yes')
+            elif isinstance(default, int):
+                try:
+                    result[key] = int(value)
+                except (ValueError, TypeError):
+                    pass
             else:
+                result[key] = value
+        return result
+
+    def set_portal_settings(self, settings: Dict[str, Any]) -> None:
+        """Upsert portal settings key/value pairs."""
+        allowed = set(self.PORTAL_SETTINGS_DEFAULTS.keys())
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for key, value in settings.items():
+                if key not in allowed:
+                    continue
+                str_value = str(value).lower() if isinstance(value, bool) else str(value)
                 cursor.execute("""
-                    SELECT r.*, k.key_prefix
-                    FROM registration_requests r
-                    LEFT JOIN api_keys k ON r.api_key_id = k.id
-                    ORDER BY r.created_at DESC
-                """)
-            return [dict(row) for row in cursor.fetchall()]
+                    INSERT INTO portal_settings (key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                                                   updated_at = CURRENT_TIMESTAMP
+                """, (key, str_value))
 
-    def get_registration_request_by_id(self, request_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch a single registration request by ID."""
+    def reset_portal_setting(self, key: str) -> bool:
+        """Delete a portal setting row, reverting it to its built-in default."""
+        if key not in self.PORTAL_SETTINGS_DEFAULTS:
+            return False
         with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT r.*, k.key_prefix
-                FROM registration_requests r
-                LEFT JOIN api_keys k ON r.api_key_id = k.id
-                WHERE r.id = ?
-            """, (request_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-    def update_registration_request(
-            self,
-            request_id: int,
-            status: str,
-            admin_note: str = None
-    ) -> bool:
-        """Update the status of a registration request."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                UPDATE registration_requests
-                SET status     = ?,
-                    admin_note = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (status, admin_note, request_id))
-            return cursor.rowcount > 0
-
-    def domain_registration_exists(self, domain: str) -> bool:
-        """Check whether a domain already has a registration request or key."""
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT id FROM registration_requests WHERE domain = ?",
-                (domain,)
-            )
-            return cursor.fetchone() is not None
+            conn.execute('DELETE FROM portal_settings WHERE key = ?', (key,))
+        return True
 
     # ==========================================================================
     # Email verification methods
@@ -1523,12 +1613,103 @@ class DatabaseManager:
             return cursor.rowcount > 0
 
     # ==========================================================================
+    # Login — 2FA codes
+    # ==========================================================================
+
+    def create_2fa_code(self, api_key_id: int, code: str, expiry_minutes: int = 10) -> int:
+        """Insert a new 2FA login code. Returns the new row id."""
+        from datetime import timedelta
+        expires_at = datetime.utcnow() + timedelta(minutes=expiry_minutes)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO login_2fa_codes (api_key_id, code, expires_at)
+                VALUES (?, ?, ?)
+            """, (api_key_id, code, expires_at.isoformat()))
+            return cursor.lastrowid
+
+    def get_valid_2fa_code(self, api_key_id: int, code: str) -> Optional[Dict[str, Any]]:
+        """Fetch a valid (unused, unexpired) 2FA code for the given key."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, api_key_id, code, used, created_at, expires_at
+                FROM login_2fa_codes
+                WHERE api_key_id = ?
+                AND code = ?
+                AND used = 0
+                AND expires_at > datetime('now')
+            """, (api_key_id, code))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def mark_2fa_code_used(self, code_id: int) -> bool:
+        """Mark a 2FA code as used."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE login_2fa_codes SET used = 1 WHERE id = ?",
+                (code_id,)
+            )
+            return cursor.rowcount > 0
+
+    def invalidate_2fa_codes(self, api_key_id: int) -> None:
+        """Mark all outstanding 2FA codes for a key as used (e.g. before issuing a new one)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE login_2fa_codes SET used = 1 WHERE api_key_id = ? AND used = 0",
+                (api_key_id,)
+            )
+
+    # ==========================================================================
+    # Login — trusted devices
+    # ==========================================================================
+
+    def create_trusted_device(self, api_key_id: int, token: str, expiry_days: int = 28) -> int:
+        """Insert a new trusted-device token. Returns the new row id."""
+        from datetime import timedelta
+        expires_at = datetime.utcnow() + timedelta(days=expiry_days)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO trusted_devices (api_key_id, token, expires_at)
+                VALUES (?, ?, ?)
+            """, (api_key_id, token, expires_at.isoformat()))
+            return cursor.lastrowid
+
+    def get_trusted_device(self, token: str) -> Optional[Dict[str, Any]]:
+        """Fetch a valid (unexpired) trusted-device record by token."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, api_key_id, token, created_at, expires_at
+                FROM trusted_devices
+                WHERE token = ?
+                AND expires_at > datetime('now')
+            """, (token,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_trusted_device(self, token: str) -> bool:
+        """Remove a trusted-device token (e.g. on logout / forget-this-device)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM trusted_devices WHERE token = ?", (token,))
+            return cursor.rowcount > 0
+
+    def delete_trusted_devices_for_key(self, api_key_id: int) -> None:
+        """Remove all trusted-device tokens for a key (e.g. on password reset)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM trusted_devices WHERE api_key_id = ?", (api_key_id,))
+
+    # ==========================================================================
     # API key management methods
     # ==========================================================================
 
     def create_api_key(
             self,
-            key_type: str,
             name: str,
             identifier: str,
             key_enc: str,
@@ -1545,11 +1726,11 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO api_keys
-                (key_type, name, identifier, key_enc, key_prefix, admin, active,
+                (name, identifier, key_enc, key_prefix, admin, active,
                  rate_per_minute, rate_per_hour, rate_per_day, output_config)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                key_type, name, identifier, key_enc, key_prefix,
+                name, identifier, key_enc, key_prefix,
                 1 if admin else 0,
                 1 if active else 0,
                 rate_per_minute, rate_per_hour, rate_per_day,
@@ -1564,21 +1745,44 @@ class DatabaseManager:
             cursor.execute("""
                 SELECT id, key_type, name, identifier, key_enc, key_prefix,
                        admin, active, rate_per_minute, rate_per_hour, rate_per_day,
-                       output_config
+                       output_config, must_change_password
                 FROM api_keys
                 WHERE key_prefix = ? AND active = 1
             """, (prefix,))
             rows = cursor.fetchall()
             return [self._api_key_row_to_dict(r) for r in rows]
 
-    def get_api_key_by_id(self, key_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch a single API key record by integer ID (includes key_enc)."""
+    def get_api_key_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single API key record by identifier (email), case-insensitive."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id, key_type, name, identifier, key_enc, key_prefix,
                        admin, active, rate_per_minute, rate_per_hour, rate_per_day,
-                       output_config, created_at, updated_at
+                       output_config, password_hash, must_change_password,
+                       created_at, updated_at
+                FROM api_keys WHERE identifier = ? COLLATE NOCASE
+            """, (identifier,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            if d.get('output_config'):
+                try:
+                    d['output_config'] = json.loads(d['output_config'])
+                except Exception:
+                    d['output_config'] = {}
+            return d
+
+    def get_api_key_by_id(self, key_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a single API key record by integer ID (includes key_enc and password_hash)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, key_type, name, identifier, key_enc, key_prefix,
+                       admin, active, rate_per_minute, rate_per_hour, rate_per_day,
+                       output_config, password_hash, must_change_password,
+                       created_at, updated_at
                 FROM api_keys WHERE id = ?
             """, (key_id,))
             row = cursor.fetchone()
@@ -1599,7 +1803,7 @@ class DatabaseManager:
             query = """
                 SELECT id, key_type, name, identifier, key_prefix,
                        admin, active, rate_per_minute, rate_per_hour, rate_per_day,
-                       output_config, created_at, updated_at
+                       output_config, must_change_password, created_at, updated_at
                 FROM api_keys
             """
             if not include_inactive:
@@ -1619,7 +1823,8 @@ class DatabaseManager:
         """Update one or more fields on an API key record."""
         allowed = {
             'name', 'key_enc', 'key_prefix', 'admin', 'active', 'key_type',
-            'rate_per_minute', 'rate_per_hour', 'rate_per_day', 'output_config'
+            'rate_per_minute', 'rate_per_hour', 'rate_per_day', 'output_config',
+            'password_hash', 'must_change_password'
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:

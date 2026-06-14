@@ -74,8 +74,7 @@ def get_user_by_key(api_key: str) -> Optional[Dict[str, Any]]:
         4. Return the matching user dict or None
 
     Returns a dict with keys:
-        id, key_type, name, identifier, admin, active,
-        rate_limits, output, is_domain, is_user
+        id, name, identifier, admin, active, rate_limits, output
     """
     if not _db_manager:
         logger.error("users.py: _db_manager not initialised — call init_users() at startup")
@@ -132,31 +131,25 @@ def _build_user_dict(key_record: Dict[str, Any], db_manager) -> Dict[str, Any]:
     The returned dict matches the shape previously returned by cfg-based users.py
     so auth.py and routes.py require no changes.
     """
-    key_type = key_record['key_type']
-
     # Resolve rate limits: key-level overrides class defaults where set
-    class_limits = db_manager.get_key_class_limits(key_type)
+    class_limits = db_manager.get_key_class_limits('user')
     rate_limits  = {
         'per_minute': key_record.get('rate_per_minute') or class_limits['rate_per_minute'],
         'per_hour':   key_record.get('rate_per_hour')   or class_limits['rate_per_hour'],
         'per_day':    key_record.get('rate_per_day')    or class_limits['rate_per_day'],
     }
 
-    # Admin keys are fully exempt from rate limiting via Flask-Limiter's
-    # exempt_when=_is_admin in app.py. Nulling the values here ensures
-    # nothing downstream accidentally applies a limit.
+    # Admin keys are fully exempt from rate limiting.
     if key_record.get('admin'):
         rate_limits = {'per_minute': None, 'per_hour': None, 'per_day': None}
 
     return {
-        'id':         str(key_record['id']),
-        'name':       key_record['name'],
-        'identifier': key_record['identifier'],
-        'key_type':   key_type,
-        'is_domain':  key_type == 'domain',
-        'is_user':    key_type == 'user',
-        'admin':      bool(key_record.get('admin')),
-        'active':     bool(key_record.get('active', True)),
-        'rate_limits': rate_limits,
-        'output':      key_record.get('output_config') or {},
+        'id':                   str(key_record['id']),
+        'name':                 key_record['name'],
+        'identifier':           key_record['identifier'],
+        'admin':                bool(key_record.get('admin')),
+        'active':               bool(key_record.get('active', True)),
+        'must_change_password': bool(key_record.get('must_change_password', False)),
+        'rate_limits':          rate_limits,
+        'output':               key_record.get('output_config') or {},
     }

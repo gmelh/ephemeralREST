@@ -111,7 +111,30 @@ class EmailService:
         self.use_ssl     = cfg['use_ssl'].lower()  in ('true', '1', 'yes')
         self.admin_email = cfg['admin_email']
         self.base_url    = cfg['base_url'].rstrip('/')
-        self.portal_url  = cfg['portal_url'].rstrip('/') if cfg.get('portal_url') else self.base_url
+        # portal_url resolution order:
+        #   1. smtp_config table (set via admin SMTP page)
+        #   2. portal_settings table (set via admin Portal Settings page)
+        #   3. PORTAL_URL env var
+        #   4. base_url fallback (wrong for portal links — logs a warning)
+        _portal_url = cfg.get('portal_url', '').strip()
+        if not _portal_url:
+            try:
+                from database import DatabaseManager
+                _ps = DatabaseManager(os.environ.get('DATABASE_PATH', 'ephemeral.db')).get_portal_settings()
+                _portal_url = _ps.get('portal_url', '').strip()
+            except Exception:
+                pass
+        if not _portal_url:
+            _portal_url = os.environ.get('PORTAL_URL', '').strip()
+        if _portal_url:
+            self.portal_url = _portal_url.rstrip('/')
+        else:
+            self.portal_url = self.base_url
+            logger.warning(
+                "portal_url is not configured — email links will use the API URL (%s) "
+                "instead of the portal URL. Set Portal URL in Settings → Portal Settings.",
+                self.base_url
+            )
         self.enabled     = bool(self.host and self.user and self.password)
 
         if not self.enabled:
@@ -124,140 +147,48 @@ class EmailService:
     # Public methods
     # -------------------------------------------------------------------------
 
-    def send_user_verification(self, to_email: str, name: str, token: str) -> bool:
+    def send_registration_verification(
+            self, to_email: str, name: str, token: str,
+            base_url: str = None, template: dict = None
+    ) -> bool:
+        """Send email verification link to a newly registered user."""
+        # Link goes to the portal's verify.php, which calls the API internally.
         verify_url = f"{self.portal_url}/verify.php?t={token}"
-        subject    = "ephemeralREST - Verify your email to activate your API key"
-        text = f"""Hello {name},
+        vars = {'name': name, 'verify_url': verify_url}
+
+        if template:
+            subject   = template.get('subject') or 'Verify your email address'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Verify your email address — ephemeralREST'
+            text_body = f"""Hello {name},
 
 Thank you for registering with ephemeralREST.
 
-To activate your API key click the link below:
+Click the link below to verify your email address:
 
     {verify_url}
 
-This link expires in 24 hours. Once verified, your API key will be
-shown once - please save it securely.
+This link expires in 24 hours.
 
-If you did not request this, ignore this email.
+If you did not request this, you can safely ignore this email.
 
 ephemeralREST
 """
-        html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">ephemeralREST - Email Verification</h2>
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#1F4E79;">Verify your email address</h2>
 <p>Hello {name},</p>
-<p>Click below to activate your API key:</p>
+<p>Thank you for registering. Click the button below to verify your email address:</p>
 <p style="margin:28px 0;">
-  <a href="{verify_url}" style="background:#2E75B6;color:#fff;padding:12px 24px;text-decoration:none;border-radius:4px;font-weight:bold;">
-    Verify Email &amp; Activate Key
+  <a href="{verify_url}" style="background:#2E75B6;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;font-weight:bold;display:inline-block;">
+    Verify Email Address
   </a>
 </p>
-<p style="color:#666;font-size:13px;">Or paste: <a href="{verify_url}">{verify_url}</a></p>
-<p style="color:#666;font-size:13px;">Link expires in 24 hours.</p>
+<p style="color:#666;font-size:13px;">Or copy this link into your browser:<br><a href="{verify_url}">{verify_url}</a></p>
+<p style="color:#666;font-size:13px;">This link expires in 24 hours.</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">If you did not request this, ignore this email.</p>
-</body></html>"""
-        return self._send(to_email, subject, text, html)
-
-    def send_domain_registration_received(
-            self, to_email: str, name: str, domain: str, template: dict = None
-    ) -> bool:
-        vars = {'name': name, 'domain': domain}
-        if template:
-            subject   = self._substitute(template.get('subject') or 'Registration received', vars)
-            text_body = self._substitute(template.get('body_text') or '', vars)
-            html_body = self._render_template_html(template, vars)
-        else:
-            subject   = 'ephemeralREST - Registration request received'
-            text_body = f"""Hello {name},
-
-We have received your API key registration request for:
-
-    {domain}
-
-Your request is pending review. We will email your key once approved.
-
-ephemeralREST
-"""
-            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">ephemeralREST - Request Received</h2>
-<p>Hello {name},</p>
-<p>We've received your registration request for <strong>{domain}</strong>.</p>
-<p>We'll email your API key once approved.</p>
-<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">ephemeralREST</p>
-</body></html>"""
-        return self._send(to_email, subject, text_body, html_body)
-
-    def send_domain_approved(
-            self, to_email: str, name: str, domain: str,
-            api_key: str, admin_note: str = None, template: dict = None
-    ) -> bool:
-        vars = {'name': name, 'domain': domain, 'api_key': api_key,
-                'admin_note': admin_note or ''}
-        if template:
-            subject   = self._substitute(template.get('subject') or 'Registration approved', vars)
-            text_body = self._substitute(template.get('body_text') or '', vars)
-            html_body = self._render_template_html(template, vars)
-        else:
-            note_text = f"\nNote from admin: {admin_note}\n" if admin_note else ""
-            note_html = f'<p style="color:#555;"><em>Note: {admin_note}</em></p>' if admin_note else ""
-            subject   = "ephemeralREST - Your API key is ready"
-            text_body = f"""Hello {name},
-
-Your API key registration for '{domain}' has been approved.
-
-Your API key:
-
-    {api_key}
-
-IMPORTANT: This key will not be shown again. Save it securely now.
-{note_text}
-Use it in every API request:
-
-    X-API-Key: {api_key}
-
-ephemeralREST
-"""
-            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">ephemeralREST - API Key Approved </h2>
-<p>Hello {name},</p>
-<p>Your registration for <strong>{domain}</strong> has been approved.</p>
-{note_html}
-<p><strong>Your API key:</strong></p>
-<p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
-<p style="color:#c00;font-weight:bold;">Save this key - it will not be shown again.</p>
-<p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
-<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">ephemeralREST</p>
-</body></html>"""
-        return self._send(to_email, subject, text_body, html_body)
-
-    def send_domain_rejected(
-            self, to_email: str, name: str, domain: str,
-            admin_note: str = None, template: dict = None
-    ) -> bool:
-        vars = {'name': name, 'domain': domain, 'admin_note': admin_note or ''}
-        if template:
-            subject   = self._substitute(template.get('subject') or 'Registration update', vars)
-            text_body = self._substitute(template.get('body_text') or '', vars)
-            html_body = self._render_template_html(template, vars)
-        else:
-            note_text = f"\n{admin_note}\n" if admin_note else "\nContact us if you believe this is an error.\n"
-            note_html = f'<p>{admin_note}</p>' if admin_note else '<p>Contact us if you believe this is an error.</p>'
-            subject   = "ephemeralREST - Registration not approved"
-            text_body = f"""Hello {name},
-
-Your API key registration for '{domain}' could not be approved.
-{note_text}
-ephemeralREST
-"""
-            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#833C00;">ephemeralREST - Not Approved</h2>
-<p>Hello {name},</p>
-<p>Your registration for <strong>{domain}</strong> could not be approved.</p>
-{note_html}
-<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
-<p style="color:#999;font-size:12px;">ephemeralREST</p>
+<p style="color:#999;font-size:12px;">If you did not request this, you can safely ignore this email.</p>
 </body></html>"""
         return self._send(to_email, subject, text_body, html_body)
 
@@ -290,12 +221,12 @@ Include it in every API request as the X-API-Key header:
 ephemeralREST
 """
             html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">ephemeralREST - API Key Activated</h2>
+<h2 style="color:#375623;">Your API key is ready</h2>
 <p>Hello {name},</p>
 <p>Your email address has been verified and your API key is now active.</p>
 <p><strong>Your API key:</strong></p>
 <p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
-<p style="color:#c00;font-weight:bold;">Save this key - it will not be shown again.</p>
+<p style="color:#c00;font-weight:bold;">Save this key — it will not be shown again.</p>
 <p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
@@ -332,51 +263,128 @@ Include it in every API request as the X-API-Key header:
 ephemeralREST
 """
             html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#375623;">ephemeralREST - API Key Rotated</h2>
+<h2 style="color:#375623;">API Key Rotated</h2>
 <p>Hello {name},</p>
 <p>Your API key for <strong>{identifier}</strong> has been rotated.</p>
 <p><strong>Your new API key:</strong></p>
 <p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:14px;border-radius:4px;word-break:break-all;">{api_key}</p>
-<p style="color:#c00;font-weight:bold;">Save this key - it will not be shown again. Your previous key has been deactivated.</p>
+<p style="color:#c00;font-weight:bold;">Save this key — it will not be shown again. Your previous key has been deactivated.</p>
 <p style="background:#f4f4f4;padding:12px;font-family:monospace;font-size:13px;border-radius:4px;">X-API-Key: {api_key}</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
         return self._send(to_email, subject, text_body, html_body)
 
-    def send_admin_new_registration(
-            self, domain: str, name: str, contact_email: str,
-            reason: str, request_id: int
-    ) -> bool:
-        if not self.admin_email:
-            return True  # no admin email configured - silently skip
+    def send_set_password(self, to_email: str, name: str, token: str, template: dict = None) -> bool:
+        """Send a link prompting the user to set a password (post email-verification)."""
+        set_password_url = f"{self.portal_url}/set-password.php?t={token}"
+        vars = {'name': name, 'set_password_url': set_password_url}
 
-        approve_url = f"{self.base_url}/admin/registrations/{request_id}/approve"
-        reject_url  = f"{self.base_url}/admin/registrations/{request_id}/reject"
-        subject     = f"ephemeralREST - New registration: {domain}"
-        text = f"""New registration request:
+        if template:
+            subject   = template.get('subject') or 'Set your password'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Set your password — ephemeralREST'
+            text_body = f"""Hello {name},
 
-  Domain:  {domain}
-  Name:    {name}
-  Email:   {contact_email}
-  Reason:  {reason or 'Not provided'}
-  ID:      {request_id}
+Your email has been verified. Click the link below to set a password
+for your account:
+
+    {set_password_url}
+
+This link expires in 24 hours.
+
+ephemeralREST
 """
-        html = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
-<h2 style="color:#1F4E79;">New Registration - {domain}</h2>
-<table style="width:100%;border-collapse:collapse;">
-  <tr><td style="padding:8px;color:#666;width:80px;">Domain</td><td style="padding:8px;"><strong>{domain}</strong></td></tr>
-  <tr><td style="padding:8px;color:#666;">Name</td><td style="padding:8px;">{name}</td></tr>
-  <tr><td style="padding:8px;color:#666;">Email</td><td style="padding:8px;">{contact_email}</td></tr>
-  <tr><td style="padding:8px;color:#666;">Reason</td><td style="padding:8px;">{reason or '—'}</td></tr>
-  <tr><td style="padding:8px;color:#666;">ID</td><td style="padding:8px;">#{request_id}</td></tr>
-</table>
-<p style="margin-top:20px;">
-  <a href="{approve_url}" style="background:#375623;color:#fff;padding:10px 20px;text-decoration:none;border-radius:4px;margin-right:10px;">Approve</a>
-  <a href="{reject_url}"  style="background:#833C00;color:#fff;padding:10px 20px;text-decoration:none;border-radius:4px;">Reject</a>
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#1F4E79;">Set Your Password</h2>
+<p>Hello {name},</p>
+<p>Your email has been verified. Click below to set a password for your account:</p>
+<p style="margin:28px 0;">
+  <a href="{set_password_url}" style="background:#2E75B6;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;font-weight:bold;display:inline-block;">
+    Set Password
+  </a>
 </p>
+<p style="color:#666;font-size:13px;">Or copy this link: <a href="{set_password_url}">{set_password_url}</a></p>
+<p style="color:#666;font-size:13px;">This link expires in 24 hours.</p>
+<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
-        return self._send(self.admin_email, subject, text, html)
+        return self._send(to_email, subject, text_body, html_body)
+
+    def send_password_reset_required(self, to_email: str, name: str, token: str, template: dict = None) -> bool:
+        """Notify a user that an admin has required them to set a new password."""
+        set_password_url = f"{self.portal_url}/set-password.php?t={token}"
+        vars = {'name': name, 'set_password_url': set_password_url}
+
+        if template:
+            subject   = template.get('subject') or 'Password reset required'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Please reset your password — ephemeralREST'
+            text_body = f"""Hello {name},
+
+An administrator has requested that you set a new password for your
+account.
+
+Click the link below to set a new password:
+
+    {set_password_url}
+
+This link expires in 24 hours.
+
+ephemeralREST
+"""
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#833C00;">Password Reset Required</h2>
+<p>Hello {name},</p>
+<p>An administrator has requested that you set a new password for your account.</p>
+<p style="margin:28px 0;">
+  <a href="{set_password_url}" style="background:#2E75B6;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;font-weight:bold;display:inline-block;">
+    Set New Password
+  </a>
+</p>
+<p style="color:#666;font-size:13px;">Or copy this link: <a href="{set_password_url}">{set_password_url}</a></p>
+<p style="color:#666;font-size:13px;">This link expires in 24 hours.</p>
+<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
+</body></html>"""
+        return self._send(to_email, subject, text_body, html_body)
+
+    def send_2fa_code(self, to_email: str, name: str, code: str, expiry_minutes: int = 10, template: dict = None) -> bool:
+        """Send a 2FA verification code during login."""
+        vars = {'name': name, 'code': code, 'expiry_minutes': str(expiry_minutes)}
+
+        if template:
+            subject   = template.get('subject') or 'Your login verification code'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Your login verification code — ephemeralREST'
+            text_body = f"""Hello {name},
+
+Your verification code is:
+
+    {code}
+
+This code expires in {expiry_minutes} minutes.
+
+If you did not attempt to log in, you can ignore this email.
+
+ephemeralREST
+"""
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#1F4E79;">Verification Code</h2>
+<p>Hello {name},</p>
+<p>Your verification code is:</p>
+<p style="background:#f4f4f4;padding:16px;font-family:monospace;font-size:28px;letter-spacing:4px;border-radius:4px;text-align:center;font-weight:bold;">{code}</p>
+<p style="color:#666;font-size:13px;">This code expires in {expiry_minutes} minutes.</p>
+<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
+<p style="color:#999;font-size:12px;">If you did not attempt to log in, you can ignore this email.</p>
+</body></html>"""
+        return self._send(to_email, subject, text_body, html_body)
 
     def send_test_email(self, to_email: str, template: dict = None) -> bool:
         """Send a test message to verify SMTP configuration."""
@@ -421,9 +429,18 @@ ephemeralREST
             body_text   = self._substitute(body_text, vars)
             footer_text = self._substitute(footer_text, vars)
 
-        # Convert plain line breaks to HTML paragraphs
+        # Convert plain line breaks to HTML paragraphs, auto-linking bare URLs
+        import re as _re
+        _url_re = _re.compile('(https?://[^ \t\n<>"\']+)')
+
+        def _linkify(text: str) -> str:
+            return _url_re.sub(
+                lambda m: '<a href="' + m.group(1) + '" style="color:#2E75B6;word-break:break-all;">' + m.group(1) + '</a>',
+                text
+            )
+
         body_html = ''.join(
-            f'<p style="margin:0 0 12px;">{line}</p>' if line.strip() else '<br>'
+            f'<p style="margin:0 0 12px;">{_linkify(line)}</p>' if line.strip() else '<br>'
             for line in body_text.split('\n')
         )
 

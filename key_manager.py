@@ -158,6 +158,27 @@ def cmd_create(args):
     key_enc   = crypto.encrypt(plaintext)
     prefix    = crypto.prefix(plaintext)
 
+    # Password — set now so the account can log in to the portal immediately.
+    # Leave blank to require the user to set one via the portal (forced
+    # password reset can be triggered later by an admin).
+    import getpass
+    from werkzeug.security import generate_password_hash
+
+    password_hash = None
+    must_change_password = 1
+
+    pw = getpass.getpass("Set a password now (blank = require set on first login): ").strip()
+    if pw:
+        if len(pw) < 8:
+            print("ERROR: password must be at least 8 characters")
+            sys.exit(1)
+        confirm = getpass.getpass("Confirm password: ").strip()
+        if pw != confirm:
+            print("ERROR: passwords do not match")
+            sys.exit(1)
+        password_hash = generate_password_hash(pw)
+        must_change_password = 0
+
     key_id = db.create_api_key(
         key_type=key_type,
         name=name,
@@ -170,6 +191,9 @@ def cmd_create(args):
         rate_per_day=rpd,
     )
 
+    if password_hash:
+        db.update_api_key(key_id, password_hash=password_hash, must_change_password=0)
+
     print(f"\n{'='*60}")
     print(f"  Key created successfully (id={key_id})")
     print(f"  Type:       {key_type}")
@@ -177,6 +201,7 @@ def cmd_create(args):
     print(f"  Identifier: {identifier}")
     print(f"  Admin:      {admin}")
     print(f"  Prefix:     {prefix}")
+    print(f"  Password:   {'set' if password_hash else 'not set (must be set on first login)'}")
     print(f"\n  API KEY (copy this — it will not be shown again):")
     print(f"\n    {plaintext}\n")
     print(f"{'='*60}")

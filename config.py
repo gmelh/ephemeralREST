@@ -116,6 +116,29 @@ RATE_LIMIT_PER_DAY=200
 # Cache
 # -----------------------------------------------------------------------------
 CACHE_EXPIRY_DAYS=90
+
+# -----------------------------------------------------------------------------
+# Login / 2FA / trusted devices
+# -----------------------------------------------------------------------------
+# Number of days a "trusted device" cookie remains valid before 2FA is
+# required again on login.
+TRUSTED_DEVICE_DAYS=28
+
+# Minutes a 2FA login code remains valid.
+TWO_FACTOR_CODE_EXPIRY_MINUTES=10
+
+# -----------------------------------------------------------------------------
+# Email link URLs
+# SMTP config (host, port, user, password, from address) is set via the
+# admin portal and stored in the database. These two URL values must be set
+# here (or as env vars) because they are needed before the portal exists.
+# -----------------------------------------------------------------------------
+# Public-facing URL of this API — used in emails to build verification links.
+API_BASE_URL=http://localhost:5000
+
+# URL of the admin portal — used in set-password and password-reset emails.
+# Must point to the portal server, not the API.
+PORTAL_URL=http://localhost:3000
 """
 
 
@@ -197,6 +220,10 @@ class Config:
     # Cache settings
     CACHE_EXPIRY_DAYS = int(os.environ.get('CACHE_EXPIRY_DAYS', '90'))
 
+    # Login / 2FA / trusted devices
+    TRUSTED_DEVICE_DAYS             = int(os.environ.get('TRUSTED_DEVICE_DAYS', '28'))
+    TWO_FACTOR_CODE_EXPIRY_MINUTES  = int(os.environ.get('TWO_FACTOR_CODE_EXPIRY_MINUTES', '10'))
+
     @classmethod
     def validate(cls):
         """Validate required configuration on startup"""
@@ -259,3 +286,4 @@ class Config:
             'key_store':            'database',
             'encryption':           'Fernet (AES-128)',
         }
+    

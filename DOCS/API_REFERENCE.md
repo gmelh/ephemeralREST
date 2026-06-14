@@ -24,21 +24,22 @@ The source code is available on GitHub. As a user of this API you are entitled t
 
 All calculation endpoints require an API key. To get one:
 
-1. Go to the home page and fill out the **Request a Key** form.
-2. Provide your name, email address, and a domain name (use `*` if you do not have a website — for example, if you are writing a script or desktop tool).
-3. Your key will be emailed to you once approved. It looks something like this: `eph_a1b2c3d4e5f6...`
+1. Go to the portal's registration page (`/register-user.php`) and enter your name and email address.
+2. Check your email and click the verification link.
+3. Click the set-password link in the follow-up email to choose a password.
+4. Your API key is emailed to you when you set your password. It looks something like this: `eph_a1b2c3d4e5f6...`
 
-**Your key is shown once and only once.** Save it somewhere safe as soon as you receive it. If you lose it, you will need to request a rotation via your portal.
-
-Keys are free for development and low-volume personal use. If you need higher limits for a production application, mention your expected volume in the request form.
+**Your key is shown once and only once — in the activation email.** Save it somewhere safe immediately. If you lose it, you can rotate it via the portal and a new key will be emailed to you.
 
 ### Your key portal
 
-Once you have a key, you can sign in at `/login.php` to:
+Once you have an account, sign in at `/login.php` with your email and password. The portal lets you:
 
 - View your key details and rate limits
 - Rotate your key if it has been compromised
 - Configure your output defaults (which bodies and fields are returned)
+
+Login uses two-factor authentication by email. If you tick "Remember this device", the 2FA step is skipped for 28 days (configurable by the operator) on that browser.
 
 ---
 
@@ -279,11 +280,25 @@ Only the fields you include in an override are changed. Everything else retains 
 
 ---
 
-### Health check
+### Infrastructure
+
+#### `GET /ping`
+
+Minimal availability check. No authentication required. Returns immediately with no database access.
+
+```bash
+curl https://api.yourdomain.com/ping
+```
+
+```json
+{ "status": "ok" }
+```
+
+---
 
 #### `GET /health`
 
-No authentication required. Returns the server status and basic information about the running instance. Use this to confirm the API is reachable before making authenticated requests.
+Requires authentication. Returns the server status and basic information about the running instance. Use this to confirm the API is reachable and your key is valid.s.
 
 ```bash
 curl https://api.yourdomain.com/health
@@ -1038,12 +1053,10 @@ curl https://api.yourdomain.com/me \
 {
   "id": "42",
   "name": "Jane Smith",
-  "identifier": "myapp.com",
-  "key_type": "domain",
-  "is_domain": true,
-  "is_user": false,
+  "identifier": "jane@example.com",
   "admin": false,
   "active": true,
+  "must_change_password": false,
   "rate_limits": {
     "per_minute": 20,
     "per_hour": 200,
@@ -1231,168 +1244,222 @@ Do not retry immediately. Wait for the relevant window to reset. If you need hig
 
 ---
 
-## Key registration
+## Account registration and authentication
 
-#### `POST /register/domain`
+#### `POST /register`
 
-Submit a registration request for an API key. No authentication required.
+Register for an account. No authentication required.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `domain` | string | Yes | Your domain, or `*` for personal/direct access |
 | `name` | string | Yes | Your name |
-| `contact_email` | string | Yes | Email address — your key will be sent here |
-| `reason` | string | No | What you are building |
+| `email` | string | Yes | Email address — verification link sent here |
 
 ```bash
-curl -X POST https://api.yourdomain.com/register/domain \
+curl -X POST https://api.yourdomain.com/register \
   -H "Content-Type: application/json" \
-  -d '{
-    "domain": "myapp.com",
-    "name": "Jane Smith",
-    "contact_email": "jane@myapp.com",
-    "reason": "Building an astrology chart web app"
-  }'
+  -d '{"name": "Jane Smith", "email": "jane@example.com"}'
 ```
 
 ```json
 {
-  "message": "Registration request submitted. You will be notified by email.",
-  "request_id": 7
+  "message": "Verification email sent. Click the link in the email to verify your address.",
+  "email": "jane@example.com"
 }
 ```
+
+The registration flow:
+
+1. A verification email is sent to the supplied address.
+2. Clicking the link renders a portal page confirming success.
+3. A second email is sent with a link to set a password.
+4. Once the password is set, the account is active and the API key is emailed once.
 
 ---
 
 #### `GET /register/verify?t=<token>`
 
-Activate a user key via email verification link. This endpoint is typically called by clicking the link in the verification email rather than directly.
+Verify an email address. Intended to be called by the portal's `verify.php` page, which renders the result.
+
+---
+
+#### `GET /setup/status`
+
+Check whether first-run setup is required. No authentication.
 
 ```bash
-curl "https://api.yourdomain.com/register/verify?t=your-verification-token"
+curl https://api.yourdomain.com/setup/status
 ```
 
-On success, returns the API key. **This is the only time the key is ever shown** — copy it immediately.
+```json
+{ "setup_required": true }
+```
 
 ---
 
----
+#### `POST /setup`
 
-### Views
-
-A view is a saved JSON blob identified by a UUID. Views exist to enable clean share URLs for chart states — instead of encoding all chart parameters in a long querystring, the client saves the relevant state to a view and shares a minimal URL such as `https://example.com?v=<uuid>`. When someone opens that URL, the client fetches the view by UUID and restores whatever state it stored.
-
-The structure of the JSON is entirely defined by the client application. ephemeralREST stores and returns it opaquely without inspecting or validating its contents.
-
-#### `POST /views`
-
-Save a new view. Always generates a fresh UUID. Returns the UUID to include in share URLs.
+Create the initial administrator account. Only works when the database is empty. Returns `403` once any key exists.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `data` | object | Yes | Any valid JSON object — the client defines the structure |
-
-```bash
-curl -X POST https://api.yourdomain.com/views \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: eph_your_key_here" \
-  -d '{
-    "data": {
-      "chart_id": "a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d",
-      "dial_orb": 1.5,
-      "bodies": ["sun", "moon", "mars"],
-      "mode": "bidial"
-    }
-  }'
-```
-
-```json
-{ "view_id": "f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d" }
-```
-
-The response is a `201 Created`. The `view_id` is what you embed in a share URL — e.g. `https://yourapp.com?v=f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d`.
-
----
-
-#### `PUT /views/<view_id>`
-
-Update an existing view in place. The blob is replaced entirely. Returns `404` if the UUID does not exist.
-
-```bash
-curl -X PUT https://api.yourdomain.com/views/f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: eph_your_key_here" \
-  -d '{
-    "data": {
-      "chart_id": "a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d",
-      "dial_orb": 2.0,
-      "bodies": ["sun", "moon", "mars", "saturn"],
-      "mode": "bidial"
-    }
-  }'
-```
-
-```json
-{ "view_id": "f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d" }
-```
-
----
-
-#### `GET /views?v=<view_id>`
-
-Retrieve a saved view by UUID. **No authentication required** — this endpoint is public so that share URLs work without a key. Anyone with the UUID can retrieve the view.
-
-```bash
-curl "https://api.yourdomain.com/views?v=f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d"
-```
+| `name` | string | Yes | Administrator name |
+| `email` | string | Yes | Login email address |
+| `password` | string | Yes | Password (minimum 8 characters) |
 
 ```json
 {
-  "view_id": "f7e6d5c4-b3a2-4190-8e7d-6c5b4a3f2e1d",
-  "data": {
-    "chart_id": "a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d",
-    "dial_orb": 1.5,
-    "bodies": ["sun", "moon", "mars"],
-    "mode": "bidial"
-  },
-  "created_at": "2026-03-31T08:10:00",
-  "updated_at": "2026-03-31T08:10:00"
+  "message": "Setup complete. Administrator account created.",
+  "id": 1,
+  "name": "Admin",
+  "identifier": "admin@example.com",
+  "admin": true,
+  "api_key": "eph_..."
 }
 ```
 
-Returns `404` if the UUID does not exist.
+The `api_key` is shown once only. Save it.
+
+---
+
+#### `POST /login`
+
+Authenticate with email and password. No authentication required.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `email` | string | Yes | Registered email address |
+| `password` | string | Yes | Account password |
+| `device_token` | string | No | Trusted-device token (skips 2FA if valid) |
+
+Three possible response shapes:
+
+```json
+{ "must_change_password": true, "email": "..." }
+```
+
+```json
+{ "2fa_required": true, "email": "..." }
+```
+
+```json
+{ "id": 1, "name": "...", "identifier": "...", "admin": false, "api_key": "eph_..." }
+```
+
+---
+
+#### `POST /login/2fa`
+
+Complete login by verifying a 2FA code.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `email` | string | Yes | Email address |
+| `code` | string | Yes | 6-digit code from email |
+| `remember_device` | boolean | No | Issue a trusted-device token |
+
+On success returns identity + `api_key`, and optionally `device_token` + `device_token_expires_days`.
+
+---
+
+#### `POST /password/forgot`
+
+Request a password reset email. No authentication required. Always returns the same message to prevent account enumeration.
+
+| Field | Type | Required |
+|---|---|---|
+| `email` | string | Yes |
+
+---
+
+#### `POST /password/set`
+
+Set or change a password. Supply either `token` (from email) or `email` + `current_password`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `token` | string | One of | Token from set-password email |
+| `email` | string | One of | Email address (with current_password) |
+| `current_password` | string | One of | Current password (with email) |
+| `new_password` | string | Yes | New password (min 8 chars) |
 
 ---
 
 ## Endpoint quick reference
 
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/health` | No | Server status |
-| `GET` | `/autocomplete?q=` | No | Location autocomplete |
-| `POST` | `/locations/resolve` | No | Resolve place to coordinates |
-| `POST` | `/register/domain` | No | Request a domain API key |
-| `POST` | `/register/user` | No | Register a personal user key |
-| `GET` | `/register/verify?t=` | No | Verify email and activate user key |
-| `GET` | `/me` | Yes | Your key identity and settings |
-| `GET` | `/me/output` | Yes | Your output configuration |
-| `POST` | `/me/output` | Yes | Update your output configuration |
-| `POST` | `/me/rotate` | Yes | Rotate your key |
-| `POST` | `/calculate` | Yes | Calculate a chart |
-| `GET` | `/chart/<id>` | Yes | Retrieve a chart |
-| `GET` | `/cache/stats` | Yes | Cache statistics |
-| `POST` | `/chart/<id>/progressions` | Yes | Secondary progressions |
-| `POST` | `/chart/<id>/solar-arc` | Yes | Solar arc directions |
-| `POST` | `/chart/<id>/solar-return` | Yes | Solar return |
-| `POST` | `/chart/<id>/lunar-return` | Yes | Lunar return |
-| `GET` | `/chart/<id>/derived` | Yes | List derived charts |
-| `GET` | `/derived/<id>` | Yes | Retrieve derived chart |
-| `DELETE` | `/derived/<id>` | Yes | Delete derived chart |
-| `POST` | `/ephemeris` | Yes | Monthly ephemeris |
-| `POST` | `/apsides` | Yes | Current apside positions |
-| `POST` | `/apsides/next` | Yes | Next apside events |
-| `POST` | `/lunations` | Yes | Lunation events |
-| `POST` | `/eclipses` | Yes | Solar and lunar eclipses |
-| `POST` | `/views` | Yes | Save a new view |
-| `PUT` | `/views/<id>` | Yes | Update an existing view |
+### Public endpoints (no `X-API-Key` required)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/ping` | Availability check |
+| `GET` | `/setup/status` | Whether first-run setup is needed |
+| `POST` | `/setup` | Create first admin account (empty DB only) |
+| `POST` | `/register` | Register for an account |
+| `GET` | `/register/verify?t=` | Verify email address |
+| `POST` | `/login` | Authenticate with email + password |
+| `POST` | `/login/2fa` | Complete login with 2FA code |
+| `POST` | `/password/forgot` | Request a password reset email |
+| `POST` | `/password/set` | Set or change a password |
+| `GET` | `/autocomplete?q=` | Location autocomplete |
+| `GET` | `/chart/<id>` | Retrieve a chart (public sharing) |
+| `GET` | `/views?v=<uuid>` | Retrieve a saved view |
+
+### Authenticated endpoints (`X-API-Key` required)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Server status |
+| `GET` | `/cache/stats` | Cache statistics |
+| `POST` | `/cache/cleanup` | Evict stale cache entries |
+| `POST` | `/locations/resolve` | Resolve place to coordinates |
+| `POST` | `/calculate` | Calculate a chart |
+| `POST` | `/chart/<id>/progressions` | Secondary progressions |
+| `POST` | `/chart/<id>/solar-arc` | Solar arc directions |
+| `POST` | `/chart/<id>/solar-return` | Solar return |
+| `POST` | `/chart/<id>/lunar-return` | Lunar return |
+| `GET` | `/chart/<id>/derived` | List derived charts |
+| `GET` | `/derived/<id>` | Retrieve derived chart |
+| `DELETE` | `/derived/<id>` | Delete derived chart |
+| `POST` | `/ephemeris` | Monthly ephemeris |
+| `POST` | `/apsides` | Apside positions in a date range |
+| `POST` | `/apsides/next` | Next apside events from a date |
+| `POST` | `/lunations` | Lunation events |
+| `POST` | `/eclipses` | Solar and lunar eclipses |
+| `POST` | `/views` | Save a new view |
+| `PUT` | `/views/<id>` | Update an existing view |
+| `GET` | `/archive` | Search the chart archive |
+| `GET` | `/archive/<chart_id>` | Retrieve an archive entry |
+| `GET` | `/me` | Your account identity and settings |
+| `GET` | `/me/output` | Your output configuration |
+| `POST` | `/me/output` | Update your output configuration |
+| `POST` | `/me/rotate` | Rotate your API key |
+| `POST` | `/me/forget-device` | Revoke a trusted-device token |
+
+### Admin endpoints (admin key required)
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/admin/keys` | List all keys |
+| `GET` | `/admin/keys/<id>` | Key detail |
+| `DELETE` | `/admin/keys/<id>` | Delete a key |
+| `POST` | `/admin/keys/<id>/disable` | Disable a key |
+| `POST` | `/admin/keys/<id>/enable` | Enable a key |
+| `POST` | `/admin/keys/<id>/rotate` | Rotate a key |
+| `POST` | `/admin/keys/<id>/limits` | Set per-key rate limits |
+| `GET` | `/admin/keys/<id>/output` | Key output config |
+| `POST` | `/admin/keys/<id>/output` | Update key output config |
+| `POST` | `/admin/keys/<id>/set-admin` | Grant or revoke admin flag |
+| `POST` | `/admin/keys/<id>/force-password-reset` | Force password reset + email user |
+| `GET` | `/admin/class-limits` | Default rate limits |
+| `POST` | `/admin/class-limits` | Update default rate limits |
+| `GET` | `/admin/smtp` | SMTP configuration |
+| `POST` | `/admin/smtp` | Update SMTP configuration |
+| `DELETE` | `/admin/smtp` | Clear SMTP configuration |
+| `POST` | `/admin/smtp/test` | Send test email |
+| `GET` | `/admin/portal-settings` | Portal settings |
+| `POST` | `/admin/portal-settings` | Update portal settings |
+| `DELETE` | `/admin/portal-settings/<key>` | Reset a setting to default |
+| `GET` | `/admin/email-templates/<name>` | Get an email template |
+| `POST` | `/admin/email-templates/<name>` | Update an email template |
+| `POST` | `/admin/email-templates/<name>/reset` | Reset template to default |
 | `GET` | `/views?v=` | No | Retrieve a view by UUID |

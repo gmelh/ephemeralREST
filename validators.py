@@ -340,16 +340,47 @@ class EphemerisSchema(Schema):
 
 
 
-class RegisterDomainSchema(Schema):
-    domain         = fields.Str(required=True, validate=validate.Length(min=3, max=200))
-    name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))
-    contact_email  = fields.Email(required=True)
-    reason         = fields.Str(load_default=None, validate=validate.Length(max=1000), allow_none=True)
+class RegisterSchema(Schema):
+    """Schema for POST /register — self-serve registration by email."""
+    email = fields.Email(required=True)
+    name  = fields.Str(required=True, validate=validate.Length(min=1, max=100))
 
 
-class RegisterUserSchema(Schema):
-    email          = fields.Email(required=True)
-    name           = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+class SetupSchema(Schema):
+    """Schema for POST /setup — first-run admin account creation."""
+    name     = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    email    = fields.Email(required=True)
+    password = fields.Str(required=True, validate=validate.Length(min=8, max=200))
+
+
+class LoginSchema(Schema):
+    """Schema for POST /login — email + password, optional trusted-device token."""
+    email           = fields.Email(required=True)
+    password        = fields.Str(required=True, validate=validate.Length(min=1, max=200))
+    device_token    = fields.Str(load_default=None, allow_none=True)
+
+
+class Login2FASchema(Schema):
+    """Schema for POST /login/2fa — email + 2FA code, optional remember-device flag."""
+    email  = fields.Email(required=True)
+    code   = fields.Str(required=True, validate=validate.Length(min=1, max=20))
+    remember_device = fields.Bool(load_default=False)
+
+
+class SetPasswordSchema(Schema):
+    """
+    Schema for POST /password/set.
+
+    Either:
+      - token (from a set-password / password-reset email), or
+      - email + current_password (normal in-portal password change)
+
+    new_password is always required.
+    """
+    token            = fields.Str(load_default=None, allow_none=True)
+    email            = fields.Email(load_default=None, allow_none=True)
+    current_password = fields.Str(load_default=None, allow_none=True)
+    new_password     = fields.Str(required=True, validate=validate.Length(min=8, max=200))
 
 
 class EclipseSchema(Schema):
