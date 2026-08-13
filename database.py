@@ -32,7 +32,8 @@
 
 """
 Database management module for Astro API.
-Handles SQLite operations with connection pooling and caching.
+Handles SQLite (default) or MySQL operations, selected via DB_TYPE, with
+connection pooling and caching.
 
 Tables:
     Existing (unchanged):
@@ -44,33 +45,258 @@ Tables:
         place_aliases       — user-entered variants mapped to canonical places
         place_cache         — Google-derived lat/lon/timezone, expires after 30 days
         place_lookup_log    — audit log of every resolution attempt
+
+MySQL support:
+    Set DB_TYPE=mysql (plus MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/
+    MYSQL_DATABASE) to run against MySQL instead of SQLite. This is a
+    MySQL-only mode, not a dual-dialect abstraction: when MySQL is selected,
+    a separate schema (_init_schema_mysql) is created and a thin
+    connection/cursor wrapper (_MySQLConnectionWrapper/_MySQLCursorWrapper)
+    translates the handful of SQLite-specific idioms used throughout this
+    module (the '?' placeholder style, INSERT OR IGNORE/REPLACE, the
+    ON CONFLICT...DO UPDATE upsert syntax, and datetime('now', ...) helpers)
+    into their MySQL equivalents. Everything else — every method below
+    get_connection() — is written once and shared by both backends.
 """
+import os
+import re
 import sqlite3
 import json
 import hashlib
 import uuid
 import logging
+import decimal
 from contextlib import contextmanager
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from datetime import datetime, timedelta, date
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
 PLACE_CACHE_EXPIRY_DAYS = 30
 
 
-class DatabaseManager:
-    """Manages database operations with connection pooling"""
+# ==============================================================================
+# MySQL compatibility layer
+#
+# Only imported/used when DB_TYPE=mysql. Translates the SQLite idioms this
+# module was originally written against into MySQL-compatible SQL, and wraps
+# rows/cursors so the calling code (row['col'], row[0], dict(row), lastrowid,
+# rowcount, etc.) behaves the same regardless of backend.
+# ==============================================================================
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+# MySQL expression standing in for SQLite's datetime('now'). A native
+# UTC_TIMESTAMP() value (not a formatted string) so it compares directly
+# against the datetime objects _fmt_dt() passes through for MySQL, and so
+# it contains no '%' characters — mysql-connector's own placeholder
+# scanner treats a literal '%s' anywhere in the SQL text (including inside
+# a format-string literal) as a bind parameter, so DATE_FORMAT(...,'%s')
+# is not safe to use here.
+_MYSQL_NOW_EXPR = "UTC_TIMESTAMP(6)"
+
+
+def _translate_sql_mysql(sql: str) -> str:
+    """
+    Translate a SQLite-flavoured SQL statement into MySQL-compatible SQL.
+    This is a small, targeted translation covering exactly the idioms used
+    in this file — not a general SQL dialect converter.
+    """
+    out = sql
+
+    # SQLite relative-date arithmetic used by cleanup_old_cache()
+    out = out.replace(
+        "datetime('now', '-' || ? || ' days')",
+        "DATE_SUB(UTC_TIMESTAMP(), INTERVAL ? DAY)"
+    )
+    # SQLite "now" comparisons against expires_at / last_accessed columns
+    out = out.replace("datetime('now')", _MYSQL_NOW_EXPR)
+
+    # MySQL's default utf8mb4 collations are already case-insensitive, so
+    # this SQLite-specific clause can simply be dropped.
+    out = out.replace('COLLATE NOCASE', '')
+
+    # Upsert syntax
+    out = re.sub(r'INSERT\s+OR\s+IGNORE\s+INTO', 'INSERT IGNORE INTO', out, flags=re.IGNORECASE)
+    out = re.sub(r'INSERT\s+OR\s+REPLACE\s+INTO', 'REPLACE INTO', out, flags=re.IGNORECASE)
+    out = re.sub(
+        r'ON CONFLICT\s*\([^)]*\)\s*DO UPDATE SET\s*(.*)',
+        lambda m: 'ON DUPLICATE KEY UPDATE ' + m.group(1),
+        out,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    out = re.sub(r'excluded\.(\w+)', r'VALUES(\1)', out, flags=re.IGNORECASE)
+
+    # Placeholder style — done last since none of the substitutions above
+    # introduce a literal '?' that shouldn't be converted.
+    out = out.replace('?', '%s')
+
+    return out
+
+
+def _normalise_mysql_value(value):
+    """
+    Normalise a single MySQL connector value so downstream code (much of
+    which assumes SQLite's plain str/int/float/None row values) doesn't
+    need to know it's talking to MySQL.
+    """
+    if isinstance(value, decimal.Decimal):
+        # SUM()/AVG() over integer columns come back as Decimal in MySQL
+        # but as plain int/float from SQLite.
+        as_int = int(value)
+        return as_int if as_int == value else float(value)
+    if isinstance(value, datetime):
+        return value.isoformat(sep=' ')
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
+
+
+class _MySQLRow(dict):
+    """
+    dict subclass that also supports positional index access, mirroring
+    sqlite3.Row (which supports both row['col'] and row[0]).
+    """
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return list(self.values())[key]
+        return super().__getitem__(key)
+
+
+class _MySQLCursorWrapper:
+    """Wraps a mysql-connector cursor to translate SQL and normalise rows."""
+
+    def __init__(self, raw_cursor):
+        self._cursor = raw_cursor
+
+    def execute(self, sql, params=()):
+        self._cursor.execute(_translate_sql_mysql(sql), params or ())
+        return self
+
+    def executemany(self, sql, seq_of_params):
+        self._cursor.executemany(_translate_sql_mysql(sql), list(seq_of_params))
+        return self
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        return _MySQLRow((k, _normalise_mysql_value(v)) for k, v in row.items())
+
+    def fetchall(self):
+        return [
+            _MySQLRow((k, _normalise_mysql_value(v)) for k, v in row.items())
+            for row in self._cursor.fetchall()
+        ]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+
+class _MySQLConnectionWrapper:
+    """
+    Wraps a mysql-connector connection so it can be used as a drop-in
+    replacement for a sqlite3.Connection in this module — including the
+    conn.execute(...) convenience method sqlite3 provides directly on the
+    connection object (not just on a cursor).
+    """
+
+    def __init__(self, mysql_config: Dict[str, Any]):
+        import mysql.connector  # imported lazily — only required for DB_TYPE=mysql
+        self._conn = mysql.connector.connect(
+            host=mysql_config['host'],
+            port=int(mysql_config.get('port', 3306)),
+            user=mysql_config['user'],
+            password=mysql_config.get('password', ''),
+            database=mysql_config['database'],
+            autocommit=False,
+        )
+
+    def cursor(self):
+        return _MySQLCursorWrapper(self._conn.cursor(dictionary=True))
+
+    def execute(self, sql, params=()):
+        """Mimics sqlite3.Connection.execute() — execute directly on the connection."""
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def executemany(self, sql, seq_of_params):
+        cur = self.cursor()
+        cur.executemany(sql, seq_of_params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+class DatabaseManager:
+    """Manages database operations with connection pooling. Backs onto
+    either SQLite (default) or MySQL, selected via db_type."""
+
+    def __init__(
+            self,
+            db_path: str = None,
+            db_type: str = None,
+            mysql_config: Optional[Dict[str, Any]] = None,
+    ):
+        self.db_type = (db_type or os.environ.get('DB_TYPE', 'sqlite')).strip().lower()
+        if self.db_type not in ('sqlite', 'mysql'):
+            logger.warning(f"Unknown DB_TYPE '{self.db_type}' — falling back to sqlite")
+            self.db_type = 'sqlite'
+
+        if self.db_type == 'mysql':
+            self.mysql_config = mysql_config or {
+                'host':     os.environ.get('MYSQL_HOST', 'localhost'),
+                'port':     int(os.environ.get('MYSQL_PORT', '3306')),
+                'user':     os.environ.get('MYSQL_USER', ''),
+                'password': os.environ.get('MYSQL_PASSWORD', ''),
+                'database': os.environ.get('MYSQL_DATABASE', ''),
+            }
+            if not self.mysql_config.get('user') or not self.mysql_config.get('database'):
+                raise ValueError(
+                    "DB_TYPE=mysql requires at least MYSQL_USER and MYSQL_DATABASE "
+                    "to be set (see .env)."
+                )
+            self.db_path = None
+        else:
+            self.mysql_config = None
+            self.db_path = db_path or os.environ.get('DATABASE_PATH', 'ephemeral.db')
+
         self.init_database()
+
+    def _fmt_dt(self, dt: datetime):
+        """
+        Format a datetime for storage in an expires_at-style column.
+        SQLite gets Python's normal ISO8601 string, matching its opaque
+        TEXT/TIMESTAMP columns. MySQL gets the raw datetime object back —
+        the connector serialises it natively into its DATETIME/TIMESTAMP
+        wire format, which is what UTC_TIMESTAMP(6) comparisons expect.
+        """
+        if self.db_type == 'mysql':
+            return dt
+        return dt.isoformat()
 
     @contextmanager
     def get_connection(self):
         """Context manager for database connections"""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        if self.db_type == 'mysql':
+            conn = _MySQLConnectionWrapper(self.mysql_config)
+        else:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
         try:
             yield conn
             conn.commit()
@@ -82,83 +308,130 @@ class DatabaseManager:
             conn.close()
 
     def init_database(self):
-        """Initialize the SQLite database with all required tables"""
+        """Initialize the database schema for whichever backend is configured."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            if self.db_type == 'mysql':
+                self._init_schema_mysql(cursor)
+            else:
+                self._init_schema_sqlite(cursor)
+            logger.info(f"Database initialized successfully ({self.db_type})")
 
-            # ------------------------------------------------------------------
-            # Existing tables (unchanged)
-            # ------------------------------------------------------------------
+    def _init_schema_sqlite(self, cursor):
+        """Initialize the SQLite database with all required tables"""
 
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS locations
-                (
-                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                    query_text        TEXT UNIQUE NOT NULL,
-                    query_hash        TEXT UNIQUE NOT NULL,
-                    latitude          REAL NOT NULL,
-                    longitude         REAL NOT NULL,
-                    formatted_address TEXT NOT NULL,
-                    timezone          TEXT NOT NULL,
-                    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_used         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+        # ------------------------------------------------------------------
+        # Existing tables (unchanged)
+        # ------------------------------------------------------------------
 
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS charts
-                (
-                    id             TEXT PRIMARY KEY,
-                    chart_name     TEXT DEFAULT 'Untitled Chart',
-                    datetime_utc   TEXT NOT NULL,
-                    datetime_local TEXT NOT NULL,
-                    location_id    INTEGER NOT NULL,
-                    chart_data     TEXT NOT NULL,
-                    chart_hash     TEXT UNIQUE NOT NULL,
-                    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_accessed  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    access_count   INTEGER DEFAULT 1,
-                    FOREIGN KEY (location_id) REFERENCES locations (id)
-                )
-            ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS locations
+            (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_text        TEXT UNIQUE NOT NULL,
+                query_hash        TEXT UNIQUE NOT NULL,
+                latitude          REAL NOT NULL,
+                longitude         REAL NOT NULL,
+                formatted_address TEXT NOT NULL,
+                timezone          TEXT NOT NULL,
+                created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
 
-            # Migrations: add columns to charts if missing from older databases
-            cursor.execute("PRAGMA table_info(charts)")
-            columns = [column[1] for column in cursor.fetchall()]
-            if 'chart_name' not in columns:
-                cursor.execute("ALTER TABLE charts ADD COLUMN chart_name TEXT DEFAULT 'Untitled Chart'")
-                logger.info("Migration: added chart_name column to charts table")
-            if 'chart_type' not in columns:
-                cursor.execute("ALTER TABLE charts ADD COLUMN chart_type TEXT NOT NULL DEFAULT 'natal'")
-                logger.info("Migration: added chart_type column to charts table")
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS charts
+            (
+                id             TEXT PRIMARY KEY,
+                chart_name     TEXT DEFAULT 'Untitled Chart',
+                datetime_utc   TEXT NOT NULL,
+                datetime_local TEXT NOT NULL,
+                location_id    INTEGER NOT NULL,
+                chart_data     TEXT NOT NULL,
+                chart_hash     TEXT UNIQUE NOT NULL,
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                access_count   INTEGER DEFAULT 1,
+                FOREIGN KEY (location_id) REFERENCES locations (id)
+            )
+        ''')
 
-            # Derived charts — all charts calculated from a primary radix
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS derived_charts
-                (
-                    id                  TEXT PRIMARY KEY,
-                    chart_id            TEXT NOT NULL,
-                    secondary_chart_id  TEXT,
-                    chart_type          TEXT NOT NULL,
-                    chart_name          TEXT DEFAULT 'Untitled',
-                    reference_date      TEXT NOT NULL,
-                    chart_data          TEXT NOT NULL,
-                    chart_hash          TEXT UNIQUE NOT NULL,
-                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_accessed       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    access_count        INTEGER DEFAULT 1,
-                    FOREIGN KEY (chart_id)           REFERENCES charts(id),
-                    FOREIGN KEY (secondary_chart_id) REFERENCES charts(id)
-                )
-            ''')
+        # Migrations: add columns to charts if missing from older databases
+        cursor.execute("PRAGMA table_info(charts)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if 'chart_name' not in columns:
+            cursor.execute("ALTER TABLE charts ADD COLUMN chart_name TEXT DEFAULT 'Untitled Chart'")
+            logger.info("Migration: added chart_name column to charts table")
+        if 'chart_type' not in columns:
+            cursor.execute("ALTER TABLE charts ADD COLUMN chart_type TEXT NOT NULL DEFAULT 'natal'")
+            logger.info("Migration: added chart_type column to charts table")
+
+        # Derived charts — all charts calculated from a primary radix
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS derived_charts
+            (
+                id                  TEXT PRIMARY KEY,
+                chart_id            TEXT NOT NULL,
+                secondary_chart_id  TEXT,
+                chart_type          TEXT NOT NULL,
+                chart_name          TEXT DEFAULT 'Untitled',
+                reference_date      TEXT NOT NULL,
+                chart_data          TEXT NOT NULL,
+                chart_hash          TEXT UNIQUE NOT NULL,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                access_count        INTEGER DEFAULT 1,
+                FOREIGN KEY (chart_id)           REFERENCES charts(id),
+                FOREIGN KEY (secondary_chart_id) REFERENCES charts(id)
+            )
+        ''')
 
 
-            # ------------------------------------------------------------------
-            # API key management tables
-            # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # API key management tables
+        # ------------------------------------------------------------------
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_keys
+            (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_type        TEXT NOT NULL DEFAULT 'user',
+                name            TEXT NOT NULL,
+                identifier      TEXT NOT NULL UNIQUE,
+                key_enc         TEXT NOT NULL,
+                key_prefix      TEXT NOT NULL,
+                admin           INTEGER NOT NULL DEFAULT 0,
+                active          INTEGER NOT NULL DEFAULT 1,
+                rate_per_minute INTEGER,
+                rate_per_hour   INTEGER,
+                rate_per_day    INTEGER,
+                output_config   TEXT,
+                password_hash         TEXT,
+                must_change_password  INTEGER NOT NULL DEFAULT 1,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Migrations for api_keys table
+        cursor.execute("PRAGMA table_info(api_keys)")
+        _api_key_cols = {column[1]: column for column in cursor.fetchall()}
+
+        # Fix: if key_type column has a NOT NULL constraint with no default,
+        # SQLite cannot ALTER COLUMN — we must recreate the table.
+        # Detect this by checking whether the column has a dflt_value.
+        # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
+        _needs_recreate = False
+        if 'key_type' in _api_key_cols:
+            _col = _api_key_cols['key_type']
+            # dflt_value is index 4; if NOT NULL (index 3 == 1) and no default
+            if _col[3] == 1 and _col[4] is None:
+                _needs_recreate = True
+
+        if _needs_recreate:
+            logger.info("Migration: recreating api_keys table to fix key_type constraint")
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS api_keys
+                CREATE TABLE IF NOT EXISTS api_keys_new
                 (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     key_type        TEXT NOT NULL DEFAULT 'user',
@@ -178,416 +451,801 @@ class DatabaseManager:
                     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-
-            # Migrations for api_keys table
+            cursor.execute("""
+                INSERT INTO api_keys_new
+                    (id, key_type, name, identifier, key_enc, key_prefix,
+                     admin, active, rate_per_minute, rate_per_hour, rate_per_day,
+                     output_config, created_at, updated_at)
+                SELECT
+                    id,
+                    COALESCE(key_type, 'user'),
+                    name, identifier, key_enc, key_prefix,
+                    admin, active, rate_per_minute, rate_per_hour, rate_per_day,
+                    output_config, created_at, updated_at
+                FROM api_keys
+            """)
+            cursor.execute("DROP TABLE api_keys")
+            cursor.execute("ALTER TABLE api_keys_new RENAME TO api_keys")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_identifier ON api_keys(identifier)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
+            logger.info("Migration: api_keys table recreated successfully")
+            # Refresh column info after recreation
             cursor.execute("PRAGMA table_info(api_keys)")
             _api_key_cols = {column[1]: column for column in cursor.fetchall()}
 
-            # Fix: if key_type column has a NOT NULL constraint with no default,
-            # SQLite cannot ALTER COLUMN — we must recreate the table.
-            # Detect this by checking whether the column has a dflt_value.
-            # PRAGMA table_info returns: (cid, name, type, notnull, dflt_value, pk)
-            _needs_recreate = False
-            if 'key_type' in _api_key_cols:
-                _col = _api_key_cols['key_type']
-                # dflt_value is index 4; if NOT NULL (index 3 == 1) and no default
-                if _col[3] == 1 and _col[4] is None:
-                    _needs_recreate = True
+        # Add password columns if missing
+        if 'password_hash' not in _api_key_cols:
+            cursor.execute("ALTER TABLE api_keys ADD COLUMN password_hash TEXT")
+            logger.info("Migration: added password_hash column to api_keys")
+        if 'must_change_password' not in _api_key_cols:
+            cursor.execute("ALTER TABLE api_keys ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 1")
+            logger.info("Migration: added must_change_password column to api_keys")
 
-            if _needs_recreate:
-                logger.info("Migration: recreating api_keys table to fix key_type constraint")
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS api_keys_new
-                    (
-                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                        key_type        TEXT NOT NULL DEFAULT 'user',
-                        name            TEXT NOT NULL,
-                        identifier      TEXT NOT NULL UNIQUE,
-                        key_enc         TEXT NOT NULL,
-                        key_prefix      TEXT NOT NULL,
-                        admin           INTEGER NOT NULL DEFAULT 0,
-                        active          INTEGER NOT NULL DEFAULT 1,
-                        rate_per_minute INTEGER,
-                        rate_per_hour   INTEGER,
-                        rate_per_day    INTEGER,
-                        output_config   TEXT,
-                        password_hash         TEXT,
-                        must_change_password  INTEGER NOT NULL DEFAULT 1,
-                        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                cursor.execute("""
-                    INSERT INTO api_keys_new
-                        (id, key_type, name, identifier, key_enc, key_prefix,
-                         admin, active, rate_per_minute, rate_per_hour, rate_per_day,
-                         output_config, created_at, updated_at)
-                    SELECT
-                        id,
-                        COALESCE(key_type, 'user'),
-                        name, identifier, key_enc, key_prefix,
-                        admin, active, rate_per_minute, rate_per_hour, rate_per_day,
-                        output_config, created_at, updated_at
-                    FROM api_keys
-                """)
-                cursor.execute("DROP TABLE api_keys")
-                cursor.execute("ALTER TABLE api_keys_new RENAME TO api_keys")
-                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_identifier ON api_keys(identifier)")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
-                logger.info("Migration: api_keys table recreated successfully")
-                # Refresh column info after recreation
-                cursor.execute("PRAGMA table_info(api_keys)")
-                _api_key_cols = {column[1]: column for column in cursor.fetchall()}
-
-            # Add password columns if missing
-            if 'password_hash' not in _api_key_cols:
-                cursor.execute("ALTER TABLE api_keys ADD COLUMN password_hash TEXT")
-                logger.info("Migration: added password_hash column to api_keys")
-            if 'must_change_password' not in _api_key_cols:
-                cursor.execute("ALTER TABLE api_keys ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 1")
-                logger.info("Migration: added must_change_password column to api_keys")
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS key_class_limits
-                (
-                    key_type        TEXT PRIMARY KEY,
-                    rate_per_minute INTEGER NOT NULL DEFAULT 10,
-                    rate_per_hour   INTEGER NOT NULL DEFAULT 50,
-                    rate_per_day    INTEGER NOT NULL DEFAULT 200,
-                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            cursor.execute("INSERT OR IGNORE INTO key_class_limits (key_type, rate_per_minute, rate_per_hour, rate_per_day) VALUES ('user', 10, 100, 500)")
-
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_type   ON api_keys(key_type)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(active)")
-
-
-            # ------------------------------------------------------------------
-            # Registration and verification tables
-            # ------------------------------------------------------------------
-
-            # registration_requests table removed — flat self-serve registration,
-            # no admin approval workflow.
-
-            # Email verification tokens for user key activation
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS email_verifications
-                (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    api_key_id  INTEGER NOT NULL,
-                    token       TEXT NOT NULL UNIQUE,
-                    email       TEXT NOT NULL,
-                    used        INTEGER NOT NULL DEFAULT 0,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at  TIMESTAMP NOT NULL,
-                    FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
-                )
-            """)
-
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_verif_token   ON email_verifications(token)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_verif_key     ON email_verifications(api_key_id)")
-
-
-            # ------------------------------------------------------------------
-            # Login — 2FA codes and trusted devices
-            # ------------------------------------------------------------------
-
-            # Short-lived numeric codes emailed during the 2FA login step
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS login_2fa_codes
-                (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    api_key_id  INTEGER NOT NULL,
-                    code        TEXT NOT NULL,
-                    used        INTEGER NOT NULL DEFAULT 0,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at  TIMESTAMP NOT NULL,
-                    FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
-                )
-            """)
-
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_login_2fa_key ON login_2fa_codes(api_key_id)")
-
-            # Trusted-device tokens — allow skipping 2FA on recognised machines.
-            # Token is stored as a portal cookie; lifetime is configurable via
-            # TRUSTED_DEVICE_DAYS (default 28).
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS trusted_devices
-                (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    api_key_id  INTEGER NOT NULL,
-                    token       TEXT NOT NULL UNIQUE,
-                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at  TIMESTAMP NOT NULL,
-                    FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
-                )
-            """)
-
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trusted_device_token ON trusted_devices(token)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trusted_device_key   ON trusted_devices(api_key_id)")
-
-
-            # ------------------------------------------------------------------
-            # SMTP configuration (single row, upserted by key)
-            # ------------------------------------------------------------------
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS smtp_config
-                (
-                    key        TEXT PRIMARY KEY,
-                    value      TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # ------------------------------------------------------------------
-            # Portal settings — configurable admin portal behaviour
-            # ------------------------------------------------------------------
-            # Simple key/value store. Defaults are baked into the application;
-            # only values that differ from defaults are stored here.
-
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS portal_settings
-                (
-                    key        TEXT PRIMARY KEY,
-                    value      TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-
-            # ------------------------------------------------------------------
-            # New canonical place tables
-            # ------------------------------------------------------------------
-
-            # One row per real-world place
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS canonical_places
-                (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    normalized_key  TEXT UNIQUE NOT NULL,
-                    google_place_id TEXT,
-                    formatted_name  TEXT NOT NULL,
-                    locality        TEXT,
-                    admin_area_1    TEXT,
-                    admin_area_2    TEXT,
-                    country         TEXT,
-                    country_code    TEXT,
-                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # Many user-entered strings mapping to one canonical place
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS place_aliases
-                (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    alias_text          TEXT NOT NULL,
-                    normalized_alias    TEXT UNIQUE NOT NULL,
-                    canonical_place_id  INTEGER NOT NULL,
-                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (canonical_place_id) REFERENCES canonical_places (id)
-                )
-            ''')
-
-            # Temporary Google-derived geocode/timezone cache, expires after 30 days
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS place_cache
-                (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    canonical_place_id  INTEGER UNIQUE NOT NULL,
-                    latitude            REAL NOT NULL,
-                    longitude           REAL NOT NULL,
-                    timezone_id         TEXT NOT NULL,
-                    utc_offset_seconds  INTEGER NOT NULL DEFAULT 0,
-                    dst_offset_seconds  INTEGER NOT NULL DEFAULT 0,
-                    geocode_source      TEXT NOT NULL DEFAULT 'google',
-                    fetched_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    expires_at          TIMESTAMP NOT NULL,
-                    FOREIGN KEY (canonical_place_id) REFERENCES canonical_places (id)
-                )
-            ''')
-
-            # Audit log of every resolution attempt
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS place_lookup_log
-                (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    input_text          TEXT NOT NULL,
-                    normalized_input    TEXT NOT NULL,
-                    matched_alias_id    INTEGER,
-                    matched_place_id    INTEGER,
-                    cache_hit           INTEGER NOT NULL DEFAULT 0,
-                    google_called       INTEGER NOT NULL DEFAULT 0,
-                    success             INTEGER NOT NULL DEFAULT 0,
-                    error_message       TEXT,
-                    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # ------------------------------------------------------------------
-            # Indexes
-            # ------------------------------------------------------------------
-
-            # Existing
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_locations_query_hash    ON locations(query_hash)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_hash             ON charts(chart_hash)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_location         ON charts(location_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_last_accessed    ON charts(last_accessed)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_locations_last_used     ON locations(last_used)')
-
-            # New
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_canonical_places_key    ON canonical_places(normalized_key)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_canonical_places_gid    ON canonical_places(google_place_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_aliases_norm      ON place_aliases(normalized_alias)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_aliases_place     ON place_aliases(canonical_place_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_cache_place       ON place_cache(canonical_place_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_cache_expires     ON place_cache(expires_at)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_log_created       ON place_lookup_log(created_at)')
-
-            # Derived charts indexes
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_chart_id        ON derived_charts(chart_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_secondary_id    ON derived_charts(secondary_chart_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_type            ON derived_charts(chart_type)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_hash            ON derived_charts(chart_hash)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_last_accessed   ON derived_charts(last_accessed)')
-
-            # Email templates
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS email_templates
-                (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name            VARCHAR(64) UNIQUE NOT NULL,
-                    bg_color        VARCHAR(16)  NOT NULL DEFAULT '#f4f4f4',
-                    panel_color     VARCHAR(16)  NOT NULL DEFAULT '#ffffff',
-                    text_color      VARCHAR(16)  NOT NULL DEFAULT '#1a1a1a',
-                    content_width   INTEGER      NOT NULL DEFAULT 600,
-                    header_align    VARCHAR(8)   NOT NULL DEFAULT 'left',
-                    subject         TEXT,
-                    header_text     TEXT,
-                    body_text       TEXT,
-                    footer_text     TEXT,
-                    updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # ------------------------------------------------------------------
-            # Permanent chart archive — never cleaned up, append-only
-            # Records every chart ever calculated for potential recalculation.
-            # INSERT OR IGNORE on chart_id means the first calculation wins;
-            # recalcs update the live charts table but never touch this record.
-            # ------------------------------------------------------------------
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS chart_archive
-                (
-                    chart_id            TEXT PRIMARY KEY,
-                    chart_name          TEXT NOT NULL,
-                    datetime_utc        TEXT NOT NULL,
-                    datetime_local      TEXT NOT NULL,
-                    location            TEXT NOT NULL,
-                    first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            cursor.execute(
-                'CREATE INDEX IF NOT EXISTS idx_archive_name ON chart_archive(chart_name)'
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS key_class_limits
+            (
+                key_type        TEXT PRIMARY KEY,
+                rate_per_minute INTEGER NOT NULL DEFAULT 10,
+                rate_per_hour   INTEGER NOT NULL DEFAULT 50,
+                rate_per_day    INTEGER NOT NULL DEFAULT 200,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            cursor.execute(
-                'CREATE INDEX IF NOT EXISTS idx_archive_datetime ON chart_archive(datetime_utc)'
+        """)
+
+        cursor.execute("INSERT OR IGNORE INTO key_class_limits (key_type, rate_per_minute, rate_per_hour, rate_per_day) VALUES ('user', 10, 100, 500)")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix ON api_keys(key_prefix)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_type   ON api_keys(key_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(active)")
+
+        # ------------------------------------------------------------------
+        # Federated service access grants.
+        #
+        # ephemeral.rest can act as the shared identity provider for a
+        # cluster of companion services that read this same database:
+        # holding a key is enough to authenticate against ephemeral.rest
+        # itself, and a key can additionally be granted access to any
+        # number of arbitrarily-named external services, each of which
+        # checks its own grants directly against this table rather than
+        # calling back to ephemeral.rest per request. Service names are
+        # free text chosen by whoever operates the companion service —
+        # nothing here is specific to any particular deployment.
+        # ------------------------------------------------------------------
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_key_services
+            (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id     INTEGER NOT NULL REFERENCES api_keys(id),
+                service    TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(key_id, service)
             )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_key_services_key     ON api_key_services(key_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_key_services_service ON api_key_services(service)")
 
-            # ------------------------------------------------------------------
-            # Chart recalculation history — linked to chart_archive
-            # Records every recalculation of a chart, preserving what changed.
-            # A note field allows the reason to be recorded (e.g. "Birth time
-            # confirmed from birth certificate").
-            # ------------------------------------------------------------------
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS chart_recalculations
-                (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chart_id        TEXT NOT NULL
-                                        REFERENCES chart_archive(chart_id),
-                    chart_name      TEXT NOT NULL,
-                    datetime_utc    TEXT NOT NULL,
-                    datetime_local  TEXT NOT NULL,
-                    location        TEXT NOT NULL,
-                    note            TEXT,
-                    recalculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
 
-            cursor.execute(
-                'CREATE INDEX IF NOT EXISTS idx_recalc_chart_id '
-                'ON chart_recalculations(chart_id)'
+        # ------------------------------------------------------------------
+        # Registration and verification tables
+        # ------------------------------------------------------------------
+
+        # registration_requests table removed — flat self-serve registration,
+        # no admin approval workflow.
+
+        # Email verification tokens for user key activation
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS email_verifications
+            (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id  INTEGER NOT NULL,
+                token       TEXT NOT NULL UNIQUE,
+                email       TEXT NOT NULL,
+                used        INTEGER NOT NULL DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at  TIMESTAMP NOT NULL,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
             )
-            cursor.execute(
-                'CREATE INDEX IF NOT EXISTS idx_recalc_at '
-                'ON chart_recalculations(recalculated_at)'
+        """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_verif_token   ON email_verifications(token)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_email_verif_key     ON email_verifications(api_key_id)")
+
+
+        # ------------------------------------------------------------------
+        # Login — 2FA codes and trusted devices
+        # ------------------------------------------------------------------
+
+        # Short-lived numeric codes emailed during the 2FA login step
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS login_2fa_codes
+            (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id  INTEGER NOT NULL,
+                code        TEXT NOT NULL,
+                used        INTEGER NOT NULL DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at  TIMESTAMP NOT NULL,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
             )
+        """)
 
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS views
-                (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    view_id       TEXT UNIQUE NOT NULL,
-                    key_id        INTEGER NOT NULL REFERENCES api_keys(id),
-                    data          TEXT NOT NULL,
-                    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_login_2fa_key ON login_2fa_codes(api_key_id)")
 
-            # Migration: add last_accessed to views if missing from older databases
-            cursor.execute("PRAGMA table_info(views)")
-            view_columns = [column[1] for column in cursor.fetchall()]
-            if 'last_accessed' not in view_columns:
-                cursor.execute(
-                    "ALTER TABLE views ADD COLUMN last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-                )
-                # Back-fill from updated_at so existing rows get a sensible value
-                cursor.execute(
-                    "UPDATE views SET last_accessed = updated_at WHERE last_accessed IS NULL"
-                )
-                logger.info("Migration: added last_accessed column to views table")
+        # Trusted-device tokens — allow skipping 2FA on recognised machines.
+        # Token is stored as a portal cookie; lifetime is configurable via
+        # TRUSTED_DEVICE_DAYS (default 28).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trusted_devices
+            (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                api_key_id  INTEGER NOT NULL,
+                token       TEXT NOT NULL UNIQUE,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at  TIMESTAMP NOT NULL,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            )
+        """)
 
-            # ------------------------------------------------------------------
-            # GeoNames cities5000 — offline geocoding / autocomplete source
-            # ------------------------------------------------------------------
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trusted_device_token ON trusted_devices(token)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_trusted_device_key   ON trusted_devices(api_key_id)")
 
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS cities
-                (
-                    geoname_id   INTEGER PRIMARY KEY,
-                    name         TEXT NOT NULL,
-                    ascii_name   TEXT NOT NULL,
-                    country_code TEXT NOT NULL,
-                    admin1_code  TEXT,
-                    latitude     REAL NOT NULL,
-                    longitude    REAL NOT NULL,
-                    timezone_id  TEXT NOT NULL,
-                    population   INTEGER
-                )
-            ''')
 
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS cities_import_meta
-                (
-                    id          INTEGER PRIMARY KEY CHECK (id = 1),
-                    filename    TEXT NOT NULL,
-                    row_count   INTEGER NOT NULL,
-                    imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+        # ------------------------------------------------------------------
+        # SMTP configuration (single row, upserted by key)
+        # ------------------------------------------------------------------
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS smtp_config
+            (
+                `key`      TEXT PRIMARY KEY,
+                `value`    TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_ascii  ON cities(ascii_name)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_name   ON cities(name)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_cc     ON cities(country_code)')
+        # ------------------------------------------------------------------
+        # Portal settings — configurable admin portal behaviour
+        # ------------------------------------------------------------------
+        # Simple key/value store. Defaults are baked into the application;
+        # only values that differ from defaults are stored here.
 
-            logger.info("Database initialized successfully")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS portal_settings
+            (
+                `key`      TEXT PRIMARY KEY,
+                `value`    TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # ------------------------------------------------------------------
+        # New canonical place tables
+        # ------------------------------------------------------------------
+
+        # One row per real-world place
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS canonical_places
+            (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                normalized_key  TEXT UNIQUE NOT NULL,
+                google_place_id TEXT,
+                formatted_name  TEXT NOT NULL,
+                locality        TEXT,
+                admin_area_1    TEXT,
+                admin_area_2    TEXT,
+                country         TEXT,
+                country_code    TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Many user-entered strings mapping to one canonical place
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS place_aliases
+            (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                alias_text          TEXT NOT NULL,
+                normalized_alias    TEXT UNIQUE NOT NULL,
+                canonical_place_id  INTEGER NOT NULL,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (canonical_place_id) REFERENCES canonical_places (id)
+            )
+        ''')
+
+        # Temporary Google-derived geocode/timezone cache, expires after 30 days
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS place_cache
+            (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_place_id  INTEGER UNIQUE NOT NULL,
+                latitude            REAL NOT NULL,
+                longitude           REAL NOT NULL,
+                timezone_id         TEXT NOT NULL,
+                utc_offset_seconds  INTEGER NOT NULL DEFAULT 0,
+                dst_offset_seconds  INTEGER NOT NULL DEFAULT 0,
+                geocode_source      TEXT NOT NULL DEFAULT 'google',
+                fetched_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at          TIMESTAMP NOT NULL,
+                FOREIGN KEY (canonical_place_id) REFERENCES canonical_places (id)
+            )
+        ''')
+
+        # Audit log of every resolution attempt
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS place_lookup_log
+            (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_text          TEXT NOT NULL,
+                normalized_input    TEXT NOT NULL,
+                matched_alias_id    INTEGER,
+                matched_place_id    INTEGER,
+                cache_hit           INTEGER NOT NULL DEFAULT 0,
+                google_called       INTEGER NOT NULL DEFAULT 0,
+                success             INTEGER NOT NULL DEFAULT 0,
+                error_message       TEXT,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # ------------------------------------------------------------------
+        # Indexes
+        # ------------------------------------------------------------------
+
+        # Existing
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_locations_query_hash    ON locations(query_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_hash             ON charts(chart_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_location         ON charts(location_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_last_accessed    ON charts(last_accessed)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_locations_last_used     ON locations(last_used)')
+
+        # New
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_canonical_places_key    ON canonical_places(normalized_key)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_canonical_places_gid    ON canonical_places(google_place_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_aliases_norm      ON place_aliases(normalized_alias)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_aliases_place     ON place_aliases(canonical_place_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_cache_place       ON place_cache(canonical_place_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_cache_expires     ON place_cache(expires_at)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_place_log_created       ON place_lookup_log(created_at)')
+
+        # Derived charts indexes
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_chart_id        ON derived_charts(chart_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_secondary_id    ON derived_charts(secondary_chart_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_type            ON derived_charts(chart_type)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_hash            ON derived_charts(chart_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_derived_last_accessed   ON derived_charts(last_accessed)')
+
+        # Email templates
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS email_templates
+            (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            VARCHAR(64) UNIQUE NOT NULL,
+                bg_color        VARCHAR(16)  NOT NULL DEFAULT '#f4f4f4',
+                panel_color     VARCHAR(16)  NOT NULL DEFAULT '#ffffff',
+                text_color      VARCHAR(16)  NOT NULL DEFAULT '#1a1a1a',
+                content_width   INTEGER      NOT NULL DEFAULT 600,
+                header_align    VARCHAR(8)   NOT NULL DEFAULT 'left',
+                subject         TEXT,
+                header_text     TEXT,
+                body_text       TEXT,
+                footer_text     TEXT,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # ------------------------------------------------------------------
+        # Permanent chart archive — never cleaned up, append-only
+        # Records every chart ever calculated for potential recalculation.
+        # INSERT OR IGNORE on chart_id means the first calculation wins;
+        # recalcs update the live charts table but never touch this record.
+        # ------------------------------------------------------------------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chart_archive
+            (
+                chart_id            TEXT PRIMARY KEY,
+                chart_name          TEXT NOT NULL,
+                datetime_utc        TEXT NOT NULL,
+                datetime_local      TEXT NOT NULL,
+                location            TEXT NOT NULL,
+                first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_archive_name ON chart_archive(chart_name)'
+        )
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_archive_datetime ON chart_archive(datetime_utc)'
+        )
+
+        # ------------------------------------------------------------------
+        # Chart recalculation history — linked to chart_archive
+        # Records every recalculation of a chart, preserving what changed.
+        # A note field allows the reason to be recorded (e.g. "Birth time
+        # confirmed from birth certificate").
+        # ------------------------------------------------------------------
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS chart_recalculations
+            (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                chart_id        TEXT NOT NULL
+                                    REFERENCES chart_archive(chart_id),
+                chart_name      TEXT NOT NULL,
+                datetime_utc    TEXT NOT NULL,
+                datetime_local  TEXT NOT NULL,
+                location        TEXT NOT NULL,
+                note            TEXT,
+                recalculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_recalc_chart_id '
+            'ON chart_recalculations(chart_id)'
+        )
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_recalc_at '
+            'ON chart_recalculations(recalculated_at)'
+        )
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS views
+            (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                view_id       TEXT UNIQUE NOT NULL,
+                key_id        INTEGER NOT NULL REFERENCES api_keys(id),
+                data          TEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # Migration: add last_accessed to views if missing from older databases
+        cursor.execute("PRAGMA table_info(views)")
+        view_columns = [column[1] for column in cursor.fetchall()]
+        if 'last_accessed' not in view_columns:
+            cursor.execute(
+                "ALTER TABLE views ADD COLUMN last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            )
+            # Back-fill from updated_at so existing rows get a sensible value
+            cursor.execute(
+                "UPDATE views SET last_accessed = updated_at WHERE last_accessed IS NULL"
+            )
+            logger.info("Migration: added last_accessed column to views table")
+
+        # ------------------------------------------------------------------
+        # GeoNames cities5000 — offline geocoding / autocomplete source
+        # ------------------------------------------------------------------
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cities
+            (
+                geoname_id   INTEGER PRIMARY KEY,
+                name         TEXT NOT NULL,
+                ascii_name   TEXT NOT NULL,
+                country_code TEXT NOT NULL,
+                admin1_code  TEXT,
+                latitude     REAL NOT NULL,
+                longitude    REAL NOT NULL,
+                timezone_id  TEXT NOT NULL,
+                population   INTEGER
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cities_import_meta
+            (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                filename    TEXT NOT NULL,
+                row_count   INTEGER NOT NULL,
+                imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_ascii  ON cities(ascii_name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_name   ON cities(name)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_cc     ON cities(country_code)')
+
+    def _mysql_create_index(self, cursor, sql: str):
+        """
+        MySQL's CREATE INDEX has no IF NOT EXISTS clause. Swallow the
+        resulting "duplicate key name" error on repeat runs so schema
+        init stays idempotent, matching the CREATE TABLE IF NOT EXISTS
+        semantics used everywhere else in this file.
+        """
+        try:
+            cursor.execute(sql)
+        except Exception as e:
+            msg = str(e).lower()
+            if 'duplicate key name' in msg or 'already exists' in msg:
+                return
+            raise
+
+    def _init_schema_mysql(self, cursor):
+        """
+        Initialize the MySQL database with all required tables.
+
+        This is a fresh-schema creation (final column set already applied)
+        rather than a port of the SQLite migration history above — MySQL
+        support is new, so there is no legacy MySQL data to migrate from.
+        TEXT/BLOB columns that need a PRIMARY KEY, UNIQUE, or plain index
+        are sized as VARCHAR instead, since MySQL requires an explicit key
+        length for any indexed TEXT/BLOB column.
+        """
+        charset = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS locations
+            (
+                id                INT AUTO_INCREMENT PRIMARY KEY,
+                query_text        VARCHAR(255) UNIQUE NOT NULL,
+                query_hash        VARCHAR(32) UNIQUE NOT NULL,
+                latitude          DOUBLE NOT NULL,
+                longitude         DOUBLE NOT NULL,
+                formatted_address TEXT NOT NULL,
+                timezone          VARCHAR(64) NOT NULL,
+                created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_used         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS charts
+            (
+                id             VARCHAR(36) PRIMARY KEY,
+                chart_name     VARCHAR(255) DEFAULT 'Untitled Chart',
+                chart_type     VARCHAR(32) NOT NULL DEFAULT 'natal',
+                datetime_utc   VARCHAR(64) NOT NULL,
+                datetime_local VARCHAR(64) NOT NULL,
+                location_id    INT NOT NULL,
+                chart_data     LONGTEXT NOT NULL,
+                chart_hash     VARCHAR(32) UNIQUE NOT NULL,
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                access_count   INT DEFAULT 1,
+                FOREIGN KEY (location_id) REFERENCES locations (id)
+            ) {charset}
+        ''')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS derived_charts
+            (
+                id                  VARCHAR(36) PRIMARY KEY,
+                chart_id            VARCHAR(36) NOT NULL,
+                secondary_chart_id  VARCHAR(36),
+                chart_type          VARCHAR(32) NOT NULL,
+                chart_name          VARCHAR(255) DEFAULT 'Untitled',
+                reference_date      TEXT NOT NULL,
+                chart_data          LONGTEXT NOT NULL,
+                chart_hash          VARCHAR(32) UNIQUE NOT NULL,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                access_count        INT DEFAULT 1,
+                FOREIGN KEY (chart_id)           REFERENCES charts(id),
+                FOREIGN KEY (secondary_chart_id) REFERENCES charts(id)
+            ) {charset}
+        ''')
+
+        # ------------------------------------------------------------------
+        # API key management tables
+        # ------------------------------------------------------------------
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS api_keys
+            (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                key_type        VARCHAR(32) NOT NULL DEFAULT 'user',
+                name            TEXT NOT NULL,
+                identifier      VARCHAR(255) NOT NULL UNIQUE,
+                key_enc         TEXT NOT NULL,
+                key_prefix      VARCHAR(32) NOT NULL,
+                admin           INT NOT NULL DEFAULT 0,
+                active          INT NOT NULL DEFAULT 1,
+                rate_per_minute INT,
+                rate_per_hour   INT,
+                rate_per_day    INT,
+                output_config   LONGTEXT,
+                password_hash         TEXT,
+                must_change_password  INT NOT NULL DEFAULT 1,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS key_class_limits
+            (
+                key_type        VARCHAR(32) PRIMARY KEY,
+                rate_per_minute INT NOT NULL DEFAULT 10,
+                rate_per_hour   INT NOT NULL DEFAULT 50,
+                rate_per_day    INT NOT NULL DEFAULT 200,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        """)
+
+        cursor.execute(
+            "INSERT IGNORE INTO key_class_limits (key_type, rate_per_minute, rate_per_hour, rate_per_day) "
+            "VALUES ('user', 10, 100, 500)"
+        )
+
+        self._mysql_create_index(cursor, "CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix)")
+        self._mysql_create_index(cursor, "CREATE INDEX idx_api_keys_type   ON api_keys(key_type)")
+        self._mysql_create_index(cursor, "CREATE INDEX idx_api_keys_active ON api_keys(active)")
+
+        # ------------------------------------------------------------------
+        # Federated service access grants.
+        #
+        # ephemeral.rest can act as the shared identity provider for a
+        # cluster of companion services that read this same database:
+        # holding a key is enough to authenticate against ephemeral.rest
+        # itself, and a key can additionally be granted access to any
+        # number of arbitrarily-named external services, each of which
+        # checks its own grants directly against this table rather than
+        # calling back to ephemeral.rest per request. Service names are
+        # free text chosen by whoever operates the companion service —
+        # nothing here is specific to any particular deployment.
+        # ------------------------------------------------------------------
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS api_key_services
+            (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                key_id     INT NOT NULL REFERENCES api_keys(id),
+                service    VARCHAR(32) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(key_id, service)
+            ) {charset}
+        """)
+        self._mysql_create_index(cursor, "CREATE INDEX idx_key_services_key     ON api_key_services(key_id)")
+        self._mysql_create_index(cursor, "CREATE INDEX idx_key_services_service ON api_key_services(service)")
+
+        # ------------------------------------------------------------------
+        # Registration and verification tables
+        # ------------------------------------------------------------------
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS email_verifications
+            (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                api_key_id  INT NOT NULL,
+                token       VARCHAR(255) NOT NULL UNIQUE,
+                email       TEXT NOT NULL,
+                used        INT NOT NULL DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at  TIMESTAMP NOT NULL,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            ) {charset}
+        """)
+        self._mysql_create_index(cursor, "CREATE INDEX idx_email_verif_key ON email_verifications(api_key_id)")
+
+        # ------------------------------------------------------------------
+        # Login — 2FA codes and trusted devices
+        # ------------------------------------------------------------------
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS login_2fa_codes
+            (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                api_key_id  INT NOT NULL,
+                code        TEXT NOT NULL,
+                used        INT NOT NULL DEFAULT 0,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at  TIMESTAMP NOT NULL,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            ) {charset}
+        """)
+        self._mysql_create_index(cursor, "CREATE INDEX idx_login_2fa_key ON login_2fa_codes(api_key_id)")
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS trusted_devices
+            (
+                id          INT AUTO_INCREMENT PRIMARY KEY,
+                api_key_id  INT NOT NULL,
+                token       VARCHAR(255) NOT NULL UNIQUE,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at  TIMESTAMP NOT NULL,
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            ) {charset}
+        """)
+        self._mysql_create_index(cursor, "CREATE INDEX idx_trusted_device_key ON trusted_devices(api_key_id)")
+
+        # ------------------------------------------------------------------
+        # SMTP configuration and portal settings (single-row-per-key stores)
+        # `key` is a reserved word in MySQL — backtick-quoted throughout,
+        # which also works fine on SQLite.
+        # ------------------------------------------------------------------
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS smtp_config
+            (
+                `key`      VARCHAR(64) PRIMARY KEY,
+                `value`    TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        """)
+
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS portal_settings
+            (
+                `key`      VARCHAR(64) PRIMARY KEY,
+                `value`    TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        """)
+
+        # ------------------------------------------------------------------
+        # Canonical place tables
+        # ------------------------------------------------------------------
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS canonical_places
+            (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                normalized_key  VARCHAR(255) UNIQUE NOT NULL,
+                google_place_id VARCHAR(255),
+                formatted_name  TEXT NOT NULL,
+                locality        TEXT,
+                admin_area_1    TEXT,
+                admin_area_2    TEXT,
+                country         TEXT,
+                country_code    VARCHAR(8),
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS place_aliases
+            (
+                id                  INT AUTO_INCREMENT PRIMARY KEY,
+                alias_text          TEXT NOT NULL,
+                normalized_alias    VARCHAR(255) UNIQUE NOT NULL,
+                canonical_place_id  INT NOT NULL,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (canonical_place_id) REFERENCES canonical_places (id)
+            ) {charset}
+        ''')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS place_cache
+            (
+                id                  INT AUTO_INCREMENT PRIMARY KEY,
+                canonical_place_id  INT UNIQUE NOT NULL,
+                latitude            DOUBLE NOT NULL,
+                longitude           DOUBLE NOT NULL,
+                timezone_id         VARCHAR(64) NOT NULL,
+                utc_offset_seconds  INT NOT NULL DEFAULT 0,
+                dst_offset_seconds  INT NOT NULL DEFAULT 0,
+                geocode_source      VARCHAR(32) NOT NULL DEFAULT 'google',
+                fetched_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at          TIMESTAMP NOT NULL,
+                FOREIGN KEY (canonical_place_id) REFERENCES canonical_places (id)
+            ) {charset}
+        ''')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS place_lookup_log
+            (
+                id                  INT AUTO_INCREMENT PRIMARY KEY,
+                input_text          TEXT NOT NULL,
+                normalized_input    TEXT NOT NULL,
+                matched_alias_id    INT,
+                matched_place_id    INT,
+                cache_hit           INT NOT NULL DEFAULT 0,
+                google_called       INT NOT NULL DEFAULT 0,
+                success             INT NOT NULL DEFAULT 0,
+                error_message       TEXT,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        # ------------------------------------------------------------------
+        # Indexes
+        # ------------------------------------------------------------------
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_charts_location         ON charts(location_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_charts_last_accessed    ON charts(last_accessed)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_locations_last_used     ON locations(last_used)')
+
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_canonical_places_gid    ON canonical_places(google_place_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_place_aliases_place     ON place_aliases(canonical_place_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_place_cache_place       ON place_cache(canonical_place_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_place_cache_expires     ON place_cache(expires_at)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_place_log_created       ON place_lookup_log(created_at)')
+
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_derived_chart_id        ON derived_charts(chart_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_derived_secondary_id    ON derived_charts(secondary_chart_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_derived_type            ON derived_charts(chart_type)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_derived_last_accessed   ON derived_charts(last_accessed)')
+
+        # Email templates
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS email_templates
+            (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                name            VARCHAR(64) UNIQUE NOT NULL,
+                bg_color        VARCHAR(16)  NOT NULL DEFAULT '#f4f4f4',
+                panel_color     VARCHAR(16)  NOT NULL DEFAULT '#ffffff',
+                text_color      VARCHAR(16)  NOT NULL DEFAULT '#1a1a1a',
+                content_width   INT          NOT NULL DEFAULT 600,
+                header_align    VARCHAR(8)   NOT NULL DEFAULT 'left',
+                subject         TEXT,
+                header_text     TEXT,
+                body_text       TEXT,
+                footer_text     TEXT,
+                updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        # Permanent chart archive
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS chart_archive
+            (
+                chart_id            VARCHAR(36) PRIMARY KEY,
+                chart_name          VARCHAR(255) NOT NULL,
+                datetime_utc        VARCHAR(64) NOT NULL,
+                datetime_local      TEXT NOT NULL,
+                location            TEXT NOT NULL,
+                first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_archive_name     ON chart_archive(chart_name)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_archive_datetime ON chart_archive(datetime_utc)')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS chart_recalculations
+            (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                chart_id        VARCHAR(36) NOT NULL REFERENCES chart_archive(chart_id),
+                chart_name      TEXT NOT NULL,
+                datetime_utc    TEXT NOT NULL,
+                datetime_local  TEXT NOT NULL,
+                location        TEXT NOT NULL,
+                note            TEXT,
+                recalculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_recalc_chart_id ON chart_recalculations(chart_id)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_recalc_at       ON chart_recalculations(recalculated_at)')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS views
+            (
+                id            INT AUTO_INCREMENT PRIMARY KEY,
+                view_id       VARCHAR(36) UNIQUE NOT NULL,
+                key_id        INT NOT NULL REFERENCES api_keys(id),
+                data          LONGTEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        # ------------------------------------------------------------------
+        # GeoNames cities5000 — offline geocoding / autocomplete source
+        # ------------------------------------------------------------------
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS cities
+            (
+                geoname_id   INT PRIMARY KEY,
+                name         VARCHAR(255) NOT NULL,
+                ascii_name   VARCHAR(255) NOT NULL,
+                country_code VARCHAR(8) NOT NULL,
+                admin1_code  TEXT,
+                latitude     DOUBLE NOT NULL,
+                longitude    DOUBLE NOT NULL,
+                timezone_id  VARCHAR(64) NOT NULL,
+                population   INT
+            ) {charset}
+        ''')
+
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS cities_import_meta
+            (
+                id          INT PRIMARY KEY CHECK (id = 1),
+                filename    TEXT NOT NULL,
+                row_count   INT NOT NULL,
+                imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_cities_ascii  ON cities(ascii_name)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_cities_name   ON cities(name)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_cities_cc     ON cities(country_code)')
 
     # ==========================================================================
     # View methods
@@ -943,7 +1601,7 @@ class DatabaseManager:
                 tz.get('timeZoneId', 'UTC'),
                 tz.get('rawOffset', 0),
                 tz.get('dstOffset', 0),
-                expires_at.isoformat(),
+                self._fmt_dt(expires_at),
             ))
 
     def cleanup_expired_place_cache(self) -> int:
@@ -1476,7 +2134,7 @@ class DatabaseManager:
         """Return all SMTP config key/value pairs as a dict."""
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT key, value FROM smtp_config')
+            cursor.execute('SELECT `key`, `value` FROM smtp_config')
             return {row['key']: row['value'] for row in cursor.fetchall()}
 
     def set_smtp_config(self, config: Dict[str, str]) -> None:
@@ -1487,10 +2145,10 @@ class DatabaseManager:
                 if key not in self.SMTP_KEYS:
                     continue
                 cursor.execute("""
-                    INSERT INTO smtp_config (key, value)
+                    INSERT INTO smtp_config (`key`, `value`)
                     VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET
-                        value      = excluded.value,
+                    ON CONFLICT(`key`) DO UPDATE SET
+                        `value`    = excluded.value,
                         updated_at = CURRENT_TIMESTAMP
                 """, (key, str(value) if value is not None else ''))
 
@@ -1521,7 +2179,7 @@ class DatabaseManager:
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT key, value FROM portal_settings')
+            cursor.execute('SELECT `key`, `value` FROM portal_settings')
             stored = {row['key']: row['value'] for row in cursor.fetchall()}
 
         result = dict(self.PORTAL_SETTINGS_DEFAULTS)
@@ -1548,10 +2206,10 @@ class DatabaseManager:
                     continue
                 str_value = str(value).lower() if isinstance(value, bool) else str(value)
                 cursor.execute("""
-                    INSERT INTO portal_settings (key, value)
+                    INSERT INTO portal_settings (`key`, `value`)
                     VALUES (?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value = excluded.value,
-                                                   updated_at = CURRENT_TIMESTAMP
+                    ON CONFLICT(`key`) DO UPDATE SET `value` = excluded.value,
+                                                      updated_at = CURRENT_TIMESTAMP
                 """, (key, str_value))
 
     def reset_portal_setting(self, key: str) -> bool:
@@ -1559,7 +2217,7 @@ class DatabaseManager:
         if key not in self.PORTAL_SETTINGS_DEFAULTS:
             return False
         with self.get_connection() as conn:
-            conn.execute('DELETE FROM portal_settings WHERE key = ?', (key,))
+            conn.execute('DELETE FROM portal_settings WHERE `key` = ?', (key,))
         return True
 
     # ==========================================================================
@@ -1582,7 +2240,7 @@ class DatabaseManager:
                 INSERT INTO email_verifications
                 (api_key_id, token, email, expires_at)
                 VALUES (?, ?, ?, ?)
-            """, (api_key_id, token, email, expires_at.isoformat()))
+            """, (api_key_id, token, email, self._fmt_dt(expires_at)))
             return cursor.lastrowid
 
     def get_email_verification(self, token: str) -> Optional[Dict[str, Any]]:
@@ -1625,7 +2283,7 @@ class DatabaseManager:
             cursor.execute("""
                 INSERT INTO login_2fa_codes (api_key_id, code, expires_at)
                 VALUES (?, ?, ?)
-            """, (api_key_id, code, expires_at.isoformat()))
+            """, (api_key_id, code, self._fmt_dt(expires_at)))
             return cursor.lastrowid
 
     def get_valid_2fa_code(self, api_key_id: int, code: str) -> Optional[Dict[str, Any]]:
@@ -1675,7 +2333,7 @@ class DatabaseManager:
             cursor.execute("""
                 INSERT INTO trusted_devices (api_key_id, token, expires_at)
                 VALUES (?, ?, ?)
-            """, (api_key_id, token, expires_at.isoformat()))
+            """, (api_key_id, token, self._fmt_dt(expires_at)))
             return cursor.lastrowid
 
     def get_trusted_device(self, token: str) -> Optional[Dict[str, Any]]:
@@ -1845,9 +2503,14 @@ class DatabaseManager:
             return cursor.rowcount > 0
 
     def delete_api_key(self, key_id: int) -> bool:
-        """Permanently delete an API key record."""
+        """
+        Permanently delete an API key record and any service grants it holds.
+        Service grants are removed first — MySQL's FK constraint on
+        api_key_services.key_id would otherwise reject the delete.
+        """
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute('DELETE FROM api_key_services WHERE key_id = ?', (key_id,))
             cursor.execute('DELETE FROM api_keys WHERE id = ?', (key_id,))
             return cursor.rowcount > 0
 
@@ -1883,6 +2546,123 @@ class DatabaseManager:
                     rate_per_day    = excluded.rate_per_day,
                     updated_at      = CURRENT_TIMESTAMP
             """, (key_type, rate_per_minute, rate_per_hour, rate_per_day))
+
+    # ==========================================================================
+    # Federated service access grants
+    #
+    # ephemeral.rest can act as the shared identity provider for a cluster
+    # of companion services built by anyone self-hosting this software.
+    # Holding a key is enough to authenticate against ephemeral.rest
+    # itself — this table only governs additional, arbitrarily-named
+    # external services, each of which is expected to check its own
+    # grants directly against this shared database (see the "Federated
+    # services" section of the architecture doc for the intended pattern).
+    # ==========================================================================
+
+    def grant_key_service(self, key_id: int, service: str) -> bool:
+        """Grant a key access to a named external service. Idempotent — granting twice is a no-op."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR IGNORE INTO api_key_services (key_id, service) VALUES (?, ?)",
+                (key_id, service)
+            )
+            return True
+
+    def grant_key_services(self, key_id: int, services: List[str]) -> List[str]:
+        """
+        Grant a key access to multiple named external services in one call.
+        Idempotent per service — already-granted services are left as-is.
+        Returns the key's full list of granted services after the operation.
+        """
+        if services:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.executemany(
+                    "INSERT OR IGNORE INTO api_key_services (key_id, service) VALUES (?, ?)",
+                    [(key_id, s) for s in services]
+                )
+        return self.get_key_services(key_id)
+
+    def revoke_key_service(self, key_id: int, service: str) -> bool:
+        """Revoke a key's access to a service. Returns True if a grant was removed."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM api_key_services WHERE key_id = ? AND service = ?",
+                (key_id, service)
+            )
+            return cursor.rowcount > 0
+
+    def revoke_key_services(self, key_id: int, services: List[str]) -> List[str]:
+        """
+        Revoke a key's access to multiple named services in one call.
+        Returns the key's full list of remaining granted services.
+        """
+        if services:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                placeholders = ', '.join('?' * len(services))
+                cursor.execute(
+                    f"DELETE FROM api_key_services WHERE key_id = ? AND service IN ({placeholders})",
+                    [key_id, *services]
+                )
+        return self.get_key_services(key_id)
+
+    def set_key_services(self, key_id: int, services: List[str]) -> List[str]:
+        """
+        Replace a key's entire set of granted services with exactly
+        `services` — grants not in the list are revoked, missing ones are
+        added. Suited to a checkbox-list admin UI ("save the services this
+        key should have access to") where the caller sends the full
+        desired state rather than an incremental grant/revoke. Pass an
+        empty list to revoke all of a key's service access.
+        Returns the key's full list of granted services after the operation.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM api_key_services WHERE key_id = ?", (key_id,))
+            if services:
+                cursor.executemany(
+                    "INSERT INTO api_key_services (key_id, service) VALUES (?, ?)",
+                    [(key_id, s) for s in services]
+                )
+        return self.get_key_services(key_id)
+
+    def key_has_service(self, key_id: int, service: str) -> bool:
+        """Check whether a key is granted access to a specific service."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM api_key_services WHERE key_id = ? AND service = ?",
+                (key_id, service)
+            ).fetchone()
+            return row is not None
+
+    def get_key_services(self, key_id: int) -> list:
+        """Return the list of service names a key is granted access to."""
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT service FROM api_key_services WHERE key_id = ? ORDER BY service",
+                (key_id,)
+            ).fetchall()
+            return [r['service'] for r in rows]
+
+    def get_keys_for_service(self, service: str) -> list:
+        """
+        Return active API key records (without key_enc) granted access to a
+        given service — used by admin views to see who can call what.
+        """
+        with self.get_connection() as conn:
+            rows = conn.execute("""
+                SELECT k.id, k.key_type, k.name, k.identifier, k.key_prefix,
+                       k.admin, k.active, k.rate_per_minute, k.rate_per_hour,
+                       k.rate_per_day, k.created_at
+                FROM api_keys k
+                JOIN api_key_services s ON s.key_id = k.id
+                WHERE s.service = ? AND k.active = 1
+                ORDER BY k.name
+            """, (service,)).fetchall()
+            return [dict(r) for r in rows]
 
     def _api_key_row_to_dict(self, row) -> Dict[str, Any]:
         """Convert a raw api_keys row to a dict, parsing output_config JSON."""
@@ -2115,3 +2895,40 @@ class DatabaseManager:
                 f"{deleted_views} views, {deleted_locations} locations — {total} total"
             )
             return total
+
+
+# ==============================================================================
+# Factory
+# ==============================================================================
+
+def create_database_manager(config=None) -> 'DatabaseManager':
+    """
+    Build a DatabaseManager from configuration.
+
+    Pass the app's Config class (config_class) when available so DB_TYPE
+    and the MySQL/SQLite settings it already resolved from the environment
+    are reused consistently. Standalone scripts (cleanup.py, key_manager.py,
+    email_service.py) that don't import config.py can call this with no
+    arguments — DatabaseManager falls back to reading DB_TYPE and friends
+    directly from the environment in that case.
+
+    This is the preferred way to construct a DatabaseManager; use it
+    instead of calling DatabaseManager(...) directly so every entry point
+    picks up MySQL settings the same way.
+    """
+    if config is not None:
+        db_type = getattr(config, 'DB_TYPE', 'sqlite')
+        if db_type == 'mysql':
+            return DatabaseManager(
+                db_type='mysql',
+                mysql_config={
+                    'host':     config.MYSQL_HOST,
+                    'port':     config.MYSQL_PORT,
+                    'user':     config.MYSQL_USER,
+                    'password': config.MYSQL_PASSWORD,
+                    'database': config.MYSQL_DATABASE,
+                },
+            )
+        return DatabaseManager(db_type='sqlite', db_path=config.DATABASE_PATH)
+
+    return DatabaseManager()

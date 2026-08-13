@@ -23,6 +23,122 @@ This licence was chosen because the Swiss Ephemeris library is itself AGPL v3. U
 
 ---
 
+## Docker deployment (alternative)
+
+Steps 1–9 below cover a manual bare-metal install. If you'd rather run
+everything in containers, `docker-compose.yml` (in the ephemeralREST repo)
+sets up three services — the API, the admin portal, and an nginx front end
+proxying both. This section covers the full path: MySQL already running on
+the same VPS, real domains, and HTTPS via Let's Encrypt.
+
+### Layout
+
+```
+some-parent-dir/
+  ephemeralREST/    ← docker-compose.yml lives here; run `docker compose` from here
+  ephemeralADMIN/   ← sibling directory; docker-compose.yml builds it via `../ephemeralADMIN`
+```
+
+### If MySQL is running directly on this VPS (not a separate managed database)
+
+A container's "localhost" is itself, not the host machine — the API
+container needs a specific route to reach MySQL on the host:
+
+1. `docker-compose.yml` already sets `extra_hosts: host.docker.internal:host-gateway`
+   on the `ephemeral-rest` service (Docker Engine 20.10+). Set
+   `MYSQL_HOST=host.docker.internal` in `.env`.
+2. MySQL needs to actually be listening somewhere the container can reach —
+   its default `bind-address = 127.0.0.1` only accepts connections from the
+   host itself. In `/etc/mysql/mysql.conf.d/mysqld.cnf`, change this to
+   `bind-address = 0.0.0.0`, then `systemctl restart mysql`.
+3. **This means MySQL is now listening on the VPS's public interface too —
+   firewall port 3306 immediately**, allowing only local/loopback traffic:
+   ```bash
+   ufw deny 3306
+   # or, if you use a VPS provider firewall/security group instead of ufw,
+   # block 3306 there — the point is nothing outside this VPS should reach it.
+   ```
+4. The MySQL user needs to accept connections from the Docker bridge
+   gateway, which isn't `'localhost'` from MySQL's point of view. Use `'%'`
+   (any host) rather than `'localhost'` — safe here specifically *because*
+   you just firewalled 3306 from the public internet in step 3:
+   ```sql
+   CREATE DATABASE ephemeral CHARACTER SET utf8mb4;
+   CREATE USER 'ephemeral'@'%' IDENTIFIED BY 'your-mysql-password';
+   GRANT ALL PRIVILEGES ON ephemeral.* TO 'ephemeral'@'%';
+   FLUSH PRIVILEGES;
+   ```
+
+If MySQL is instead a separate managed database server, skip all of the
+above — just set `MYSQL_HOST` to its hostname and make sure this VPS is
+allowed to reach it (VPC/firewall rules on the database side).
+
+### Real domains + HTTPS
+
+1. Point DNS A records for both domains (e.g. `api.yourdomain.com`,
+   `admin.yourdomain.com`) at this VPS before continuing — certbot's
+   HTTP-01 challenge needs them resolving correctly.
+2. Create the ACME challenge webroot nginx expects:
+   ```bash
+   mkdir -p /srv/ephemeral/certbot-webroot
+   ```
+3. Install certbot and obtain a certificate covering both domains as SANs
+   (nginx isn't running yet at this point, so `--standalone` is simplest
+   for this first issuance — it briefly binds port 80 itself):
+   ```bash
+   apt install certbot
+   certbot certonly --standalone -d api.yourdomain.com -d admin.yourdomain.com
+   ```
+4. In `nginx.conf`, replace every occurrence of `api.yourdomain.com` and
+   `admin.yourdomain.com` with your real domains (each appears twice).
+5. Set up renewal — going forward, renewals use the webroot method (via
+   the `/.well-known/acme-challenge/` location already in `nginx.conf`),
+   so they don't need port 80 free or any downtime:
+   ```bash
+   certbot certonly --webroot -w /srv/ephemeral/certbot-webroot \
+       -d api.yourdomain.com -d admin.yourdomain.com \
+       --deploy-hook "docker compose -f /path/to/ephemeralREST/docker-compose.yml restart nginx"
+   ```
+   (certbot's own systemd timer / cron job, installed automatically, picks
+   this up for future renewals since it re-reads the last-used method.)
+
+### Bringing it up
+
+```bash
+cd ephemeralREST
+cp .env.example .env    # or let the app write one on first run — see §4 below
+nano .env                # SECRET_KEY, DB_TYPE=mysql + MYSQL_* values from above
+docker compose up -d
+```
+
+Steps 3 (Swiss Ephemeris data — the `sweph/` directory still needs the
+`.se1` files present before starting) and 6 (first-run admin setup) below
+still apply. For step 6, run it inside the running container:
+
+```bash
+docker compose exec ephemeral-rest python3 key_manager.py create
+```
+
+The portal's own configuration (`API_BASE`) is set automatically via the
+`ephemeral-admin` service's environment in `docker-compose.yml`, pointed at
+the `ephemeral-rest` service by its Compose DNS name rather than
+`localhost`.
+
+The API and portal are deliberately separate images (see
+`ephemeralADMIN/Dockerfile`) — different licenses, and the portal has no
+need for `SECRET_KEY` or database access at all.
+
+### Verifying
+
+```bash
+curl https://api.yourdomain.com/health
+```
+
+Then open `https://admin.yourdomain.com` in a browser and log in with the
+admin key created above.
+
+---
+
 ## 1. System preparation
 
 ```bash
@@ -86,6 +202,62 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 
 > **`PORTAL_URL`** is essential. Verification emails, password-reset emails, and set-password emails all link to pages on the portal. Without this, email links point to the API (returning raw JSON) rather than the portal (rendering a page).
 
+### Choosing a database: SQLite or MySQL
+
+`DB_TYPE` selects the backend. It defaults to `sqlite` and needs no further
+configuration — the file at `DATABASE_PATH` is created automatically. This
+is the right choice for most single-server deployments.
+
+Set `DB_TYPE=mysql` to run against MySQL (or MariaDB) instead. The database
+itself must already exist — this app creates its own tables on first run
+but will not create the database:
+
+```bash
+DB_TYPE=mysql
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=ephemeral
+MYSQL_PASSWORD=your-mysql-password
+MYSQL_DATABASE=ephemeral
+```
+
+```sql
+-- Run once, before first start:
+CREATE DATABASE ephemeral CHARACTER SET utf8mb4;
+CREATE USER 'ephemeral'@'localhost' IDENTIFIED BY 'your-mysql-password';
+GRANT ALL PRIVILEGES ON ephemeral.* TO 'ephemeral'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+When `DB_TYPE=mysql`, `DATABASE_PATH` is ignored and `mysql-connector-python`
+(already in `requirements.txt`) is used to connect. MySQL 8.0+ or an
+equivalent MariaDB release is required (for `CHECK` constraint support).
+
+Already have data in an existing SQLite database? `migrate_sqlite_to_mysql.py`
+copies it into a MySQL database in one pass, preserving primary keys and
+foreign key relationships — see `python migrate_sqlite_to_mysql.py --help`.
+
+#### Federated service access — read-only companion-service user
+
+If other services you run will read this same MySQL database to check API
+key validity and service grants (see `ARCHITECTURE.md`, "Federated service
+access"), give them their own MySQL user with read-only access, rather than
+sharing the read-write user above:
+
+```sql
+CREATE USER 'ephemeral_ro'@'%' IDENTIFIED BY 'a-different-password';
+GRANT SELECT ON ephemeral.api_keys         TO 'ephemeral_ro'@'%';
+GRANT SELECT ON ephemeral.api_key_services TO 'ephemeral_ro'@'%';
+GRANT SELECT ON ephemeral.key_class_limits TO 'ephemeral_ro'@'%';
+FLUSH PRIVILEGES;
+```
+
+Adjust `'%'` to the specific host(s) your companion services run on if
+you'd rather not allow this user to connect from anywhere. Grants
+themselves are managed from ephemeral.rest — see `key_manager.py`'s
+`grant-service` / `revoke-service` / `set-services` / `list-grants`
+commands.
+
 ---
 
 ## 5. Initialise the database
@@ -94,8 +266,10 @@ The database is created automatically on first start. Tables are created with `C
 
 ```bash
 source .venv/bin/activate
-python3 -c "from database import DatabaseManager; DatabaseManager('ephemeral.db'); print('Ready')"
+python3 -c "from database import create_database_manager; create_database_manager(); print('Ready')"
 ```
+
+(This reads `DB_TYPE` and the corresponding SQLite/MySQL settings from `.env`, same as the app itself.)
 
 ---
 

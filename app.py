@@ -41,7 +41,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 from config import Config
-from database import DatabaseManager
+from database import create_database_manager
 from api_usage import APIUsageTracker
 from auth import AuthManager, get_client_ip
 from geocoding import GeocodingService
@@ -205,7 +205,7 @@ def create_app(config_class=Config):
          supports_credentials=True)
 
     # Initialize components
-    db_manager = DatabaseManager(config_class.DATABASE_PATH)
+    db_manager = create_database_manager(config_class)
     usage_tracker = APIUsageTracker(
         config_class.USAGE_COUNT_FILE,
         config_class.MAX_MONTHLY_REQUESTS
@@ -267,6 +267,11 @@ def create_app(config_class=Config):
         'api.admin_set_key_limits',
         'api.admin_set_key_output',
         'api.admin_delete_key',
+        'api.admin_get_key_services',
+        'api.admin_grant_key_services',
+        'api.admin_set_key_services',
+        'api.admin_revoke_key_services',
+        'api.admin_list_service_keys',
         'api.admin_get_smtp',
         'api.admin_get_portal_settings',
         'api.admin_set_portal_settings',
@@ -358,7 +363,7 @@ def print_startup_info(config):
     print(f"📊 Swiss Ephemeris:     {config.SWISS_EPHEMERIS_PATH}")
     print(f"📈 Max Monthly Req:     {config.MAX_MONTHLY_REQUESTS}")
     print(f"📝 Log File:            {config.LOG_FILE}")
-    print(f"🗄️  Database:            {config.DATABASE_PATH}")
+    print(f"🗄️  Database:            {config.get_summary()['database']} ({config.DB_TYPE})")
     print(f"🌐 CORS Origins:        {', '.join(config.CORS_ORIGINS)}")
     print(f"👥 Key store:           database")
     print(f"⚡ Rate Limiting:       {'Enabled (per-user)' if config.RATE_LIMIT_ENABLED else 'Disabled'}")

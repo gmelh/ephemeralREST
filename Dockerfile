@@ -49,6 +49,10 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:5000/health')" || exit 1
 
 # Set environment variables
+# DB_TYPE defaults to 'sqlite' (config.py's own default) and isn't set here —
+# DATABASE_PATH below only takes effect in that case. Override DB_TYPE (and
+# set MYSQL_HOST/PORT/USER/PASSWORD/DATABASE) via `docker run -e` or
+# docker-compose.yml's environment: block to run against MySQL instead.
 ENV PYTHONUNBUFFERED=1 \
     FLASK_HOST=0.0.0.0 \
     FLASK_PORT=5000 \

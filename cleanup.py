@@ -119,9 +119,10 @@ def main():
         args.charts      = True
 
     # Initialise database
-    from database import DatabaseManager
-    db_path = os.environ.get('DATABASE_PATH', 'ephemeral.db')
-    db      = DatabaseManager(db_path)
+    from database import create_database_manager
+    from config import Config
+    db = create_database_manager(Config)
+    db_path = Config.DATABASE_PATH if Config.DB_TYPE == 'sqlite' else f"mysql:{Config.MYSQL_DATABASE}"
 
     print(f"\n{'=' * 55}")
     print(f"  Ephemeral.REST Cache Cleanup")

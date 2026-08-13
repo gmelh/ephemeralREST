@@ -50,6 +50,10 @@ Commands:
     set-limits  Set rate limits for a specific key or a key class
     set-output  Set output configuration for a key (JSON file or inline JSON)
     class-limits Show or update class-level default rate limits
+    grant-service   Grant a key access to one or more federated services
+    revoke-service  Revoke a key's access to one or more federated services
+    set-services    Replace a key's entire set of federated service grants
+    list-grants     List keys granted access to a given federated service
     migrate     Import keys from existing ./users/*.cfg files
     verify      Test whether a plaintext key is valid
 
@@ -62,6 +66,10 @@ Usage examples:
     python key_manager.py set-limits --identifier cosmobiology.online --per-minute 30 --per-hour 300 --per-day 2000
     python key_manager.py class-limits --type domain --per-minute 20 --per-hour 200 --per-day 1000
     python key_manager.py set-output --identifier cosmobiology.online --file config.json
+    python key_manager.py grant-service --identifier cosmobiology.online --service my-companion-app
+    python key_manager.py revoke-service --identifier cosmobiology.online --service my-companion-app
+    python key_manager.py set-services --identifier cosmobiology.online --service app-a --service app-b
+    python key_manager.py list-grants --service my-companion-app
     python key_manager.py migrate
     python key_manager.py verify
 """
@@ -78,9 +86,8 @@ load_dotenv()
 
 
 def get_db():
-    from database import DatabaseManager
-    db_path = os.environ.get('DATABASE_PATH', 'ephemeral.db')
-    return DatabaseManager(db_path)
+    from database import create_database_manager
+    return create_database_manager()
 
 
 def get_crypto():
@@ -290,6 +297,9 @@ def cmd_show(args):
         print(f"    {json.dumps(cfg, indent=4)}")
     else:
         print(f"\n  Output config: (inherits server defaults)")
+
+    services = db.get_key_services(record['id'])
+    print(f"\n  Federated service access: {', '.join(services) if services else '(none)'}")
     print()
 
 
@@ -442,6 +452,75 @@ def cmd_set_output(args):
 
     db.update_api_key(record['id'], output_config=cfg)
     print(f"Output config updated for '{args.identifier}'")
+
+
+def _find_key_or_exit(db, identifier: str) -> dict:
+    """Shared lookup used by the service-grant commands below."""
+    keys   = db.get_all_api_keys(include_inactive=True)
+    record = next((k for k in keys if k['identifier'] == identifier), None)
+    if not record:
+        print(f"ERROR: No key found for '{identifier}'")
+        sys.exit(1)
+    return record
+
+
+def cmd_grant_service(args):
+    """
+    Grant a key access to one or more federated services.
+    Service names are free text — this app never hardcodes any; they're
+    whatever name the companion service checking against the shared
+    database expects (see ARCHITECTURE.md, "Federated service access").
+    """
+    db      = get_db()
+    record  = _find_key_or_exit(db, args.identifier)
+    current = db.grant_key_services(record['id'], args.service)
+    print(f"'{args.identifier}' now has access to: {', '.join(current) if current else '(none)'}")
+
+
+def cmd_revoke_service(args):
+    """Revoke a key's access to one or more federated services."""
+    db      = get_db()
+    record  = _find_key_or_exit(db, args.identifier)
+    current = db.revoke_key_services(record['id'], args.service)
+    print(f"'{args.identifier}' now has access to: {', '.join(current) if current else '(none)'}")
+
+
+def cmd_set_services(args):
+    """
+    Replace a key's entire set of federated service grants with exactly
+    what's passed. Omit --service entirely to revoke all service access.
+    """
+    db       = get_db()
+    record   = _find_key_or_exit(db, args.identifier)
+    services = args.service or []
+
+    if not services:
+        confirm = input(
+            f"No --service given — this revokes ALL service access for "
+            f"'{args.identifier}'. Continue? [yes/N]: "
+        ).strip()
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return
+
+    current = db.set_key_services(record['id'], services)
+    print(f"'{args.identifier}' now has access to: {', '.join(current) if current else '(none)'}")
+
+
+def cmd_list_grants(args):
+    """List active keys currently granted access to a given service."""
+    db   = get_db()
+    keys = db.get_keys_for_service(args.service)
+
+    if not keys:
+        print(f"No active keys are granted access to '{args.service}'.")
+        return
+
+    print(f"\nKeys granted access to '{args.service}':\n")
+    for k in keys:
+        admin_flag = ' [admin]' if k.get('admin') else ''
+        print(f"  {k['identifier']:<40} {k['name']}{admin_flag}")
+    print()
 
 
 def cmd_migrate(args):
@@ -658,6 +737,28 @@ def main():
     p.add_argument('--file',       help='Path to JSON config file')
     p.add_argument('--json',       help='Inline JSON string')
 
+    # grant-service
+    p = sub.add_parser('grant-service', help='Grant a key access to one or more federated services')
+    p.add_argument('--identifier', required=True)
+    p.add_argument('--service', action='append', required=True,
+                    help='Service name to grant (repeatable, e.g. --service foo --service bar)')
+
+    # revoke-service
+    p = sub.add_parser('revoke-service', help='Revoke a key\'s access to one or more federated services')
+    p.add_argument('--identifier', required=True)
+    p.add_argument('--service', action='append', required=True,
+                    help='Service name to revoke (repeatable)')
+
+    # set-services
+    p = sub.add_parser('set-services', help='Replace a key\'s entire set of federated service grants')
+    p.add_argument('--identifier', required=True)
+    p.add_argument('--service', action='append', default=None,
+                    help='Service name to grant (repeatable). Omit entirely to revoke all.')
+
+    # list-grants
+    p = sub.add_parser('list-grants', help='List keys granted access to a given federated service')
+    p.add_argument('--service', required=True)
+
     # migrate
     sub.add_parser('migrate', help='Import from ./users/*.cfg files')
 
@@ -678,6 +779,10 @@ def main():
         'set-limits':   cmd_set_limits,
         'class-limits': cmd_class_limits,
         'set-output':   cmd_set_output,
+        'grant-service':  cmd_grant_service,
+        'revoke-service': cmd_revoke_service,
+        'set-services':   cmd_set_services,
+        'list-grants':    cmd_list_grants,
         'migrate':      cmd_migrate,
         'verify':       cmd_verify,
     }

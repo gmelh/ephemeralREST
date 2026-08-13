@@ -63,8 +63,9 @@ ephemeralREST consists of two separate applications that communicate over HTTP:
          └──────┬──────────────┘         └─────────────────┘
                 │
          ┌──────▼──────────────┐
-         │  SQLite database    │
-         │  ephemeral.db       │
+         │  SQLite or MySQL    │
+         │  ephemeral.db /     │
+         │  MySQL database     │
          └─────────────────────┘
 ```
 
@@ -72,7 +73,7 @@ ephemeralREST consists of two separate applications that communicate over HTTP:
 
 **The PHP admin portal** is a thin client. It never touches the database directly — it makes HTTP requests to the Flask API using the logged-in user's session key, and renders the responses as HTML.
 
-**SQLite** stores everything: charts, keys, locations, SMTP config, portal settings. There is no separate database server.
+**The database** stores everything: charts, keys, locations, SMTP config, portal settings. There is no separate cache layer. `DB_TYPE` selects SQLite (default, no server required) or MySQL; see §7.
 
 ---
 
@@ -404,11 +405,15 @@ Secondary progressions, solar arc, solar return, and lunar return all:
 
 ### DatabaseManager
 
-Raw SQL wrapper around Python's `sqlite3`. No ORM. Instantiated once in `routes.py`. Uses `sqlite3.Row` as row factory so columns are accessible by name.
+Raw SQL wrapper — no ORM. Instantiated once in `routes.py` via `create_database_manager(config)`, which reads `DB_TYPE` (`sqlite`, default, or `mysql`) and the matching connection settings.
 
-Schema is initialised by `_init_db()` on startup using `CREATE TABLE IF NOT EXISTS`. Migrations run inline: `PRAGMA table_info` checks column presence, then `ALTER TABLE ADD COLUMN` adds missing columns.
+Against SQLite it wraps Python's `sqlite3` directly, using `sqlite3.Row` as row factory so columns are accessible by name. Against MySQL it wraps `mysql-connector-python` behind `_MySQLConnectionWrapper`/`_MySQLCursorWrapper`, which translate the handful of SQLite idioms the query methods are written against (`?` placeholders, `INSERT OR IGNORE`/`OR REPLACE`, the `ON CONFLICT...DO UPDATE` upsert syntax, and `datetime('now')` comparisons) into their MySQL equivalents, and normalise MySQL's return types (`Decimal`, `datetime`) back to plain values — so every method below this layer is written once and shared by both backends.
 
-**Special migration:** the `api_keys.key_type` column had a `NOT NULL CHECK (key_type IN ('domain','user'))` constraint in older databases with no default. `_init_db()` detects this and recreates the table (preserving all data) with the corrected constraint before adding new columns.
+Schema is initialised on startup by `_init_schema_sqlite()` or `_init_schema_mysql()`, both called from `init_database()`, using `CREATE TABLE IF NOT EXISTS`. The two are separate, hand-maintained schemas rather than one translated definition: MySQL requires an explicit key length on any indexed `TEXT`/`BLOB` column, so IDs, hashes, and tokens that are `TEXT PRIMARY KEY`/`UNIQUE` in SQLite become sized `VARCHAR` columns (`VARCHAR(36)` for UUIDs, `VARCHAR(32)` for MD5 hashes, `VARCHAR(255)` for general unique text) in the MySQL schema. MySQL support targets fresh deployments only — `_init_schema_mysql()` creates tables with their final column set directly rather than replaying the SQLite migration history below.
+
+Migrations (SQLite only) run inline: `PRAGMA table_info` checks column presence, then `ALTER TABLE ADD COLUMN` adds missing columns.
+
+**Special migration:** the `api_keys.key_type` column had a `NOT NULL CHECK (key_type IN ('domain','user'))` constraint in older databases with no default. `_init_schema_sqlite()` detects this and recreates the table (preserving all data) with the corrected constraint before adding new columns.
 
 ### Schema overview
 
@@ -418,6 +423,7 @@ Schema is initialised by `_init_db()` on startup using `CREATE TABLE IF NOT EXIS
 |---|---|
 | `api_keys` | All accounts. `key_enc` (Fernet), `key_prefix`, `password_hash`, `must_change_password`, `admin`, `active`, rate overrides, output config |
 | `key_class_limits` | Single `'user'` row — default rate limits applied when key has no override |
+| `api_key_services` | Federated service grants — see below |
 
 **Authentication:**
 
@@ -459,6 +465,43 @@ Schema is initialised by `_init_db()` on startup using `CREATE TABLE IF NOT EXIS
 | `smtp_config` | Key/value SMTP settings. Loaded fresh on each email send |
 | `portal_settings` | Key/value portal behaviour settings. Cached in PHP session |
 | `email_templates` | Per-template styling and content overrides |
+
+### Federated service access
+
+ephemeral.rest can act as the shared identity provider for a cluster of
+independent companion services, without any of this being specific to a
+particular deployment — it's a general capability of the software, available
+to anyone self-hosting it.
+
+**The idea:** holding a valid API key is always sufficient to call
+ephemeral.rest itself. The `api_key_services` table additionally lets a key
+be granted access to any number of arbitrarily-named external services —
+`grant_key_service(key_id, 'my-other-app')`, `key_has_service(key_id,
+'my-other-app')`, and so on (see `database.py`, "Federated service access
+grants"). Service names are free text chosen by whoever runs the companion
+service; ephemeral.rest itself never references any specific service by
+name and doesn't consult this table when authenticating its own requests.
+
+**Intended pattern for a companion service:**
+
+1. Run it under `DB_TYPE=mysql`, pointed at the same MySQL database as
+   ephemeral.rest (see §4 of `SETUP.md`). A read-only MySQL user — `SELECT`
+   only on `api_keys`, `api_key_services`, and `key_class_limits` — is
+   recommended, since the companion service should never need to write to
+   ephemeral.rest's own tables.
+2. On each request, resolve the caller's `X-API-Key` the same way
+   ephemeral.rest does (`key_prefix` lookup, then verify against `key_enc`
+   — see §4, "Key verification"), then check `key_has_service(key_id,
+   '<this service's own name>')` before proceeding.
+3. Grants are managed from ephemeral.rest's side — via `key_manager.py` or
+   the admin portal — the same place all other key administration already
+   happens.
+
+This keeps auth resolution local to each service (no per-request callback
+to ephemeral.rest, no added network dependency) while keeping key issuance,
+rate limits, and admin status centralised in one place. It's an entirely
+optional feature — a deployment that only ever runs ephemeral.rest itself
+can ignore `api_key_services` completely.
 
 ---
 

@@ -81,8 +81,21 @@ CITIES_FOLDER=./cities
 
 # -----------------------------------------------------------------------------
 # Database and ephemeris
+# DB_TYPE=sqlite → default, self-contained, zero setup, database file below
+# DB_TYPE=mysql  → requires MYSQL_HOST/MYSQL_PORT/MYSQL_USER/MYSQL_PASSWORD/
+#                  MYSQL_DATABASE, all set below. DATABASE_PATH is ignored.
 # -----------------------------------------------------------------------------
+DB_TYPE=sqlite
 DATABASE_PATH=ephemeral.db
+
+# Only required when DB_TYPE=mysql. The database itself must already exist —
+# this app creates its tables on first run but will not create the schema.
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=
+MYSQL_PASSWORD=
+MYSQL_DATABASE=
+
 SWISS_EPHEMERIS_PATH=./sweph
 
 # -----------------------------------------------------------------------------
@@ -193,7 +206,16 @@ class Config:
     GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY')
 
     # Database
+    # DB_TYPE: 'sqlite' (default) or 'mysql'
+    DB_TYPE       = os.environ.get('DB_TYPE', 'sqlite').strip().lower()
     DATABASE_PATH = os.environ.get('DATABASE_PATH', 'ephemeral.db')
+
+    # MySQL connection settings — only used when DB_TYPE=mysql
+    MYSQL_HOST     = os.environ.get('MYSQL_HOST', 'localhost')
+    MYSQL_PORT     = int(os.environ.get('MYSQL_PORT', '3306'))
+    MYSQL_USER     = os.environ.get('MYSQL_USER', '')
+    MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', '')
+    MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE', '')
 
     # Swiss Ephemeris
     SWISS_EPHEMERIS_PATH = os.environ.get('SWISS_EPHEMERIS_PATH', './sweph')
@@ -229,6 +251,19 @@ class Config:
         """Validate required configuration on startup"""
         errors   = []
         warnings = []
+
+        # Database type
+        if cls.DB_TYPE not in ('sqlite', 'mysql'):
+            errors.append(
+                f"DB_TYPE must be 'sqlite' or 'mysql', got '{cls.DB_TYPE}'"
+            )
+        elif cls.DB_TYPE == 'mysql':
+            if not cls.MYSQL_USER:
+                errors.append("MYSQL_USER is required when DB_TYPE=mysql")
+            if not cls.MYSQL_DATABASE:
+                errors.append("MYSQL_DATABASE is required when DB_TYPE=mysql")
+            if not cls.MYSQL_PASSWORD:
+                warnings.append("MYSQL_PASSWORD is empty — only appropriate for local/dev MySQL")
 
         # Google Maps API key — only required when USE_GOOGLE=true
         if cls.USE_GOOGLE:
@@ -275,7 +310,9 @@ class Config:
             'host':                  cls.FLASK_HOST,
             'port':                  cls.FLASK_PORT,
             'debug':                 cls.FLASK_DEBUG,
-            'database':              cls.DATABASE_PATH,
+            'db_type':               cls.DB_TYPE,
+            'database':              cls.DATABASE_PATH if cls.DB_TYPE == 'sqlite'
+                                      else f"mysql://{cls.MYSQL_HOST}:{cls.MYSQL_PORT}/{cls.MYSQL_DATABASE}",
             'ephemeris_path':        cls.SWISS_EPHEMERIS_PATH,
             'max_monthly_requests':  cls.MAX_MONTHLY_REQUESTS,
             'cors_origins':          cls.CORS_ORIGINS,
@@ -286,4 +323,3 @@ class Config:
             'key_store':            'database',
             'encryption':           'Fernet (AES-128)',
         }
-    

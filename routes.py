@@ -1998,6 +1998,7 @@ def admin_get_key(key_id):
         return _error(f'Key {key_id} not found', 404)
 
     record.pop('key_enc', None)
+    record['services'] = db_manager.get_key_services(key_id)
     return jsonify(record)
 
 
@@ -2186,6 +2187,115 @@ def admin_delete_key(key_id):
 
     logger.info(f"Admin deleted key {key_id}")
     return jsonify({'message': f'Key {key_id} permanently deleted'})
+
+
+
+# ---------------------------------------------------------------------------
+# Admin — Federated service access endpoints
+#
+# Lets a key be granted access to companion services that check this
+# database directly (see ARCHITECTURE.md, "Federated service access").
+# Service names are free text chosen by whoever operates the companion
+# service — nothing here is specific to any particular deployment.
+# ---------------------------------------------------------------------------
+
+@api.route('/admin/keys/<int:key_id>/services', methods=['GET'])
+def admin_get_key_services(key_id):
+    """List the federated services a key is granted access to. Admin only."""
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    if not db_manager.get_api_key_by_id(key_id):
+        return _error(f'Key {key_id} not found', 404)
+
+    return jsonify({'key_id': key_id, 'services': db_manager.get_key_services(key_id)})
+
+
+@api.route('/admin/keys/<int:key_id>/services', methods=['POST'])
+def admin_grant_key_services(key_id):
+    """
+    Grant a key access to one or more federated services. Admin only.
+    Idempotent — services the key already has are left as-is.
+
+    Body: { "services": ["service-a", "service-b", ...] }
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    if not db_manager.get_api_key_by_id(key_id):
+        return _error(f'Key {key_id} not found', 404)
+
+    data     = request.get_json(silent=True) or {}
+    services = data.get('services')
+    if not isinstance(services, list) or not all(isinstance(s, str) and s.strip() for s in services):
+        return _error('Body must include "services": a non-empty list of service name strings', 400)
+
+    current = db_manager.grant_key_services(key_id, services)
+    logger.info(f"Admin [{user.get('identifier')}] granted key_id={key_id} access to: {services}")
+    return jsonify({'message': 'Service access granted', 'key_id': key_id, 'services': current})
+
+
+@api.route('/admin/keys/<int:key_id>/services', methods=['PUT'])
+def admin_set_key_services(key_id):
+    """
+    Replace a key's entire set of federated service grants. Admin only.
+    Services not in the list are revoked; missing ones are added. Pass an
+    empty list to revoke all of a key's service access.
+
+    Body: { "services": ["service-a", "service-b", ...] }
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    if not db_manager.get_api_key_by_id(key_id):
+        return _error(f'Key {key_id} not found', 404)
+
+    data     = request.get_json(silent=True) or {}
+    services = data.get('services')
+    if not isinstance(services, list) or not all(isinstance(s, str) and s.strip() for s in services):
+        return _error('Body must include "services": a list of service name strings (may be empty)', 400)
+
+    current = db_manager.set_key_services(key_id, services)
+    logger.info(f"Admin [{user.get('identifier')}] set key_id={key_id} services to: {services}")
+    return jsonify({'message': 'Service access updated', 'key_id': key_id, 'services': current})
+
+
+@api.route('/admin/keys/<int:key_id>/services/revoke', methods=['POST'])
+def admin_revoke_key_services(key_id):
+    """
+    Revoke a key's access to one or more federated services. Admin only.
+
+    Body: { "services": ["service-a", "service-b", ...] }
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    if not db_manager.get_api_key_by_id(key_id):
+        return _error(f'Key {key_id} not found', 404)
+
+    data     = request.get_json(silent=True) or {}
+    services = data.get('services')
+    if not isinstance(services, list) or not all(isinstance(s, str) and s.strip() for s in services):
+        return _error('Body must include "services": a non-empty list of service name strings', 400)
+
+    current = db_manager.revoke_key_services(key_id, services)
+    logger.info(f"Admin [{user.get('identifier')}] revoked key_id={key_id} access to: {services}")
+    return jsonify({'message': 'Service access revoked', 'key_id': key_id, 'services': current})
+
+
+@api.route('/admin/services/<service>/keys', methods=['GET'])
+def admin_list_service_keys(service):
+    """List active keys currently granted access to a given service. Admin only."""
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    keys = db_manager.get_keys_for_service(service)
+    return jsonify({'service': service, 'count': len(keys), 'keys': keys})
 
 
 

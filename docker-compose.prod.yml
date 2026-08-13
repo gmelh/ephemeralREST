@@ -1,8 +1,12 @@
 ################################################################################
 ################################################################################
 ###                                                                          ###
-###                      docker-compose.yml                                 ###
-###                   Docker Compose Configuration                          ###
+###                   docker-compose.prod.yml                               ###
+###         Production — pulls pre-built images, does not build from       ###
+###         source. Use this on production; use docker-compose.yml (the    ###
+###         one that builds locally) on your test box. See DOCS/           ###
+###         DOCKER_DEPLOYMENT_CHECKLIST.md, "Build once, deploy the same   ###
+###         image" for the full tag/push/pull sequence this depends on.    ###
 ###                                                                          ###
 ################################################################################
 ################################################################################
@@ -11,7 +15,7 @@ version: '3.8'
 
 services:
   ephemeral-rest:
-    build: .
+    image: ${REGISTRY}/ephemeral-rest:${IMAGE_TAG:-latest}
     container_name: ephemeral-rest
     restart: unless-stopped
     ports:
@@ -23,12 +27,10 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
       - API_KEY=${API_KEY}
-      # Database: DB_TYPE=sqlite (default) needs no further setup — the
-      # file below is created automatically and lives on the ephemeral-data
-      # volume. Set DB_TYPE=mysql (plus the MYSQL_* values) to run against
-      # an external MySQL server instead — typically a shared database also
-      # used by other companion services (see ARCHITECTURE.md, "Federated
-      # service access"); DATABASE_PATH is ignored in that case.
+      # Database — this MUST be its own separate database from whatever you
+      # used for testing. Never point production at the same MySQL instance
+      # (or the same managed database) as a test deployment; keys, charts,
+      # and everything else created while testing would become "real" data.
       - DB_TYPE=${DB_TYPE:-sqlite}
       - DATABASE_PATH=/app/data/ephemeral.db
       - MYSQL_HOST=${MYSQL_HOST:-}
@@ -48,17 +50,14 @@ services:
       - RATE_LIMIT_PER_DAY=${RATE_LIMIT_PER_DAY:-200}
       - CACHE_EXPIRY_DAYS=${CACHE_EXPIRY_DAYS:-90}
     volumes:
+      # Swiss Ephemeris data files are never baked into the image — they're
+      # mounted from the host on every box that runs this, test or prod.
+      # Make sure ./sweph is populated here too (see Phase 3 of the
+      # deployment checklist); the image being identical to what you tested
+      # doesn't help if this directory is empty.
       - ./sweph:/app/sweph:ro
-      # Only used when DB_TYPE=sqlite (the default). Unused, but harmless,
-      # when running against external MySQL.
       - ephemeral-data:/app/data
       - ephemeral-logs:/app/logs
-    # Lets the container reach services running directly on the VPS host
-    # (e.g. a locally-installed MySQL) via host.docker.internal — a
-    # container's "localhost" is otherwise itself, not the host. Only
-    # relevant when MYSQL_HOST=host.docker.internal is set in .env; no
-    # effect otherwise. Requires Docker Engine 20.10+ (host-gateway support
-    # on Linux).
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -70,8 +69,6 @@ services:
       retries: 3
       start_period: 40s
 
-  # Optional: Nginx reverse proxy — fronts both ephemeral-rest (API) and
-  # ephemeral-admin (portal). See nginx.conf: port 80 → API, port 8080 → portal.
   nginx:
     image: nginx:alpine
     container_name: ephemeral-nginx
@@ -82,20 +79,8 @@ services:
       - "443:443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      # Real certificates from certbot running on the host (see DOCS/SETUP.md,
-      # "Docker deployment") — only needed if using the real-domain HTTPS
-      # server blocks in nginx.conf; harmless otherwise.
       - /etc/letsencrypt:/etc/letsencrypt:ro
-      # ACME HTTP-01 challenge webroot, shared with the host's certbot
-      # process for certificate renewal. Create this directory on the host
-      # before first run: mkdir -p /srv/ephemeral/certbot-webroot
       - /srv/ephemeral/certbot-webroot:/var/www/certbot:ro
-      # Read-only access to the portal's code, so nginx can serve static
-      # assets directly and resolve SCRIPT_FILENAME for fastcgi_pass to
-      # ephemeral-admin. Populated automatically from the ephemeral-admin
-      # image the first time this volume is created (standard Docker
-      # behaviour for a named volume mounted over a directory with content
-      # already baked into the image).
       - admin-app:/var/www/html:ro
     depends_on:
       - ephemeral-rest
@@ -103,18 +88,11 @@ services:
     networks:
       - ephemeral-network
 
-  # ephemeralADMIN — the PHP admin portal. PHP-FPM only, no bundled web
-  # server; nginx (above) is the front door and proxies *.php requests to
-  # this container over FastCGI. Separate image from ephemeral-rest — MIT
-  # licensed, no database access, and no reason to share a process, restart
-  # policy, or attack surface with the API that holds SECRET_KEY.
   ephemeral-admin:
-    build: ../ephemeralADMIN
+    image: ${REGISTRY}/ephemeral-admin:${IMAGE_TAG:-latest}
     container_name: ephemeral-admin
     restart: unless-stopped
     environment:
-      # Docker Compose service DNS name, not localhost — see config.php's
-      # getenv('API_BASE') fallback.
       - API_BASE=http://ephemeral-rest:5000
     volumes:
       - admin-app:/var/www/html
@@ -134,3 +112,4 @@ volumes:
 networks:
   ephemeral-network:
     driver: bridge
+    

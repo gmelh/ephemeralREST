@@ -82,8 +82,8 @@ def _load_config() -> dict:
     """
     db_cfg = {}
     try:
-        from database import DatabaseManager
-        db = DatabaseManager(os.environ.get('DATABASE_PATH', 'ephemeral.db'))
+        from database import create_database_manager
+        db = create_database_manager()
         db_cfg = db.get_smtp_config()
     except Exception as e:
         logger.debug(f"SMTP config DB read failed - using env vars: {e}")
@@ -119,8 +119,8 @@ class EmailService:
         _portal_url = cfg.get('portal_url', '').strip()
         if not _portal_url:
             try:
-                from database import DatabaseManager
-                _ps = DatabaseManager(os.environ.get('DATABASE_PATH', 'ephemeral.db')).get_portal_settings()
+                from database import create_database_manager
+                _ps = create_database_manager().get_portal_settings()
                 _portal_url = _ps.get('portal_url', '').strip()
             except Exception:
                 pass
