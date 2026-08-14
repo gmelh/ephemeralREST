@@ -499,6 +499,28 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(active)")
 
         # ------------------------------------------------------------------
+        # Federated service registry — admin-curated list of known external
+        # services a key can be granted access to. `slug` is what
+        # api_key_services.service actually stores; this table exists so
+        # the portal can present a real list (with names/descriptions)
+        # instead of admins typing free-text service names from memory.
+        # ------------------------------------------------------------------
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS federated_services
+            (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug         TEXT UNIQUE NOT NULL,
+                display_name TEXT NOT NULL,
+                description  TEXT,
+                base_url     TEXT,
+                active       INTEGER NOT NULL DEFAULT 1,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_federated_services_active ON federated_services(active)")
+
+        # ------------------------------------------------------------------
         # Federated service access grants.
         #
         # ephemeral.rest can act as the shared identity provider for a
@@ -971,6 +993,27 @@ class DatabaseManager:
         self._mysql_create_index(cursor, "CREATE INDEX idx_api_keys_prefix ON api_keys(key_prefix)")
         self._mysql_create_index(cursor, "CREATE INDEX idx_api_keys_type   ON api_keys(key_type)")
         self._mysql_create_index(cursor, "CREATE INDEX idx_api_keys_active ON api_keys(active)")
+
+        # ------------------------------------------------------------------
+        # Federated service registry — admin-curated list of known external
+        # services a key can be granted access to. `slug` is what
+        # api_key_services.service actually stores; VARCHAR(32) to match
+        # that column's size.
+        # ------------------------------------------------------------------
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS federated_services
+            (
+                id           INT AUTO_INCREMENT PRIMARY KEY,
+                slug         VARCHAR(32) UNIQUE NOT NULL,
+                display_name VARCHAR(255) NOT NULL,
+                description  TEXT,
+                base_url     TEXT,
+                active       INT NOT NULL DEFAULT 1,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        """)
+        self._mysql_create_index(cursor, "CREATE INDEX idx_federated_services_active ON federated_services(active)")
 
         # ------------------------------------------------------------------
         # Federated service access grants.
@@ -2372,6 +2415,7 @@ class DatabaseManager:
             identifier: str,
             key_enc: str,
             key_prefix: str,
+            key_type: str = 'user',
             admin: bool = False,
             active: bool = True,
             rate_per_minute: int = None,
@@ -2384,11 +2428,11 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO api_keys
-                (name, identifier, key_enc, key_prefix, admin, active,
+                (name, identifier, key_enc, key_prefix, key_type, admin, active,
                  rate_per_minute, rate_per_hour, rate_per_day, output_config)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                name, identifier, key_enc, key_prefix,
+                name, identifier, key_enc, key_prefix, key_type,
                 1 if admin else 0,
                 1 if active else 0,
                 rate_per_minute, rate_per_hour, rate_per_day,
@@ -2663,6 +2707,112 @@ class DatabaseManager:
                 ORDER BY k.name
             """, (service,)).fetchall()
             return [dict(r) for r in rows]
+
+    # ==========================================================================
+    # Federated service registry
+    #
+    # Admin-curated list of known external services, so the portal can show
+    # a real list instead of free text. api_key_services.service continues
+    # to store the plain slug string — this registry is a layer on top,
+    # not a replacement; grant/revoke/check methods above are unaffected.
+    # ==========================================================================
+
+    def create_federated_service(
+            self,
+            slug: str,
+            display_name: str,
+            description: str = None,
+            base_url: str = None,
+    ) -> int:
+        """Register a new federated service. Raises on duplicate slug (UNIQUE)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO federated_services (slug, display_name, description, base_url)
+                VALUES (?, ?, ?, ?)
+            """, (slug, display_name, description, base_url))
+            return cursor.lastrowid
+
+    def get_federated_services(self, active_only: bool = False) -> list:
+        """List registered federated services, newest first by name."""
+        with self.get_connection() as conn:
+            sql = "SELECT * FROM federated_services"
+            if active_only:
+                sql += " WHERE active = 1"
+            sql += " ORDER BY display_name"
+            rows = conn.execute(sql).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_federated_service(self, service_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch one registered service by id."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM federated_services WHERE id = ?", (service_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_federated_service_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
+        """Fetch one registered service by slug."""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM federated_services WHERE slug = ?", (slug,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def update_federated_service(
+            self,
+            service_id: int,
+            display_name: str = None,
+            description: str = None,
+            base_url: str = None,
+            active: bool = None,
+    ) -> bool:
+        """Update a registered service's editable fields. Only supplied fields change."""
+        fields, params = [], []
+        if display_name is not None:
+            fields.append("display_name = ?"); params.append(display_name)
+        if description is not None:
+            fields.append("description = ?"); params.append(description)
+        if base_url is not None:
+            fields.append("base_url = ?"); params.append(base_url)
+        if active is not None:
+            fields.append("active = ?"); params.append(1 if active else 0)
+
+        if not fields:
+            return False
+
+        fields.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(service_id)
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE federated_services SET {', '.join(fields)} WHERE id = ?",
+                params
+            )
+            return cursor.rowcount > 0
+
+    def delete_federated_service(self, service_id: int, remove_grants: bool = False) -> bool:
+        """
+        Permanently remove a service from the registry. Existing grants in
+        api_key_services referencing its slug are left as-is by default
+        (they just stop appearing as a checkbox option in the portal) —
+        pass remove_grants=True to also revoke every key's access to it.
+        Prefer update_federated_service(active=False) over this for most
+        cases; that keeps the service visible (read-only) on keys that
+        already have it, which is usually less surprising than deletion.
+        """
+        service = self.get_federated_service(service_id)
+        if not service:
+            return False
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            if remove_grants:
+                cursor.execute(
+                    "DELETE FROM api_key_services WHERE service = ?", (service['slug'],)
+                )
+            cursor.execute("DELETE FROM federated_services WHERE id = ?", (service_id,))
+            return cursor.rowcount > 0
 
     def _api_key_row_to_dict(self, row) -> Dict[str, Any]:
         """Convert a raw api_keys row to a dict, parsing output_config JSON."""

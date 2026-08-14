@@ -272,6 +272,11 @@ def create_app(config_class=Config):
         'api.admin_set_key_services',
         'api.admin_revoke_key_services',
         'api.admin_list_service_keys',
+        'api.admin_list_federated_services',
+        'api.admin_create_federated_service',
+        'api.admin_get_federated_service',
+        'api.admin_update_federated_service',
+        'api.admin_delete_federated_service',
         'api.admin_get_smtp',
         'api.admin_get_portal_settings',
         'api.admin_set_portal_settings',
@@ -296,8 +301,6 @@ def create_app(config_class=Config):
         'api.admin_set_key_admin',
         'api.admin_force_password_reset',
         'api.get_chart',
-        'api.health',
-        'api.cache_stats',
         'api.locations_resolve',
     ]
     for _endpoint in _protected:

@@ -402,6 +402,26 @@ def health():
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 
+@api.route('/branding', methods=['GET'])
+def branding():
+    """
+    Public, unauthenticated — deliberately the *only* portal setting exposed
+    without a key. The portal's own public pages (landing.php) need the
+    configured site name before a visitor has ever logged in, and site name
+    is not sensitive: it's already visible in every page's own title/header
+    once loaded. Nothing else from portal_settings (portal_url, admin
+    promotion flags, etc.) belongs in an unauthenticated response — add to
+    this deliberately if a future public page needs one more specific field,
+    don't just return the whole settings dict here.
+    """
+    try:
+        settings = db_manager.get_portal_settings()
+        return jsonify({'site_name': settings.get('site_name') or 'ephemeralREST'})
+    except Exception as e:
+        logger.error(f"Branding endpoint error: {str(e)}", exc_info=True)
+        return jsonify({'site_name': 'ephemeralREST'})
+
+
 
 
 
@@ -2296,6 +2316,132 @@ def admin_list_service_keys(service):
 
     keys = db_manager.get_keys_for_service(service)
     return jsonify({'service': service, 'count': len(keys), 'keys': keys})
+
+
+
+# ---------------------------------------------------------------------------
+# Admin — Federated service registry
+#
+# Admin-curated list of known federated services, so the portal (and
+# key_manager.py) can present a real list instead of free text. Grants
+# themselves are unaffected by this — see the endpoints above.
+# ---------------------------------------------------------------------------
+
+@api.route('/admin/federated-services', methods=['GET'])
+def admin_list_federated_services():
+    """List registered federated services. Admin only. ?active=1 to filter."""
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    active_only = request.args.get('active') == '1'
+    services = db_manager.get_federated_services(active_only=active_only)
+    return jsonify({'count': len(services), 'services': services})
+
+
+@api.route('/admin/federated-services', methods=['POST'])
+def admin_create_federated_service():
+    """
+    Register a new federated service. Admin only.
+
+    Body: { "slug": "...", "display_name": "...", "description": "...",
+            "base_url": "..." }
+    slug and display_name are required; description and base_url optional.
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    data         = request.get_json(silent=True) or {}
+    slug         = (data.get('slug') or '').strip()
+    display_name = (data.get('display_name') or '').strip()
+    description  = data.get('description')
+    base_url     = data.get('base_url')
+
+    if not slug or not display_name:
+        return _error('Body must include non-empty "slug" and "display_name"', 400)
+    if len(slug) > 32:
+        return _error('"slug" must be 32 characters or fewer', 400)
+
+    if db_manager.get_federated_service_by_slug(slug):
+        return _error(f"A service with slug '{slug}' already exists", 409)
+
+    service_id = db_manager.create_federated_service(slug, display_name, description, base_url)
+    logger.info(f"Admin [{user.get('identifier')}] registered federated service: {slug}")
+    return jsonify(db_manager.get_federated_service(service_id)), 201
+
+
+@api.route('/admin/federated-services/<int:service_id>', methods=['GET'])
+def admin_get_federated_service(service_id):
+    """Fetch one registered federated service. Admin only."""
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    service = db_manager.get_federated_service(service_id)
+    if not service:
+        return _error(f'Federated service {service_id} not found', 404)
+    return jsonify(service)
+
+
+@api.route('/admin/federated-services/<int:service_id>', methods=['PUT'])
+def admin_update_federated_service(service_id):
+    """
+    Update a registered federated service's editable fields. Admin only.
+    Only fields present in the body are changed; slug itself is immutable
+    (delete and re-register under a new slug if it truly needs to change,
+    since api_key_services grants reference it by that string).
+
+    Body: any of { "display_name", "description", "base_url", "active" }
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    if not db_manager.get_federated_service(service_id):
+        return _error(f'Federated service {service_id} not found', 404)
+
+    data = request.get_json(silent=True) or {}
+    if not data:
+        return _error('Body must include at least one field to update', 400)
+
+    updated = db_manager.update_federated_service(
+        service_id,
+        display_name=data.get('display_name'),
+        description=data.get('description'),
+        base_url=data.get('base_url'),
+        active=data.get('active'),
+    )
+    if not updated:
+        return _error('No recognised fields to update', 400)
+
+    logger.info(f"Admin [{user.get('identifier')}] updated federated service id={service_id}")
+    return jsonify(db_manager.get_federated_service(service_id))
+
+
+@api.route('/admin/federated-services/<int:service_id>', methods=['DELETE'])
+def admin_delete_federated_service(service_id):
+    """
+    Permanently remove a service from the registry. Admin only.
+    Existing grants for it are left alone by default — pass
+    ?remove_grants=1 to also revoke every key's access to it. Prefer
+    PUT .../active=false over this for most cases (see database.py's
+    delete_federated_service docstring).
+    """
+    user = getattr(g, 'user', {})
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
+
+    remove_grants = request.args.get('remove_grants') == '1'
+    deleted = db_manager.delete_federated_service(service_id, remove_grants=remove_grants)
+    if not deleted:
+        return _error(f'Federated service {service_id} not found', 404)
+
+    logger.info(
+        f"Admin [{user.get('identifier')}] deleted federated service id={service_id} "
+        f"(remove_grants={remove_grants})"
+    )
+    return jsonify({'message': f'Federated service {service_id} deleted'})
 
 
 

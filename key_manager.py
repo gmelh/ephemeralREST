@@ -54,6 +54,10 @@ Commands:
     revoke-service  Revoke a key's access to one or more federated services
     set-services    Replace a key's entire set of federated service grants
     list-grants     List keys granted access to a given federated service
+    register-service    Register a new federated service in the registry
+    update-service      Update a registered service's editable fields
+    unregister-service  Remove a service from the registry
+    list-services       List registered federated services
     migrate     Import keys from existing ./users/*.cfg files
     verify      Test whether a plaintext key is valid
 
@@ -66,6 +70,10 @@ Usage examples:
     python key_manager.py set-limits --identifier cosmobiology.online --per-minute 30 --per-hour 300 --per-day 2000
     python key_manager.py class-limits --type domain --per-minute 20 --per-hour 200 --per-day 1000
     python key_manager.py set-output --identifier cosmobiology.online --file config.json
+    python key_manager.py register-service --slug my-companion-app --name "My Companion App"
+    python key_manager.py list-services
+    python key_manager.py update-service --slug my-companion-app --deactivate
+    python key_manager.py unregister-service --slug my-companion-app
     python key_manager.py grant-service --identifier cosmobiology.online --service my-companion-app
     python key_manager.py revoke-service --identifier cosmobiology.online --service my-companion-app
     python key_manager.py set-services --identifier cosmobiology.online --service app-a --service app-b
@@ -523,6 +531,83 @@ def cmd_list_grants(args):
     print()
 
 
+def cmd_register_service(args):
+    """Register a new federated service in the registry."""
+    db = get_db()
+    if db.get_federated_service_by_slug(args.slug):
+        print(f"ERROR: A service with slug '{args.slug}' already exists")
+        sys.exit(1)
+    if len(args.slug) > 32:
+        print("ERROR: --slug must be 32 characters or fewer")
+        sys.exit(1)
+
+    service_id = db.create_federated_service(
+        slug=args.slug,
+        display_name=args.name,
+        description=args.description,
+        base_url=args.base_url,
+    )
+    print(f"Registered '{args.slug}' (id={service_id})")
+
+
+def cmd_update_service(args):
+    """Update a registered federated service's editable fields."""
+    db      = get_db()
+    service = db.get_federated_service_by_slug(args.slug)
+    if not service:
+        print(f"ERROR: No registered service found for slug '{args.slug}'")
+        sys.exit(1)
+
+    updated = db.update_federated_service(
+        service['id'],
+        display_name=args.name,
+        description=args.description,
+        base_url=args.base_url,
+        active=(not args.deactivate) if (args.deactivate or args.reactivate) else None,
+    )
+    if not updated:
+        print("Nothing to update — pass at least one of --name/--description/--base-url/--deactivate/--reactivate")
+        return
+    print(f"Updated '{args.slug}'")
+
+
+def cmd_unregister_service(args):
+    """Remove a service from the registry."""
+    db      = get_db()
+    service = db.get_federated_service_by_slug(args.slug)
+    if not service:
+        print(f"ERROR: No registered service found for slug '{args.slug}'")
+        sys.exit(1)
+
+    if args.remove_grants:
+        confirm = input(
+            f"This also revokes ALL keys' access to '{args.slug}'. Continue? [yes/N]: "
+        ).strip()
+        if confirm.lower() != 'yes':
+            print("Cancelled.")
+            return
+
+    db.delete_federated_service(service['id'], remove_grants=args.remove_grants)
+    print(f"Removed '{args.slug}' from the registry" + (" and revoked all grants for it" if args.remove_grants else " (existing grants left as-is)"))
+
+
+def cmd_list_services(args):
+    """List registered federated services."""
+    db       = get_db()
+    services = db.get_federated_services(active_only=args.active_only)
+
+    if not services:
+        print("No federated services registered.")
+        return
+
+    print(f"\n{'Slug':<20} {'Name':<25} {'Status':<10} Description")
+    print("-" * 90)
+    for s in services:
+        status = 'active' if s.get('active') else 'inactive'
+        print(f"{s['slug']:<20} {s['display_name']:<25} {status:<10} {s.get('description') or ''}")
+    print()
+
+
 def cmd_migrate(args):
     """
     Import keys from existing ./users/*.cfg files into the database.
@@ -759,6 +844,32 @@ def main():
     p = sub.add_parser('list-grants', help='List keys granted access to a given federated service')
     p.add_argument('--service', required=True)
 
+    # register-service
+    p = sub.add_parser('register-service', help='Register a new federated service in the registry')
+    p.add_argument('--slug', required=True, help='Stable identifier, e.g. my-companion-app (max 32 chars)')
+    p.add_argument('--name', required=True, help='Display name shown in the portal')
+    p.add_argument('--description', default=None)
+    p.add_argument('--base-url', dest='base_url', default=None)
+
+    # update-service
+    p = sub.add_parser('update-service', help="Update a registered service's editable fields")
+    p.add_argument('--slug', required=True, help='Existing slug to update (immutable — cannot itself be changed)')
+    p.add_argument('--name', default=None, help='New display name')
+    p.add_argument('--description', default=None)
+    p.add_argument('--base-url', dest='base_url', default=None)
+    p.add_argument('--deactivate', action='store_true', help='Mark inactive (hidden from grant checkboxes, existing grants untouched)')
+    p.add_argument('--reactivate', action='store_true')
+
+    # unregister-service
+    p = sub.add_parser('unregister-service', help='Remove a service from the registry')
+    p.add_argument('--slug', required=True)
+    p.add_argument('--remove-grants', dest='remove_grants', action='store_true',
+                    help="Also revoke every key's access to this service (default: leave existing grants as-is)")
+
+    # list-services
+    p = sub.add_parser('list-services', help='List registered federated services')
+    p.add_argument('--active-only', dest='active_only', action='store_true')
+
     # migrate
     sub.add_parser('migrate', help='Import from ./users/*.cfg files')
 
@@ -783,6 +894,10 @@ def main():
         'revoke-service': cmd_revoke_service,
         'set-services':   cmd_set_services,
         'list-grants':    cmd_list_grants,
+        'register-service':   cmd_register_service,
+        'update-service':     cmd_update_service,
+        'unregister-service': cmd_unregister_service,
+        'list-services':      cmd_list_services,
         'migrate':      cmd_migrate,
         'verify':       cmd_verify,
     }

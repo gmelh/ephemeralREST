@@ -22,7 +22,6 @@ services:
       - FLASK_DEBUG=${FLASK_DEBUG:-False}
       - SECRET_KEY=${SECRET_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
-      - API_KEY=${API_KEY}
       # Database: DB_TYPE=sqlite (default) needs no further setup — the
       # file below is created automatically and lives on the ephemeral-data
       # volume. Set DB_TYPE=mysql (plus the MYSQL_* values) to run against
@@ -113,9 +112,15 @@ services:
     container_name: ephemeral-admin
     restart: unless-stopped
     environment:
-      # Docker Compose service DNS name, not localhost — see config.php's
-      # getenv('API_BASE') fallback.
+      # Internal Docker network address — what the portal actually
+      # connects to. Deliberately not the public API URL: this stays
+      # inside the Docker network, bypassing nginx/TLS entirely.
       - API_BASE=http://ephemeral-rest:5000
+      # What gets *displayed* to an admin (Dashboard "Endpoint" field,
+      # API Tester header) — set this to your real public API URL, e.g.
+      # https://api.yourdomain.com. Falls back to API_BASE (the internal
+      # address above) if left unset, so this is optional.
+      - API_PUBLIC_URL=${API_PUBLIC_URL:-}
     volumes:
       - admin-app:/var/www/html
     depends_on:
@@ -134,3 +139,12 @@ volumes:
 networks:
   ephemeral-network:
     driver: bridge
+    ipam:
+      config:
+        # Pinned rather than auto-assigned, so it's a known, fixed value
+        # you can firewall against (see DOCS/DOCKER_DEPLOYMENT_CHECKLIST.md
+        # Phase 4) without needing to inspect the network after the fact —
+        # useful since the network doesn't exist until first `docker
+        # compose up`, but the firewall rule needs to be in place before
+        # MySQL is exposed at all.
+        - subnet: 172.28.0.0/16

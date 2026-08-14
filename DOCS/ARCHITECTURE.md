@@ -424,6 +424,7 @@ Migrations (SQLite only) run inline: `PRAGMA table_info` checks column presence,
 | `api_keys` | All accounts. `key_enc` (Fernet), `key_prefix`, `password_hash`, `must_change_password`, `admin`, `active`, rate overrides, output config |
 | `key_class_limits` | Single `'user'` row — default rate limits applied when key has no override |
 | `api_key_services` | Federated service grants — see below |
+| `federated_services` | Admin-curated registry of known services — see below |
 
 **Authentication:**
 
@@ -502,6 +503,30 @@ to ephemeral.rest, no added network dependency) while keeping key issuance,
 rate limits, and admin status centralised in one place. It's an entirely
 optional feature — a deployment that only ever runs ephemeral.rest itself
 can ignore `api_key_services` completely.
+
+**The service registry.** `api_key_services.service` is just a plain
+string — nothing stops a client from calling `grant_key_service(key_id,
+'literally anything')` directly. `federated_services` is a curated layer
+on top, not a replacement: an admin-managed list of *known* services
+(`slug`, `display_name`, `description`, `base_url`, `active`), so the
+portal can present real checkboxes instead of a free-text field admins
+have to spell correctly from memory. `key-detail.php`'s grant UI is
+registry-only (it only offers granting services that are registered and
+`active`), but the underlying grant mechanism doesn't enforce this — the
+CLI (`key_manager.py grant-service`) and the API
+(`POST /admin/keys/<id>/services`) still accept any slug, registered or
+not, for ad-hoc/testing use. Deactivating a service
+(`update-service --slug ... --deactivate`, or the portal's edit modal)
+hides it from the grant checkboxes without touching any key's existing
+grants; deleting it from the registry (`unregister-service`, or the
+portal's Remove button) behaves the same way by default — existing grants
+for that slug are left alone unless `--remove-grants` /
+`?remove_grants=1` is explicitly passed.
+
+Manage the registry from `key_manager.py` (`register-service`,
+`update-service`, `unregister-service`, `list-services`), the API
+(`/admin/federated-services`), or the portal's dedicated **Federated
+Services** page.
 
 ---
 

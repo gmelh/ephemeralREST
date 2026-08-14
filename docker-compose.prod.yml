@@ -26,7 +26,6 @@ services:
       - FLASK_DEBUG=${FLASK_DEBUG:-False}
       - SECRET_KEY=${SECRET_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
-      - API_KEY=${API_KEY}
       # Database — this MUST be its own separate database from whatever you
       # used for testing. Never point production at the same MySQL instance
       # (or the same managed database) as a test deployment; keys, charts,
@@ -93,7 +92,15 @@ services:
     container_name: ephemeral-admin
     restart: unless-stopped
     environment:
+      # Internal Docker network address — what the portal actually
+      # connects to. Deliberately not the public API URL: this stays
+      # inside the Docker network, bypassing nginx/TLS entirely.
       - API_BASE=http://ephemeral-rest:5000
+      # What gets *displayed* to an admin (Dashboard "Endpoint" field,
+      # API Tester header) — set this to your real public API URL, e.g.
+      # https://api.yourdomain.com. Falls back to API_BASE (the internal
+      # address above) if left unset, so this is optional.
+      - API_PUBLIC_URL=${API_PUBLIC_URL:-}
     volumes:
       - admin-app:/var/www/html
     depends_on:
@@ -112,4 +119,9 @@ volumes:
 networks:
   ephemeral-network:
     driver: bridge
-    
+    ipam:
+      config:
+        # Must match docker-compose.yml's pinned subnet — same firewall
+        # rule (see DOCS/DOCKER_DEPLOYMENT_CHECKLIST.md Phase 4) needs to
+        # apply on production too.
+        - subnet: 172.28.0.0/16
