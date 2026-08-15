@@ -90,7 +90,11 @@ services:
     networks:
       - ephemeral-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      # curl isn't installed in the final runtime image (multi-stage build
+      # only installs build tools like gcc in the builder stage) — Python
+      # itself is already there, so use it directly rather than adding a
+      # new system package just for this one check.
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health').status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
