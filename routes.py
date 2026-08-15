@@ -402,24 +402,31 @@ def health():
         return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 
-@api.route('/branding', methods=['GET'])
-def branding():
+@api.route('/public-config', methods=['GET'])
+def public_config():
     """
-    Public, unauthenticated — deliberately the *only* portal setting exposed
-    without a key. The portal's own public pages (landing.php) need the
-    configured site name before a visitor has ever logged in, and site name
-    is not sensitive: it's already visible in every page's own title/header
-    once loaded. Nothing else from portal_settings (portal_url, admin
-    promotion flags, etc.) belongs in an unauthenticated response — add to
-    this deliberately if a future public page needs one more specific field,
-    don't just return the whole settings dict here.
+    Public, unauthenticated — the small set of portal config values needed
+    before a visitor has ever logged in (site branding on pre-login pages,
+    the trusted-device cookie duration set partway through the login flow
+    itself), plus a couple of values the portal's read-only Settings page
+    displays for transparency (portal_url, allow_admin_promotion — the
+    latter so an admin can see the portal-side and API-side locks actually
+    agree, since they're deliberately two separate config values, not one
+    fetched value, given one's a UI affordance and the other's the real
+    enforcement). None of this is sensitive — all of it either has no
+    security implication (site name, portal URL) or is already visible in
+    the portal's own rendered pages once loaded. Extend deliberately if a
+    future page needs one more specific field, don't widen this into a
+    general config dump.
     """
-    try:
-        settings = db_manager.get_portal_settings()
-        return jsonify({'site_name': settings.get('site_name') or 'ephemeralREST'})
-    except Exception as e:
-        logger.error(f"Branding endpoint error: {str(e)}", exc_info=True)
-        return jsonify({'site_name': 'ephemeralREST'})
+    import os
+    from config import Config
+    return jsonify({
+        'site_name':             Config.SITE_NAME,
+        'trusted_device_days':   Config.TRUSTED_DEVICE_DAYS,
+        'portal_url':            os.environ.get('PORTAL_URL', ''),
+        'allow_admin_promotion': Config.ALLOW_ADMIN_PROMOTION,
+    })
 
 
 
@@ -1935,6 +1942,15 @@ def admin_set_key_admin(key_id):
     data  = request.get_json(silent=True) or {}
     admin = bool(data.get('admin', False))
 
+    # Only gates granting admin status, not revoking it — a lockdown on
+    # promotion shouldn't also block someone demoting a compromised or
+    # over-privileged key. Enforced here, not just hidden in the portal
+    # UI, since the portal-only check was bypassable by calling this
+    # endpoint directly with any valid admin key.
+    from config import Config
+    if admin and not Config.ALLOW_ADMIN_PROMOTION:
+        return _error('Admin promotion is disabled on this deployment (ALLOW_ADMIN_PROMOTION=false)', 403)
+
     if key_id == int(user.get('id', 0)):
         return _error('You cannot modify your own admin status', 400)
 
@@ -2736,76 +2752,18 @@ def admin_clear_smtp():
 
 
 # ---------------------------------------------------------------------------
-# Admin — Portal settings
+# Note: portal settings (site_name, session_timeout, trusted_device_days,
+# allow_admin_promotion, portal_url, logout_redirect_url, site_version) used
+# to be admin-editable here, backed by the portal_settings table. They're
+# now config-only (see config.py's .env template) — deliberately not
+# editable via the portal at all, since several of them are either
+# deployment-time constants that don't need runtime editing, or security
+# locks that shouldn't be changeable by anyone with mere portal access.
+# database.py's get_portal_settings()/set_portal_settings()/
+# reset_portal_setting() and the portal_settings table itself are left in
+# place (unused by any route now) in case a genuinely different setting
+# benefits from DB-backed editability in the future.
 # ---------------------------------------------------------------------------
-
-@api.route('/admin/portal-settings', methods=['GET'])
-def admin_get_portal_settings():
-    """
-    Return all portal settings with their current values and defaults.
-    Admin only.
-    """
-    user = getattr(g, 'user', {})
-    if not user.get('admin'):
-        return _error('Admin access required', 403)
-
-    settings  = db_manager.get_portal_settings()
-    defaults  = db_manager.PORTAL_SETTINGS_DEFAULTS
-
-    return jsonify({
-        'settings': settings,
-        'defaults': defaults,
-    })
-
-
-@api.route('/admin/portal-settings', methods=['POST'])
-def admin_set_portal_settings():
-    """
-    Update one or more portal settings. Admin only.
-
-    Body: { "setting_key": value, ... }
-
-    Allowed keys: site_name, site_version, session_timeout,
-    logout_redirect_url, allow_admin_promotion, trusted_device_days,
-    portal_url
-    """
-    user = getattr(g, 'user', {})
-    if not user.get('admin'):
-        return _error('Admin access required', 403)
-
-    data = request.get_json(silent=True) or {}
-    if not data:
-        return _error('No settings provided', 400)
-
-    allowed = set(db_manager.PORTAL_SETTINGS_DEFAULTS.keys())
-    unknown = set(data.keys()) - allowed
-    if unknown:
-        return _error(f"Unknown settings: {', '.join(sorted(unknown))}", 400)
-
-    db_manager.set_portal_settings(data)
-    logger.info(f"Admin [{user.get('identifier')}] updated portal settings: {list(data.keys())}")
-
-    return jsonify({
-        'message':  'Portal settings updated',
-        'settings': db_manager.get_portal_settings(),
-    })
-
-
-@api.route('/admin/portal-settings/<key>', methods=['DELETE'])
-def admin_reset_portal_setting(key):
-    """Reset a single portal setting to its built-in default. Admin only."""
-    user = getattr(g, 'user', {})
-    if not user.get('admin'):
-        return _error('Admin access required', 403)
-
-    if not db_manager.reset_portal_setting(key):
-        return _error(f"Unknown setting '{key}'", 400)
-
-    logger.info(f"Admin [{user.get('identifier')}] reset portal setting '{key}' to default")
-    return jsonify({
-        'message':  f"Setting '{key}' reset to default",
-        'settings': db_manager.get_portal_settings(),
-    })
 
 
 @api.route('/locations/resolve', methods=['POST'])

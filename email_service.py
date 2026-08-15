@@ -113,17 +113,9 @@ class EmailService:
         self.base_url    = cfg['base_url'].rstrip('/')
         # portal_url resolution order:
         #   1. smtp_config table (set via admin SMTP page)
-        #   2. portal_settings table (set via admin Portal Settings page)
-        #   3. PORTAL_URL env var
-        #   4. base_url fallback (wrong for portal links — logs a warning)
+        #   2. PORTAL_URL env var
+        #   3. base_url fallback (wrong for portal links — logs a warning)
         _portal_url = cfg.get('portal_url', '').strip()
-        if not _portal_url:
-            try:
-                from database import create_database_manager
-                _ps = create_database_manager().get_portal_settings()
-                _portal_url = _ps.get('portal_url', '').strip()
-            except Exception:
-                pass
         if not _portal_url:
             _portal_url = os.environ.get('PORTAL_URL', '').strip()
         if _portal_url:
@@ -132,7 +124,7 @@ class EmailService:
             self.portal_url = self.base_url
             logger.warning(
                 "portal_url is not configured — email links will use the API URL (%s) "
-                "instead of the portal URL. Set Portal URL in Settings → Portal Settings.",
+                "instead of the portal URL. Set PORTAL_URL in .env.",
                 self.base_url
             )
         self.enabled     = bool(self.host and self.user and self.password)

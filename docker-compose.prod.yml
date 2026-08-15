@@ -48,6 +48,24 @@ services:
       - RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR:-50}
       - RATE_LIMIT_PER_DAY=${RATE_LIMIT_PER_DAY:-200}
       - CACHE_EXPIRY_DAYS=${CACHE_EXPIRY_DAYS:-90}
+      # Public URL of the portal — used to build password-reset and
+      # verification email links. Without this, those emails link to the
+      # API instead of the portal (wrong — the API has no /verify.php or
+      # /set-password.php page for them to land on).
+      - PORTAL_URL=${PORTAL_URL:-}
+      # Days a "remember this device" cookie/token stays valid — governs
+      # both this API's own token expiry and the portal's cookie (fetched
+      # live via /public-config), a single source of truth for both.
+      - TRUSTED_DEVICE_DAYS=${TRUSTED_DEVICE_DAYS:-28}
+      # Portal branding shown on every page, including pre-login — set
+      # here (not in ephemeralADMIN's own .env) since this is the single
+      # source of truth /public-config serves to the portal.
+      - SITE_NAME=${SITE_NAME:-ephemeralREST}
+      # Whether the API allows granting admin status at all — enforced
+      # here regardless of what the portal's own UI shows, so this is the
+      # value that actually matters for this lock. See ephemeralADMIN's
+      # own ALLOW_ADMIN_PROMOTION, which should normally match.
+      - ALLOW_ADMIN_PROMOTION=${ALLOW_ADMIN_PROMOTION:-true}
     volumes:
       # Swiss Ephemeris data files are never baked into the image — they're
       # mounted from the host on every box that runs this, test or prod.
@@ -101,6 +119,13 @@ services:
       # https://api.yourdomain.com. Falls back to API_BASE (the internal
       # address above) if left unset, so this is optional.
       - API_PUBLIC_URL=${API_PUBLIC_URL:-}
+      # Portal branding/behaviour — all optional, fall back to config.php's
+      # own defaults if unset. See ephemeralADMIN/.env.example.
+      - SITE_NAME=${PORTAL_SITE_NAME:-}
+      - SITE_VERSION=${PORTAL_SITE_VERSION:-}
+      - SESSION_TIMEOUT=${PORTAL_SESSION_TIMEOUT:-}
+      - ALLOW_ADMIN_PROMOTION=${PORTAL_ALLOW_ADMIN_PROMOTION:-}
+      - LOGOUT_REDIRECT_URL=${PORTAL_LOGOUT_REDIRECT_URL:-}
     volumes:
       - admin-app:/var/www/html
     depends_on:

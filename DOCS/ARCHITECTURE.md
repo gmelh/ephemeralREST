@@ -464,7 +464,7 @@ Migrations (SQLite only) run inline: `PRAGMA table_info` checks column presence,
 | Table | Purpose |
 |---|---|
 | `smtp_config` | Key/value SMTP settings. Loaded fresh on each email send |
-| `portal_settings` | Key/value portal behaviour settings. Cached in PHP session |
+| `portal_settings` | Unused by any route (see §11) — kept in case a future setting benefits from DB-backed editability |
 | `email_templates` | Per-template styling and content overrides |
 
 ### Federated service access
@@ -574,11 +574,10 @@ With `USE_GOOGLE=false`, Google calls are replaced by cities5000 lookups.
 Email links to the portal (`verify.php`, `set-password.php`) use `self.portal_url`, resolved in this order:
 
 1. `smtp_config` table `portal_url` field
-2. `portal_settings` table `portal_url` field
-3. `PORTAL_URL` environment variable
-4. `self.base_url` fallback — **wrong for portal links** — logs a warning
+2. `PORTAL_URL` environment variable
+3. `self.base_url` fallback — **wrong for portal links** — logs a warning
 
-Always configure `portal_url` via Settings → Portal Settings, or set `PORTAL_URL` in `.env`.
+Set `PORTAL_URL` in `.env` — this is config-only (see §11), not editable from the portal.
 
 ### Template system
 
@@ -610,28 +609,54 @@ Every email type (except raw 2FA codes) can be customised via the Email Template
 
 ## 11. Portal settings
 
-Portal behaviour is configurable at runtime without touching files. Settings are stored in the `portal_settings` database table (key/value) with built-in defaults in `DatabaseManager.PORTAL_SETTINGS_DEFAULTS`.
+Portal behaviour is **config-only, not editable from within the portal** —
+deliberately. This wasn't always true: an earlier version stored these in
+a `portal_settings` database table with a Settings page to edit them
+live. Two problems with that: pre-login pages (login, 2FA, etc.) couldn't
+show the configured site name at all, since fetching it required already
+being logged in — an unfixable chicken-and-egg problem for anything that
+needs to work before authentication — and `allow_admin_promotion` was
+*only* enforced by hiding a button in the portal UI, meaning anyone with
+a valid admin API key could bypass the lock entirely by calling the API
+directly. `portal_settings` (the table, and `DatabaseManager`'s
+`get_portal_settings()`/`set_portal_settings()`/`reset_portal_setting()`
+methods) still exist, unused by any route, in case a genuinely different
+setting benefits from DB-backed editability later — nothing currently
+uses them.
 
-| Setting | Default | Description |
+Each setting now lives in exactly one of two places:
+
+| Setting | Lives in | Why there |
 |---|---|---|
-| `site_name` | `ephemeralREST` | Displayed in browser title and sidebar |
-| `site_version` | `1.0` | Shown in sidebar footer |
-| `session_timeout` | `1800` | PHP session idle timeout in seconds |
-| `trusted_device_days` | `28` | Trusted-device cookie lifetime |
-| `allow_admin_promotion` | `true` | Whether admins can promote/demote other admins via portal |
-| `logout_redirect_url` | `/login.php` | Where to redirect after sign-out |
-| `portal_url` | `''` | Public URL of the portal (used in email links) |
+| `SITE_NAME` | ephemeralREST `.env` | Needs cross-language visibility — every portal page, logged in or not, needs the same answer |
+| `TRUSTED_DEVICE_DAYS` | ephemeralREST `.env` | Governs both the portal's cookie *and* the API's own token expiry — a single source of truth, not two values that can silently drift |
+| `PORTAL_URL` | ephemeralREST `.env` | Already API-primary (used to build email links) |
+| `ALLOW_ADMIN_PROMOTION` | **both** ephemeralREST `.env` *and* `ephemeralADMIN/config.php` | Deliberately two separate values, not one fetched value — the portal's only controls whether the Keys page *offers* the option; the API's is the actual enforcement, checked in `admin_set_key_admin` regardless of whether the portal UI is bypassed. Set both together. |
+| `SITE_VERSION` | `ephemeralADMIN/config.php` | Purely a portal display value — the API has no concept of "portal version" |
+| `SESSION_TIMEOUT` | `ephemeralADMIN/config.php` | Purely portal-side — the API has no concept of a browser session |
+| `LOGOUT_REDIRECT_URL` | `ephemeralADMIN/config.php` | Purely local portal navigation |
 
-The PHP portal reads these via `portal_settings_get()` (in `includes/api.php`), which caches the result in `$_SESSION['portal_settings']` for the duration of the session. After saving via the portal's Settings page, the cache is immediately busted with `unset($_SESSION['portal_settings'])`.
+The three values that live on the API side are exposed via
+`GET /public-config` — deliberately public and unauthenticated, since
+pre-login pages need them before any session exists. It returns exactly
+`site_name`, `trusted_device_days`, `portal_url`, and
+`allow_admin_promotion` (the API's own value, for the drift-check below)
+— nothing else from `Config` belongs in an unauthenticated response.
 
-Endpoints: `GET /admin/portal-settings`, `POST /admin/portal-settings`, `DELETE /admin/portal-settings/<key>`.
+The PHP portal fetches these via `public_portal_config()` (in
+`includes/api.php`), session-cached, with `site_name_public()` and
+`trusted_device_days_public()` as thin wrappers for the two most commonly
+used values. Every page uses the same mechanism — pre-login pages and
+authenticated pages alike — which is exactly what fixes the original
+"login page doesn't show the custom site name" problem: there's no longer
+a separate DB-gated code path that only worked post-login.
 
-`config.php` in the portal now contains **only two values**:
-```php
-define('API_BASE',  'https://api.yourdomain.com');
-define('SITE_NAME', 'ephemeralREST');
-```
-Everything else is controlled via the portal settings UI.
+`portal-settings.php` is now a **read-only status page** — no form, no
+save button. It displays each value plus which file/variable actually
+controls it, and for `allow_admin_promotion` specifically, shows *both*
+the portal's and the API's configured value side by side with a visible
+warning if they disagree — since silent drift there is exactly the kind
+of thing worth surfacing rather than hiding.
 
 ---
 
@@ -654,10 +679,9 @@ Routes are organised in this order in `routes.py`:
 | Self-service | `GET /me`, `GET/POST /me/output`, `POST /me/rotate`, `POST /me/forget-device` |
 | Admin — keys | `GET /admin/keys`, `GET/DELETE /admin/keys/<id>`, `/disable`, `/enable`, `/rotate`, `/limits`, `/output`, `/force-password-reset` |
 | Admin — config | `GET/POST /admin/class-limits`, `GET/POST/DELETE /admin/smtp`, `POST /admin/smtp/test` |
-| Admin — portal | `GET/POST /admin/portal-settings`, `DELETE /admin/portal-settings/<key>` |
 | Admin — templates | `GET/POST /admin/email-templates/<name>`, `POST /admin/email-templates/<name>/reset` |
 
-**Public endpoints** (no `X-API-Key` required): `/setup/status`, `/setup`, `/register`, `/register/verify`, `/login`, `/login/2fa`, `/password/forgot`, `/password/set`, `/ping`, `/autocomplete`, `/chart/<id>` (public for sharing), `GET /views?v=<uuid>`.
+**Public endpoints** (no `X-API-Key` required): `/setup/status`, `/setup`, `/register`, `/register/verify`, `/login`, `/login/2fa`, `/password/forgot`, `/password/set`, `/ping`, `/public-config`, `/autocomplete`, `/chart/<id>` (public for sharing), `GET /views?v=<uuid>`.
 
 ---
 

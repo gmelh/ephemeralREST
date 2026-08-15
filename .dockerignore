@@ -1,0 +1,38 @@
+.git
+.gitignore
+.env
+
+# Local databases and logs — these live on Docker volumes at runtime
+# (ephemeral-data, ephemeral-logs), never baked into the image. Excluding
+# them here also keeps local test artifacts (astro.db, ephemeral.db, etc.
+# from running this outside Docker) out of the build entirely.
+*.db
+*.log
+logs/
+
+# Swiss Ephemeris data files — volume-mounted at runtime (./sweph in
+# docker-compose.yml), not baked into the image. Excluding these keeps
+# build context size and image size down; the Dockerfile itself creates
+# an empty sweph/ directory for the volume to mount over.
+sweph/*.se1
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Virtual environments — never relevant inside the container
+venv/
+.venv/
+env/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

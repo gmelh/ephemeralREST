@@ -152,6 +152,25 @@ API_BASE_URL=http://localhost:5000
 # URL of the admin portal — used in set-password and password-reset emails.
 # Must point to the portal server, not the API.
 PORTAL_URL=http://localhost:3000
+
+# -----------------------------------------------------------------------------
+# Portal branding and behaviour
+# These are read by the portal on every relevant page load (including
+# pre-login pages, via the public /public-config endpoint) — deliberately
+# config-only, not editable from within the portal itself, since they're
+# either deployment-time constants (site name) or security-relevant locks
+# (admin promotion) that shouldn't be changeable by anyone who merely has
+# portal access.
+# -----------------------------------------------------------------------------
+# Shown in the portal's title, header, and sidebar — including pre-login
+# pages (login, 2FA, etc.), via the public /public-config endpoint.
+SITE_NAME=ephemeralREST
+
+# Whether the portal's Keys page is allowed to grant admin status to other
+# keys at all. Set to false to lock this down entirely once your admin
+# accounts are established — enforced here (not just hidden in the portal
+# UI), so it can't be bypassed by calling the API directly.
+ALLOW_ADMIN_PROMOTION=true
 """
 
 
@@ -245,6 +264,12 @@ class Config:
     # Login / 2FA / trusted devices
     TRUSTED_DEVICE_DAYS             = int(os.environ.get('TRUSTED_DEVICE_DAYS', '28'))
     TWO_FACTOR_CODE_EXPIRY_MINUTES  = int(os.environ.get('TWO_FACTOR_CODE_EXPIRY_MINUTES', '10'))
+
+    # Portal branding and behaviour — deliberately config-only (see the
+    # .env template above for why), read by the portal via /public-config
+    # and enforced server-side here for ALLOW_ADMIN_PROMOTION specifically.
+    SITE_NAME              = os.environ.get('SITE_NAME', 'ephemeralREST')
+    ALLOW_ADMIN_PROMOTION  = os.environ.get('ALLOW_ADMIN_PROMOTION', 'true').strip().lower() in ('true', '1', 'yes')
 
     @classmethod
     def validate(cls):
