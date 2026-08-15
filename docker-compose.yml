@@ -22,6 +22,16 @@ services:
       - FLASK_DEBUG=${FLASK_DEBUG:-False}
       - SECRET_KEY=${SECRET_KEY}
       - GOOGLE_MAPS_API_KEY=${GOOGLE_MAPS_API_KEY}
+      - USE_GOOGLE=${USE_GOOGLE:-true}
+      # Public URL of this API itself — used as email_service.py's
+      # last-resort fallback if PORTAL_URL is ever unset. Should normally
+      # match your real public API domain, same reasoning as
+      # API_PUBLIC_URL further down for the portal.
+      - API_BASE_URL=${API_BASE_URL:-http://localhost:5000}
+      - CITIES_FOLDER=${CITIES_FOLDER:-./cities}
+      - CORS_METHODS=${CORS_METHODS:-GET,POST,PUT,DELETE,OPTIONS}
+      - CORS_HEADERS=${CORS_HEADERS:-Content-Type,Authorization,X-Requested-With,X-API-Key}
+      - TWO_FACTOR_CODE_EXPIRY_MINUTES=${TWO_FACTOR_CODE_EXPIRY_MINUTES:-10}
       # Database: DB_TYPE=sqlite (default) needs no further setup — the
       # file below is created automatically and lives on the ephemeral-data
       # volume. Set DB_TYPE=mysql (plus the MYSQL_* values) to run against
