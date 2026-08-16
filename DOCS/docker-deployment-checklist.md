@@ -81,27 +81,44 @@ Both should exist.
 
 ## Phase 3 — Swiss Ephemeris data files
 
-The API needs the `.se1` ephemeris data files present before it will start.
+The API needs the `.se1` ephemeris data files present before chart
+calculations will work. **The container will start fine and pass its
+health check without them** — only actual calculations fail, silently
+returning `null` for every planet. Don't mistake a healthy container for
+a working one; this step is easy to skip without noticing.
 
 ```bash
-cd ~/ephemeral/ephemeralREST
-mkdir -p sweph
-# Copy or download your .se1 files into ./sweph/
+cd ~/ephemeral/ephemeralREST/sweph
+curl -L -O https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/sepl_18.se1
+curl -L -O https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/semo_18.se1
+curl -L -O https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/seas_18.se1
 ```
+(The original `astro.com/ftp/sweph/ephe/` path no longer serves these
+directly — this GitHub mirror is the current, verified-working source.)
 
 **Checkpoint:**
 ```bash
-ls sweph/*.se1 | head -5
+ls -la sweph/*.se1
 ```
-Should list at least one file. If this directory is empty, the API
-container will start but chart calculations will fail — don't skip this.
+Should list all three files, each a real size (hundreds of KB to a
+couple MB — not a few bytes, which would mean the download silently
+saved an error page instead of the actual file). Then actually verify
+against a real calculation, not just file presence:
+```bash
+docker compose exec ephemeral-rest python3 -c "
+import swisseph as swe
+swe.set_ephe_path('/app/sweph')
+print(swe.calc_ut(2440587.5, swe.SUN, swe.FLG_SWIEPH))
+"
+```
+Should print real coordinates, not raise an exception.
 
 ---
 
 ## Phase 4 — MySQL setup (same-VPS installation)
 
 Skip this whole phase if you're pointing at a separate managed database —
-just note its hostname for Phase 6.
+just note its hostname for Phase 7.
 
 A Docker container's "localhost" is itself, not the host machine, so
 MySQL needs to be reachable a different way, and that requires opening it
@@ -124,16 +141,29 @@ bind-address = 0.0.0.0
 sudo systemctl restart mysql
 ```
 
-**2. Firewall port 3306 immediately** — MySQL is now listening on the
-VPS's public interface too, and nothing outside this VPS should ever
-reach it directly:
+**2. Firewall port 3306 — but scoped, not blanket.** MySQL is now
+listening on the VPS's public interface too, and nothing outside this VPS
+should ever reach it directly — but a bare `ufw deny 3306` would *also*
+block the one connection that's actually supposed to get through: the
+`ephemeral-rest` container talking to MySQL via `host.docker.internal`.
+That connection arrives at the host on the Docker bridge network, which a
+blanket deny doesn't distinguish from the public internet.
+
+`docker-compose.yml` pins the Compose network to a fixed subnet
+(`172.28.0.0/16`) specifically so this rule can be written now, correctly
+scoped, even though the network itself doesn't exist yet until Phase 10's
+first `docker compose up`. Add the allow rule *before* the deny rule —
+`ufw` evaluates top-down, first match wins:
 
 ```bash
+sudo ufw allow from 172.28.0.0/16 to any port 3306
 sudo ufw deny 3306
 ```
 
 (If your VPS provider uses a separate cloud firewall/security group
-instead of, or in addition to, `ufw`, block port 3306 there as well.)
+instead of, or in addition to, `ufw`, block port 3306 there as well — that
+layer only needs to block the public internet too, not the Docker bridge,
+which never leaves the VPS.)
 
 **3. Create the database and a user Docker can actually connect as.**
 `'ephemeral'@'localhost'` won't match a connection arriving from the
@@ -157,13 +187,61 @@ sudo ss -ltnp | grep 3306
 ```
 Should show MySQL listening on `0.0.0.0:3306` (not `127.0.0.1:3306`).
 ```bash
-sudo ufw status | grep 3306
+sudo ufw status numbered | grep 3306
 ```
-Should show `3306 DENY`.
+Should show two rules — `ALLOW` for `172.28.0.0/16` listed *above* the
+`DENY` rule (order matters; if `DENY` appears first, delete both with
+`sudo ufw delete <number>` and re-add in the order shown above).
 
 ---
 
-## Phase 5 — DNS
+## Phase 5 — Firewall for incoming traffic
+
+Set this up now, before DNS and certbot — not after. Certbot's
+`--standalone` mode (used in Phase 8) needs port 80 reachable from the
+internet to complete Let's Encrypt's challenge; if the firewall isn't
+already open by then, that step times out. This also isn't just your own
+VPS's OS-level firewall — most VPS providers additionally enforce a
+*separate*, network-level firewall (Vultr's "Firewall Groups,"
+DigitalOcean's "Cloud Firewalls," AWS "Security Groups," etc.) that's
+invisible from inside the machine entirely; check your provider's control
+panel too, not just the commands below.
+
+```bash
+sudo ufw allow 22/tcp      # don't lock yourself out of SSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+```
+
+Port 8080 (the no-domain quick-start portal port) doesn't need to be
+opened externally if you're only accessing the portal via its real domain
+on 443 — leave it closed unless you specifically want that fallback
+reachable from outside the VPS too.
+
+**Checkpoint:**
+```bash
+sudo ufw status
+```
+Should show 22, 80, and 443 as `ALLOW`, plus the two 3306 rules from
+Phase 4 (`ALLOW` for `172.28.0.0/16`, `DENY` for everything else).
+
+Then test reachability from *outside* the VPS — testing against
+`localhost` on the box itself will falsely succeed even if external
+traffic is actually blocked:
+```bash
+# from your own laptop, not the VPS:
+curl -v http://<VPS public IP>
+```
+A connection timeout here (as opposed to a fast "connection refused," or
+an HTTP response of any kind) usually means the provider's separate
+network-level firewall, not `ufw`, is still blocking it — nothing's
+listening on 80 yet at this point in the checklist anyway, so what you're
+really testing is just "can traffic reach this box on this port at all."
+
+---
+
+## Phase 6 — DNS
 
 Point A records for both domains at this VPS's public IP address, in
 whatever DNS provider you use for the domain:
@@ -180,12 +258,12 @@ VPS from the VPS itself:
 dig +short api.yourdomain.com
 dig +short admin.yourdomain.com
 ```
-Both should print your VPS's IP. Don't move on to Phase 7 (certbot) until
+Both should print your VPS's IP. Don't move on to Phase 8 (certbot) until
 this checkpoint passes — certbot's domain validation will fail otherwise.
 
 ---
 
-## Phase 6 — Environment configuration
+## Phase 7 — Environment configuration
 
 ```bash
 cd ~/ephemeral/ephemeralREST
@@ -232,7 +310,7 @@ Should show a 64-character hex string, not blank.
 
 ---
 
-## Phase 7 — Certificates (Let's Encrypt / certbot)
+## Phase 8 — Certificates (Let's Encrypt / certbot)
 
 nginx isn't running yet, so `--standalone` (which briefly binds port 80
 itself) is the simplest way to get the first certificate — one
@@ -274,7 +352,7 @@ further action from you.
 
 ---
 
-## Phase 8 — Point the config at your real domains
+## Phase 9 — Point the config at your real domains
 
 `nginx.conf` ships with placeholder domains. Replace them with your real
 ones (each appears twice — once in the HTTP→HTTPS redirect block, once in
@@ -295,28 +373,6 @@ grep -c "yourdomain.com" nginx.conf
 ```
 Should print `0` — if it doesn't, the placeholder text is still in there
 somewhere.
-
----
-
-## Phase 9 — Firewall for the actual traffic
-
-```bash
-sudo ufw allow 22/tcp      # don't lock yourself out of SSH
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
-sudo ufw enable
-```
-
-Port 8080 (the no-domain quick-start portal port) doesn't need to be
-opened externally if you're only accessing the portal via its real domain
-on 443 — leave it closed unless you specifically want that fallback
-reachable from outside the VPS too.
-
-**Checkpoint:**
-```bash
-sudo ufw status
-```
-Should show 22, 80, and 443 as `ALLOW`, and 3306 as `DENY` (from Phase 4).
 
 ---
 
@@ -452,7 +508,7 @@ own firewall. **Do not point production at the same database you used for
 testing** — every key, chart, and admin account created while testing
 would become live production data.
 
-Then, instead of Phase 6's plain `.env`, add the registry/version
+Then, instead of Phase 7's plain `.env`, add the registry/version
 variables so `docker-compose.prod.yml` knows what to pull:
 
 ```bash
@@ -462,7 +518,7 @@ nano .env
 ```bash
 REGISTRY=docker.io/yourusername
 IMAGE_TAG=<the $VERSION value from Phase 13's checkpoint>
-# ...plus everything else from Phase 6: SECRET_KEY, DB_TYPE, MYSQL_*,
+# ...plus everything else from Phase 7: SECRET_KEY, DB_TYPE, MYSQL_*,
 # PORTAL_URL, CORS_ORIGINS — all production-specific values, not copied
 # from the test box's .env.
 ```
@@ -512,8 +568,25 @@ Most common causes: MySQL connection refused (check Phase 4's checkpoint
 again — did `mysqld.cnf` actually reload? did the firewall rule land?),
 or missing `sweph/*.se1` files (Phase 3).
 
+**"Can't connect to host.docker.internal:3306" specifically.** Two
+likely causes, in order of likelihood:
+
+1. The `ufw allow from 172.28.0.0/16` rule from Phase 4 is missing or
+   landed *after* the `deny 3306` rule rather than before it (`ufw`
+   matches top-down, first rule wins):
+   ```bash
+   sudo ufw status numbered
+   ```
+2. `extra_hosts` only takes effect when a container is *created*, not on
+   one already running — if `ephemeral-rest` started before this setting
+   existed in `docker-compose.yml`, or hasn't been recreated since:
+   ```bash
+   docker compose exec ephemeral-rest getent hosts host.docker.internal
+   ```
+   Should print an IP. If it doesn't: `docker compose up -d --force-recreate ephemeral-rest`.
+
 **Certbot fails domain validation.** Almost always DNS hasn't propagated
-yet, or the A record points at the wrong IP — re-run the Phase 5
+yet, or the A record points at the wrong IP — re-run the Phase 6
 checkpoint (`dig +short`) before retrying certbot.
 
 **Portal loads but can't reach the API (login always fails).** Check

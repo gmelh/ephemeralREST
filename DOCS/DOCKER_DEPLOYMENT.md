@@ -376,19 +376,19 @@ date_default_timezone_set('UTC');
 
 ephemeralREST uses the Swiss Ephemeris library to perform planetary calculations. The library requires binary data files (`.se1`) which are not included in the repository.
 
-Download them from Astrodienst's FTP server. For dates spanning roughly 1800–2400 CE, you need three files per epoch:
+Download them from GitHub — the original Astrodienst FTP path no longer serves these files directly. For dates spanning roughly 1800–2400 CE, you need three files per epoch:
 
 ```bash
 cd ~/ephemeral/ephemeralREST/sweph
 
 # Main planets
-curl -O https://www.astro.com/ftp/sweph/ephe/sepl_18.se1
+curl -L -O https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/sepl_18.se1
 
 # Moon
-curl -O https://www.astro.com/ftp/sweph/ephe/semo_18.se1
+curl -L -O https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/semo_18.se1
 
 # Asteroids / extra bodies
-curl -O https://www.astro.com/ftp/sweph/ephe/seas_18.se1
+curl -L -O https://raw.githubusercontent.com/aloistr/swisseph/master/ephe/seas_18.se1
 
 cd ~/ephemeral
 ```

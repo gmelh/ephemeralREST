@@ -2901,12 +2901,15 @@ class DatabaseManager:
     def resolve_city(self, query: str) -> Optional[Dict[str, Any]]:
         """
         Best-match city for a query string — used for offline geocoding.
-        Tries exact ascii_name match first, then prefix match.
+        Tries exact ascii_name match first, then prefix match. If the
+        query contains a comma (e.g. "Berlin, Germany"), also retries
+        using just the part before the first comma if the full string
+        didn't match anything — city names essentially never contain a
+        literal comma, so the full-string attempt first is just a safe,
+        cheap check before assuming it's a "City, Country" split.
         Returns the highest-population match, or None if no results.
         """
-        normalised = query.strip().lower()
-        with self.get_connection() as conn:
-            # Exact match first
+        def _match(conn, normalised: str) -> Optional[Dict[str, Any]]:
             row = conn.execute('''
                 SELECT geoname_id, name, ascii_name, country_code,
                        admin1_code, latitude, longitude, timezone_id, population
@@ -2917,7 +2920,6 @@ class DatabaseManager:
             ''', (normalised,)).fetchone()
 
             if not row:
-                # Prefix match fallback
                 row = conn.execute('''
                     SELECT geoname_id, name, ascii_name, country_code,
                            admin1_code, latitude, longitude, timezone_id, population
@@ -2926,6 +2928,17 @@ class DatabaseManager:
                     ORDER BY population DESC
                     LIMIT 1
                 ''', (normalised + '%',)).fetchone()
+
+            return row
+
+        normalised = query.strip().lower()
+        with self.get_connection() as conn:
+            row = _match(conn, normalised)
+
+            if not row and ',' in normalised:
+                city_only = normalised.split(',', 1)[0].strip()
+                if city_only:
+                    row = _match(conn, city_only)
 
         return dict(row) if row else None
 
