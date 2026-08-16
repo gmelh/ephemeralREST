@@ -123,3 +123,8 @@ docker-compose.override.yml
 tmp/
 temp/
 *.tmp
+
+# zips
+ephemeral.rest.zip
+*.zip
+
