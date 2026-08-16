@@ -83,6 +83,9 @@ services:
       # deployment checklist); the image being identical to what you tested
       # doesn't help if this directory is empty.
       - ./sweph:/app/sweph:ro
+      # Not :ro — see docker-compose.yml for why (the app deletes the
+      # source file itself once the one-time import completes).
+      - ./cities:/app/cities
       - ephemeral-data:/app/data
       - ephemeral-logs:/app/logs
     extra_hosts:

@@ -76,6 +76,14 @@ services:
       - ALLOW_ADMIN_PROMOTION=${ALLOW_ADMIN_PROMOTION:-true}
     volumes:
       - ./sweph:/app/sweph:ro
+      # Not :ro — the app deletes the source .txt file itself once the
+      # one-time cities5000 import completes (see app.py's
+      # _import_cities_if_pending). Drop a GeoNames cities5000.txt here
+      # to trigger an import on next container start; leave empty the
+      # rest of the time. Data persists in the database afterward, on
+      # the same volume as everything else — this mount doesn't need
+      # anything in it on a normal restart.
+      - ./cities:/app/cities
       # Only used when DB_TYPE=sqlite (the default). Unused, but harmless,
       # when running against external MySQL.
       - ephemeral-data:/app/data
