@@ -160,6 +160,9 @@ volumes:
 
 networks:
   ephemeral-network:
+    # Pinned to the literal name "ephemeral-network" — see
+    # docker-compose.yml's matching comment for why this matters.
+    name: ephemeral-network
     driver: bridge
     ipam:
       config:

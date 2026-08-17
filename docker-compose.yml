@@ -185,6 +185,13 @@ volumes:
 
 networks:
   ephemeral-network:
+    # Pinned to the literal name "ephemeral-network" — without this,
+    # Docker Compose prefixes the network with the project name (e.g.
+    # ephemeralrest_ephemeral-network, varying by which directory `docker
+    # compose` is run from), which breaks any other stack (marketREST,
+    # future federated services) that references it as
+    # `external: true` expecting the literal name.
+    name: ephemeral-network
     driver: bridge
     ipam:
       config:
