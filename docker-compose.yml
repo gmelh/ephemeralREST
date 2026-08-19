@@ -170,6 +170,7 @@ services:
       - LOGOUT_REDIRECT_URL=${PORTAL_LOGOUT_REDIRECT_URL:-}
     volumes:
       - admin-app:/var/www/html
+      - ./federation-config:/data/federation:ro
     depends_on:
       - ephemeral-rest
     networks:
