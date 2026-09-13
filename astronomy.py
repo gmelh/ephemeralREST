@@ -309,7 +309,11 @@ class AstronomyService:
             output_config = {}
 
         try:
-            base_flags = swe.FLG_SWIEPH
+            # FLG_SPEED is required or swe.calc_ut() returns 0.0 for the
+            # speed fields (index 3-5), which silently broke retrograde
+            # (always False) and longitude/latitude/declination speed
+            # (always 0.0) for every body in every chart.
+            base_flags = swe.FLG_SWIEPH | swe.FLG_SPEED
             if heliocentric:
                 base_flags |= swe.FLG_HELCTR
 
@@ -566,8 +570,10 @@ class AstronomyService:
 
         Returns:
             Tuple of (result_dict, error_message)
-            result_dict keys: planetary_positions (geocentric, heliocentric), house_cusps,
-                              solar_arc_geo, solar_arc_helio,
+            result_dict keys: planetary_positions (geocentric, heliocentric) — each
+                              body's natal longitude advanced by the arc, in the
+                              same per-body shape as /calculate and progressions —
+                              plus house_cusps, solar_arc_geo, solar_arc_helio,
                               progressed_jd, natal_jd, days_elapsed, method
         """
         if output_config is None:
@@ -681,20 +687,26 @@ class AstronomyService:
                             directed_lon, natal_pos, helio_arc, output_config=cfg
                         )
 
-            result = {
-                'method':          'solar_arc_directions',
-                'solar_arc_geo':   round(geo_arc, 6)   if geo_arc   is not None else None,
-                'solar_arc_helio': round(helio_arc, 6) if helio_arc is not None else None,
-                'progressed_jd':   progressed_jd,
-                'natal_jd':        natal_jd,
-                'days_elapsed':    days_elapsed,
-                'house_cusps':     directed_cusps if cfg.get('geocentric', True) else None,
-            }
-
+            # Nest directed positions under 'planetary_positions', matching the
+            # shape returned by calculate_planetary_positions / secondary
+            # progressions, so routes.py's generic handling (and the
+            # /derived/<id> retrieval path) picks these up the same way.
+            planetary_positions = {}
             if cfg.get('geocentric', True):
-                result['geocentric']   = directed_geo
+                planetary_positions['geocentric']   = directed_geo
             if cfg.get('heliocentric', True):
-                result['heliocentric'] = directed_helio
+                planetary_positions['heliocentric'] = directed_helio
+
+            result = {
+                'method':               'solar_arc_directions',
+                'solar_arc_geo':        round(geo_arc, 6)   if geo_arc   is not None else None,
+                'solar_arc_helio':      round(helio_arc, 6) if helio_arc is not None else None,
+                'progressed_jd':        progressed_jd,
+                'natal_jd':             natal_jd,
+                'days_elapsed':         days_elapsed,
+                'house_cusps':          directed_cusps if cfg.get('geocentric', True) else None,
+                'planetary_positions':  planetary_positions,
+            }
 
             return result, None
 
@@ -946,7 +958,10 @@ class AstronomyService:
         Returns:
             Tuple of (julian_day, error_message)
         """
-        flags = swe.FLG_SWIEPH
+        # FLG_SPEED is required or swe.calc_ut() returns 0.0 for the speed
+        # fields (index 3-5), which made the Newton's method loop below
+        # always see speed == 0 and immediately report false non-convergence.
+        flags = swe.FLG_SWIEPH | swe.FLG_SPEED
         if heliocentric:
             flags |= swe.FLG_HELCTR
 
@@ -1039,7 +1054,8 @@ class AstronomyService:
     def calculate_apsides(
             self,
             dt_utc: datetime,
-            output_config: dict = None
+            output_config: dict = None,
+            bodies: list = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """
         Calculate lunar and planetary apsides for a given datetime.
@@ -1056,7 +1072,18 @@ class AstronomyService:
 
         Args:
             dt_utc:        Datetime in UTC
-            output_config: Merged output config (controls which bodies to include)
+            output_config: Merged output config — used as the default body
+                           filter only when `bodies` is not supplied, so
+                           existing callers keep their current behaviour.
+            bodies:        Optional explicit list of body names to include
+                           (e.g. ['moon', 'mars', 'chiron']). When given,
+                           this is the sole filter for the request — output
+                           config's body toggles are ignored, since those
+                           govern /calculate chart display, not this
+                           endpoint. Valid names: 'moon', the 8 planets,
+                           the 5 asteroids, 'mean_lilith', 'true_lilith'.
+                           None (default) includes everything output_config
+                           allows, matching prior behaviour.
 
         Returns:
             Tuple of (result_dict, error_message)
@@ -1066,6 +1093,16 @@ class AstronomyService:
             output_config = OutputConfig.as_dict()
 
         bodies_cfg = output_config.get('bodies', {})
+
+        # Explicit `bodies` list takes over entirely when provided; otherwise
+        # fall back to the output config toggles exactly as before.
+        explicit = bodies is not None
+        wanted   = set(bodies) if explicit else None
+
+        def _include(name: str, cfg_default: bool = True) -> bool:
+            if explicit:
+                return name in wanted
+            return bodies_cfg.get(name, cfg_default)
 
         try:
             jd = swe.julday(
@@ -1079,23 +1116,23 @@ class AstronomyService:
             # ------------------------------------------------------------------
             lunar_apsides = {}
 
-            # Perigee and apogee (osculating)
-            _, aps_osc, _, _ = swe.nod_aps_ut(jd, swe.MOON, swe.FLG_SWIEPH, 1)
-            _, aps_mean, _, _ = swe.nod_aps_ut(jd, swe.MOON, swe.FLG_SWIEPH, 0)
+            if _include('moon'):
+                # Perigee and apogee (osculating)
+                _, aps_osc, _, _ = swe.nod_aps_ut(jd, swe.MOON, swe.FLG_SWIEPH, 1)
 
-            lunar_apsides['perigee'] = {
-                'longitude': aps_osc[0],   # periapsis
-                'latitude':  0.0,
-                'distance_au': aps_osc[2] if len(aps_osc) > 2 else None,
-            }
-            lunar_apsides['apogee'] = {
-                'longitude': aps_osc[1],   # apoapsis
-                'latitude':  0.0,
-                'distance_au': aps_osc[3] if len(aps_osc) > 3 else None,
-            }
+                lunar_apsides['perigee'] = {
+                    'longitude': aps_osc[0],   # periapsis
+                    'latitude':  0.0,
+                    'distance_au': aps_osc[2] if len(aps_osc) > 2 else None,
+                }
+                lunar_apsides['apogee'] = {
+                    'longitude': aps_osc[1],   # apoapsis
+                    'latitude':  0.0,
+                    'distance_au': aps_osc[3] if len(aps_osc) > 3 else None,
+                }
 
             # Mean Lilith
-            if bodies_cfg.get('mean_lilith', False):
+            if _include('mean_lilith', cfg_default=False):
                 pos, _ = swe.calc_ut(jd, swe.MEAN_APOG, swe.FLG_SWIEPH)
                 lunar_apsides['mean_lilith'] = {
                     'longitude':       pos[0],
@@ -1105,7 +1142,7 @@ class AstronomyService:
                 }
 
             # True Lilith
-            if bodies_cfg.get('true_lilith', False):
+            if _include('true_lilith', cfg_default=False):
                 pos, _ = swe.calc_ut(jd, swe.OSCU_APOG, swe.FLG_SWIEPH)
                 lunar_apsides['true_lilith'] = {
                     'longitude':       pos[0],
@@ -1131,11 +1168,12 @@ class AstronomyService:
             }
 
             for planet_name, planet_id in planet_ids.items():
-                # Respect bodies config — skip disabled bodies
-                if not bodies_cfg.get(planet_name, True):
+                if not _include(planet_name):
                     continue
-                # Skip asteroids if master switch is off
-                if planet_name in ('ceres', 'pallas', 'juno', 'vesta', 'chiron'):
+                # Asteroid master switch only applies to the config-driven
+                # default path — an explicit `bodies` list already says
+                # exactly what's wanted, so it isn't gated a second time.
+                if not explicit and planet_name in ('ceres', 'pallas', 'juno', 'vesta', 'chiron'):
                     if not bodies_cfg.get('asteroids', True):
                         continue
 
@@ -1358,10 +1396,15 @@ class AstronomyService:
             return None, f"Could not bracket lunation angle {target_angle}°"
 
         # Newton's method refinement
+        # FLG_SPEED is required here — without it swe.calc_ut() returns 0.0
+        # for the speed fields, which made rel_speed always 0 and broke out
+        # of this loop on the first pass, silently returning the unrefined
+        # coarse-scan bracket (up to ~6 days off) instead of a converged time.
+        flags = swe.FLG_SWIEPH | swe.FLG_SPEED
         jd = bracket_jd
         for _ in range(max_iterations):
-            sun,  _ = swe.calc_ut(jd, swe.SUN,  swe.FLG_SWIEPH)
-            moon, _ = swe.calc_ut(jd, swe.MOON, swe.FLG_SWIEPH)
+            sun,  _ = swe.calc_ut(jd, swe.SUN,  flags)
+            moon, _ = swe.calc_ut(jd, swe.MOON, flags)
 
             angle = (moon[0] - sun[0]) % 360.0
             diff  = target_angle - angle
@@ -1445,8 +1488,11 @@ class AstronomyService:
         'chiron':  18500,
     }
 
-    # Maximum search window in days — prevents runaway searches for slow bodies
-    MAX_APSIDE_SEARCH_DAYS = 7300  # 20 years
+    # Maximum search window in days — prevents runaway searches for slow bodies.
+    # Raised to 100 years to match the schema's max_search_years ceiling and
+    # to comfortably cover multi-decade historical ranges (e.g. backtesting
+    # against data series going back to the 1970s-80s).
+    MAX_APSIDE_SEARCH_DAYS = 36525  # 100 years
 
     def calculate_next_apsides(
             self,
@@ -1454,10 +1500,13 @@ class AstronomyService:
             bodies: list = None,
             events: list = None,
             max_search_years: int = 20,
+            end_date: datetime = None,
     ) -> Tuple[Optional[list], Optional[str]]:
         """
-        Find the next perigee/aphelion and apogee/aphelion events for
-        each requested body after the reference date.
+        Find perigee/perihelion and apogee/aphelion events for each requested
+        body across a forward window from the reference date — despite the
+        name this returns EVERY matching event in the window, not just the
+        first one, so it doubles as a date-range apsides query.
 
         Moon uses swe.nod_aps_ut() for direct lookup.
         Planets iterate forward watching for distance_speed sign change
@@ -1465,11 +1514,16 @@ class AstronomyService:
         then refine with Newton's method.
 
         Args:
-            reference_date:    Search from this date forward
+            reference_date:    Search from this date forward (the range start)
             bodies:            List of body names — default is all supported bodies
             events:            List of 'perigee'/'perihelion' and/or 'apogee'/'aphelion'
                                Default is both.
-            max_search_years:  Cap on forward search window (default 20 years)
+            max_search_years:  Cap on forward search window (default 20 years).
+                               Ignored when `end_date` is supplied.
+            end_date:          Optional explicit range end. When given, the
+                               window is the exact number of days between
+                               reference_date and end_date — use this for a
+                               precise date range instead of estimating years.
 
         Returns:
             Tuple of (events_list, error_message)
@@ -1485,7 +1539,14 @@ class AstronomyService:
         want_perigee = any(e in events for e in ('perigee', 'perihelion'))
         want_apogee  = any(e in events for e in ('apogee',  'aphelion'))
 
-        max_days = min(max_search_years * 365.25, self.MAX_APSIDE_SEARCH_DAYS)
+        if end_date is not None:
+            requested_days = (end_date - reference_date).total_seconds() / 86400.0
+            if requested_days <= 0:
+                return None, 'end_date must be after reference_date'
+        else:
+            requested_days = max_search_years * 365.25
+
+        max_days = min(requested_days, self.MAX_APSIDE_SEARCH_DAYS)
 
         ref_jd = swe.julday(
             reference_date.year, reference_date.month, reference_date.day,
@@ -2092,7 +2153,7 @@ class AstronomyService:
 
         Args:
             reference_date: Start of the search window
-            years_ahead:    Number of years to search forward (max 50)
+            years_ahead:    Number of years to search forward (max 100)
 
         Returns:
             Tuple of (eclipses_list, error_message)
@@ -2101,7 +2162,7 @@ class AstronomyService:
                 magnitude, obscuration, saros_series, saros_member
             }
         """
-        years_ahead = max(1, min(50, years_ahead))
+        years_ahead = max(1, min(100, years_ahead))
 
         start_jd = swe.julday(
             reference_date.year, reference_date.month, reference_date.day,

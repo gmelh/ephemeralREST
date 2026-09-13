@@ -257,6 +257,14 @@ class ApsideSchema(Schema):
         required=True,
         error_messages={'required': 'datetime is required'}
     )
+    bodies       = fields.List(
+        fields.Str(validate=validate.OneOf(
+            VALID_APSIDE_BODIES_FULL,
+            error=f"Invalid body. Valid: {', '.join(VALID_APSIDE_BODIES_FULL)}"
+        )),
+        load_default=None,
+        allow_none=True
+    )
     output       = fields.Nested(OutputSchema, load_default=None)
 
 
@@ -292,6 +300,11 @@ VALID_APSIDE_BODIES = [
     'moon', 'mercury', 'venus', 'mars', 'jupiter', 'saturn',
     'uranus', 'neptune', 'pluto', 'ceres', 'pallas', 'juno', 'vesta', 'chiron',
 ]
+# Point-in-time /apsides also exposes the two lunar apsides points (Lilith)
+# as directly selectable "bodies" — /apsides/next doesn't search for these
+# since they aren't periodic perigee/apogee events, so they stay out of
+# VALID_APSIDE_BODIES itself and are only added for the point-in-time schema.
+VALID_APSIDE_BODIES_FULL = VALID_APSIDE_BODIES + ['mean_lilith', 'true_lilith']
 VALID_APSIDE_EVENTS = ['perigee', 'perihelion', 'apogee', 'aphelion']
 
 
@@ -300,6 +313,10 @@ class NextApsideSchema(Schema):
     reference_date    = fields.Str(
         required=True,
         error_messages={'required': 'reference_date is required'}
+    )
+    end_date          = fields.Str(
+        load_default=None,
+        allow_none=True
     )
     bodies            = fields.List(
         fields.Str(validate=validate.OneOf(
@@ -319,7 +336,7 @@ class NextApsideSchema(Schema):
     )
     max_search_years  = fields.Int(
         load_default=20,
-        validate=validate.Range(min=1, max=50)
+        validate=validate.Range(min=1, max=100)
     )
 
 
@@ -391,8 +408,8 @@ class EclipseSchema(Schema):
     )
     years_ahead = fields.Int(
         load_default=5,
-        validate=validate.Range(min=1, max=50,
-            error='years_ahead must be between 1 and 50')
+        validate=validate.Range(min=1, max=100,
+            error='years_ahead must be between 1 and 100')
     )
 
 

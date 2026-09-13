@@ -968,10 +968,15 @@ def apsides(validated_data):
         perihelion / aphelion for each active planet
 
     Body param: datetime — the datetime to calculate apsides for
+    Body param: bodies   — optional list of body names to include, e.g.
+                           ["moon", "mars", "chiron"]. Valid: moon, the 8
+                           planets, the 5 asteroids, mean_lilith, true_lilith.
+                           Omit for all bodies (previous default behaviour).
     Body param: output   — optional per-request output overrides
     """
     try:
-        datetime_str     = validated_data['datetime']
+        datetime_str      = validated_data['datetime']
+        bodies            = validated_data.get('bodies')
         request_overrides = validated_data.get('output') or {}
 
         user = getattr(g, 'user', {})
@@ -987,9 +992,9 @@ def apsides(validated_data):
             import pytz
             dt = dt.astimezone(pytz.UTC).replace(tzinfo=None)
 
-        logger.info(f"Apsides calculation for {dt}")
+        logger.info(f"Apsides calculation for {dt}" + (f", bodies={bodies}" if bodies else ""))
 
-        result, error = astronomy_service.calculate_apsides(dt, output_cfg)
+        result, error = astronomy_service.calculate_apsides(dt, output_cfg, bodies=bodies)
         if error:
             return _error(error, 500)
 
@@ -1047,10 +1052,10 @@ def lunations(validated_data):
                 return _error('Invalid start_date or end_date format', 400)
             if start_date > end_date:
                 return _error('start_date must be before end_date', 400)
-            # Cap range at 2 years to prevent runaway calculations
+            # Cap range at 100 years to match /apsides/next, prevents runaway calculations
             from datetime import timedelta
-            if (end_date - start_date).days > 730:
-                return _error('Date range cannot exceed 2 years', 400)
+            if (end_date - start_date).days > 36525:
+                return _error('Date range cannot exceed 100 years', 400)
 
         # Strip timezone info
         reference_date = reference_date.replace(tzinfo=None)
@@ -1099,14 +1104,19 @@ def next_apsides(validated_data):
     Planetary perihelion/aphelion: found by scanning forward for distance
                                    speed sign change then Newton refinement.
 
-    Body param: reference_date   — search from this date forward
+    Body param: reference_date   — search from this date forward (range start)
+    Body param: end_date         — optional explicit range end. When given,
+                                   overrides max_search_years with the exact
+                                   day count between reference_date and end_date.
     Body param: bodies           — list of body names (default: all supported)
     Body param: events           — list of 'perigee'/'perihelion'/'apogee'/'aphelion'
                                    (default: both)
-    Body param: max_search_years — cap on search window, 1–50 (default: 20)
+    Body param: max_search_years — cap on search window, 1–100 (default: 20).
+                                   Ignored when end_date is supplied.
     """
     try:
         reference_date_str = validated_data['reference_date']
+        end_date_str        = validated_data.get('end_date')
         bodies             = validated_data.get('bodies') or None
         events             = validated_data.get('events') or None
         max_search_years   = validated_data.get('max_search_years', 20)
@@ -1114,11 +1124,18 @@ def next_apsides(validated_data):
         reference_date = _parse_datetime(reference_date_str)
         if reference_date is None:
             return _error('Invalid reference_date format', 400)
-
         reference_date = reference_date.replace(tzinfo=None)
+
+        end_date = None
+        if end_date_str:
+            end_date = _parse_datetime(end_date_str)
+            if end_date is None:
+                return _error('Invalid end_date format', 400)
+            end_date = end_date.replace(tzinfo=None)
 
         logger.info(
             f"Next apsides: reference={reference_date.date()}, "
+            f"end={end_date.date() if end_date else None}, "
             f"bodies={bodies or 'all'}, events={events or 'both'}, "
             f"max_years={max_search_years}"
         )
@@ -1128,18 +1145,22 @@ def next_apsides(validated_data):
             bodies=bodies,
             events=events,
             max_search_years=max_search_years,
+            end_date=end_date,
         )
         if error:
             return _error(error, 500)
 
-        return jsonify({
+        response = {
             'reference_date':  reference_date.date().isoformat(),
+            'end_date':        end_date.date().isoformat() if end_date else None,
             'bodies_searched': bodies or list(astronomy_service.APSIDE_EVENT_BODIES.keys()),
             'events_searched': events or ['perigee', 'apogee'],
             'max_search_years': max_search_years,
             'count':           len(result),
             'events':          result,
-        })
+        }
+
+        return jsonify(response)
 
     except Exception as e:
         logger.error(f"Next apsides error: {str(e)}", exc_info=True)
@@ -1204,7 +1225,7 @@ def eclipses(validated_data):
     Find all solar and lunar eclipses within a given time window.
 
     Body param: reference_date — start of the search window (YYYY-MM-DD or ISO)
-    Body param: years_ahead    — how many years forward to search (1–50, default 5)
+    Body param: years_ahead    — how many years forward to search (1–100, default 5)
 
     Returns a chronological list of eclipses, each with:
       type, eclipse_type, datetime_utc, julian_day,
