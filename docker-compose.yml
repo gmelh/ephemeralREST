@@ -94,6 +94,7 @@ services:
     # relevant when MYSQL_HOST=host.docker.internal is set in .env; no
     # effect otherwise. Requires Docker Engine 20.10+ (host-gateway support
     # on Linux).
+      - ./.env:/app/.env:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
