@@ -250,6 +250,17 @@ class LunarReturnSchema(Schema):
 VALID_LUNATION_PHASES = ['new_moon', 'first_quarter', 'full_moon', 'last_quarter']
 VALID_LUNATION_DIRECTIONS = ['next', 'previous', 'both']
 
+VALID_APSIDE_BODIES = [
+    'moon', 'mercury', 'venus', 'mars', 'jupiter', 'saturn',
+    'uranus', 'neptune', 'pluto', 'ceres', 'pallas', 'juno', 'vesta', 'chiron',
+]
+# Point-in-time /apsides also exposes the two lunar apsides points (Lilith)
+# as directly selectable "bodies" — /apsides/next doesn't search for these
+# since they aren't periodic perigee/apogee events, so they stay out of
+# VALID_APSIDE_BODIES itself and are only added for the point-in-time schema.
+VALID_APSIDE_BODIES_FULL = VALID_APSIDE_BODIES + ['mean_lilith', 'true_lilith']
+VALID_APSIDE_EVENTS = ['perigee', 'perihelion', 'apogee', 'aphelion']
+
 
 class ApsideSchema(Schema):
     """Schema for apsides endpoint"""
@@ -293,19 +304,6 @@ class LunationSchema(Schema):
         load_default=None,
         allow_none=True
     )
-
-
-
-VALID_APSIDE_BODIES = [
-    'moon', 'mercury', 'venus', 'mars', 'jupiter', 'saturn',
-    'uranus', 'neptune', 'pluto', 'ceres', 'pallas', 'juno', 'vesta', 'chiron',
-]
-# Point-in-time /apsides also exposes the two lunar apsides points (Lilith)
-# as directly selectable "bodies" — /apsides/next doesn't search for these
-# since they aren't periodic perigee/apogee events, so they stay out of
-# VALID_APSIDE_BODIES itself and are only added for the point-in-time schema.
-VALID_APSIDE_BODIES_FULL = VALID_APSIDE_BODIES + ['mean_lilith', 'true_lilith']
-VALID_APSIDE_EVENTS = ['perigee', 'perihelion', 'apogee', 'aphelion']
 
 
 class NextApsideSchema(Schema):
