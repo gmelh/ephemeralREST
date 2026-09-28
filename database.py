@@ -823,6 +823,28 @@ class DatabaseManager:
             )
         ''')
 
+        # Account chart manifest — per-account list of "which charts are
+        # mine", so a client can sync its local chart list across
+        # machines. Never stores planetary_positions — that stays in the
+        # existing charts/derived_charts tables (which have no owner
+        # column by design); this table only tracks which uuids belong
+        # to which account.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_charts
+            (
+                key_id      INTEGER NOT NULL REFERENCES api_keys(id),
+                chart_uuid  TEXT NOT NULL,
+                type        TEXT NOT NULL,
+                parent_uuid TEXT,
+                name        TEXT,
+                date        TEXT,
+                time        TEXT,
+                location    TEXT,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (key_id, chart_uuid)
+            )
+        ''')
+
         # Migration: add last_accessed to views if missing from older databases
         cursor.execute("PRAGMA table_info(views)")
         view_columns = [column[1] for column in cursor.fetchall()]
@@ -1255,6 +1277,28 @@ class DatabaseManager:
                 created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+        # Account chart manifest — per-account list of "which charts are
+        # mine", so a client can sync its local chart list across
+        # machines. Never stores planetary_positions — that stays in the
+        # existing charts/derived_charts tables (which have no owner
+        # column by design); this table only tracks which uuids belong
+        # to which account.
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS account_charts
+            (
+                key_id      INT NOT NULL REFERENCES api_keys(id),
+                chart_uuid  VARCHAR(64) NOT NULL,
+                type        VARCHAR(16) NOT NULL,
+                parent_uuid VARCHAR(64),
+                name        TEXT,
+                date        VARCHAR(32),
+                time        VARCHAR(16),
+                location    TEXT,
+                updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (key_id, chart_uuid)
             ) {charset}
         ''')
 
@@ -2004,6 +2048,81 @@ class DatabaseManager:
                 ''', (chart_id,))
 
             return [dict(row) for row in cursor.fetchall()]
+
+    # ==========================================================================
+    # Account chart manifest — per-account list of "which charts are mine"
+    # ==========================================================================
+
+    def upsert_account_chart(
+            self,
+            key_id: int,
+            chart_uuid: str,
+            chart_type: str,
+            parent_uuid: str = None,
+            name: str = None,
+            date: str = None,
+            time: str = None,
+            location: str = None,
+    ) -> None:
+        """
+        Upsert one manifest entry for an account. Called on every local
+        save from the client — never stores planetary_positions, only
+        identity fields; the chart's actual data already lives under its
+        own uuid via the existing charts / derived_charts tables.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO account_charts
+                    (key_id, chart_uuid, type, parent_uuid, name, date, time, location, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(key_id, chart_uuid) DO UPDATE SET
+                    type        = excluded.type,
+                    parent_uuid = excluded.parent_uuid,
+                    name        = excluded.name,
+                    date        = excluded.date,
+                    time        = excluded.time,
+                    location    = excluded.location,
+                    updated_at  = CURRENT_TIMESTAMP
+            ''', (key_id, chart_uuid, chart_type, parent_uuid, name, date, time, location))
+
+    def list_account_charts(self, key_id: int) -> list:
+        """Every manifest entry belonging to this account — the listing
+        that doesn't exist anywhere else in the API, since charts /
+        derived_charts have no owner column by design."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT chart_uuid, type, parent_uuid, name, date, time, location, updated_at
+                FROM account_charts
+                WHERE key_id = ?
+                ORDER BY updated_at DESC
+            ''', (key_id,))
+            return [
+                {
+                    'uuid':        row['chart_uuid'],
+                    'type':        row['type'],
+                    'parent_uuid': row['parent_uuid'],
+                    'name':        row['name'],
+                    'date':        row['date'],
+                    'time':        row['time'],
+                    'location':    row['location'],
+                    'updated_at':  row['updated_at'],
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def delete_account_chart(self, key_id: int, chart_uuid: str) -> None:
+        """Remove one manifest entry. Does not touch the chart's actual
+        data (charts / derived_charts tables) — those stay shared,
+        owner-less resources by design; this only removes it from this
+        account's own list."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'DELETE FROM account_charts WHERE key_id = ? AND chart_uuid = ?',
+                (key_id, chart_uuid)
+            )
 
     def delete_derived_chart(self, derived_id: str) -> bool:
         """Delete a derived chart by UUID. Returns True if deleted."""

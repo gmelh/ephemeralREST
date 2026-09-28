@@ -38,7 +38,7 @@ import logging
 import pytz
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
-from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterSchema, AdminReviewSchema, SaveViewSchema, LoginSchema, Login2FASchema, SetPasswordSchema, SetupSchema
+from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterSchema, AdminReviewSchema, SaveViewSchema, LoginSchema, Login2FASchema, SetPasswordSchema, SetupSchema, AccountChartSchema
 from output_config import OutputConfig
 from email_service import EmailService
 import secrets as _secrets
@@ -951,6 +951,83 @@ def delete_derived_chart(derived_id):
         return _error(f'Failed to delete derived chart: {str(e)}', 500)
 
 
+# ==============================================================================
+# Account chart manifest — lets a client sync "which charts are mine" across
+# machines, without charts/derived_charts themselves needing an owner.
+# ==============================================================================
+
+def _account_key_id():
+    """Resolves g.user['id'] (always a string, see users.py's
+    _build_user_dict) to the integer api_keys.id account_charts.key_id
+    references. Returns (key_id, None) on success or (None, error_response)
+    on failure, so callers can `key_id, err = _account_key_id(); if err:
+    return err`. A guest/debug-mode session (g.user['id'] == 'guest') has
+    no persistent identity across requests, so it can't sensibly
+    participate in an account manifest at all — hence the explicit 403
+    rather than trying to store something under a fake id."""
+    try:
+        return int(g.user['id']), None
+    except (TypeError, ValueError, KeyError):
+        return None, _error('Account sync is not available for guest/debug sessions', 403)
+
+
+@api.route('/account/charts/<chart_uuid>', methods=['PUT'])
+@validate_request(AccountChartSchema)
+def upsert_account_chart(validated_data, chart_uuid):
+    """Upsert one manifest entry for the authenticated account."""
+    try:
+        key_id, err = _account_key_id()
+        if err:
+            return err
+
+        db_manager.upsert_account_chart(
+            key_id=key_id,
+            chart_uuid=chart_uuid,
+            chart_type=validated_data['type'],
+            parent_uuid=validated_data.get('parent_uuid'),
+            name=validated_data.get('name'),
+            date=validated_data.get('date'),
+            time=validated_data.get('time'),
+            location=validated_data.get('location'),
+        )
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        logger.error(f"Upsert account chart error: {str(e)}", exc_info=True)
+        return _error(f'Failed to save account chart: {str(e)}', 500)
+
+
+@api.route('/account/charts', methods=['GET'])
+def list_account_charts():
+    """List every manifest entry belonging to the authenticated account."""
+    try:
+        key_id, err = _account_key_id()
+        if err:
+            return err
+
+        charts = db_manager.list_account_charts(key_id=key_id)
+        return jsonify({'charts': charts})
+
+    except Exception as e:
+        logger.error(f"List account charts error: {str(e)}", exc_info=True)
+        return _error(f'Failed to list account charts: {str(e)}', 500)
+
+
+@api.route('/account/charts/<chart_uuid>', methods=['DELETE'])
+def delete_account_chart(chart_uuid):
+    """Remove one manifest entry for the authenticated account."""
+    try:
+        key_id, err = _account_key_id()
+        if err:
+            return err
+
+        db_manager.delete_account_chart(key_id=key_id, chart_uuid=chart_uuid)
+        return jsonify({'ok': True})
+
+    except Exception as e:
+        logger.error(f"Delete account chart error: {str(e)}", exc_info=True)
+        return _error(f'Failed to delete account chart: {str(e)}', 500)
+
 
 @api.route('/apsides', methods=['POST'])
 @validate_request(ApsideSchema)
@@ -968,15 +1045,10 @@ def apsides(validated_data):
         perihelion / aphelion for each active planet
 
     Body param: datetime — the datetime to calculate apsides for
-    Body param: bodies   — optional list of body names to include, e.g.
-                           ["moon", "mars", "chiron"]. Valid: moon, the 8
-                           planets, the 5 asteroids, mean_lilith, true_lilith.
-                           Omit for all bodies (previous default behaviour).
     Body param: output   — optional per-request output overrides
     """
     try:
-        datetime_str      = validated_data['datetime']
-        bodies            = validated_data.get('bodies')
+        datetime_str     = validated_data['datetime']
         request_overrides = validated_data.get('output') or {}
 
         user = getattr(g, 'user', {})
@@ -992,9 +1064,9 @@ def apsides(validated_data):
             import pytz
             dt = dt.astimezone(pytz.UTC).replace(tzinfo=None)
 
-        logger.info(f"Apsides calculation for {dt}" + (f", bodies={bodies}" if bodies else ""))
+        logger.info(f"Apsides calculation for {dt}")
 
-        result, error = astronomy_service.calculate_apsides(dt, output_cfg, bodies=bodies)
+        result, error = astronomy_service.calculate_apsides(dt, output_cfg)
         if error:
             return _error(error, 500)
 
@@ -1052,10 +1124,10 @@ def lunations(validated_data):
                 return _error('Invalid start_date or end_date format', 400)
             if start_date > end_date:
                 return _error('start_date must be before end_date', 400)
-            # Cap range at 100 years to match /apsides/next, prevents runaway calculations
+            # Cap range at 2 years to prevent runaway calculations
             from datetime import timedelta
-            if (end_date - start_date).days > 36525:
-                return _error('Date range cannot exceed 100 years', 400)
+            if (end_date - start_date).days > 730:
+                return _error('Date range cannot exceed 2 years', 400)
 
         # Strip timezone info
         reference_date = reference_date.replace(tzinfo=None)
@@ -1104,19 +1176,14 @@ def next_apsides(validated_data):
     Planetary perihelion/aphelion: found by scanning forward for distance
                                    speed sign change then Newton refinement.
 
-    Body param: reference_date   — search from this date forward (range start)
-    Body param: end_date         — optional explicit range end. When given,
-                                   overrides max_search_years with the exact
-                                   day count between reference_date and end_date.
+    Body param: reference_date   — search from this date forward
     Body param: bodies           — list of body names (default: all supported)
     Body param: events           — list of 'perigee'/'perihelion'/'apogee'/'aphelion'
                                    (default: both)
-    Body param: max_search_years — cap on search window, 1–100 (default: 20).
-                                   Ignored when end_date is supplied.
+    Body param: max_search_years — cap on search window, 1–50 (default: 20)
     """
     try:
         reference_date_str = validated_data['reference_date']
-        end_date_str        = validated_data.get('end_date')
         bodies             = validated_data.get('bodies') or None
         events             = validated_data.get('events') or None
         max_search_years   = validated_data.get('max_search_years', 20)
@@ -1124,18 +1191,11 @@ def next_apsides(validated_data):
         reference_date = _parse_datetime(reference_date_str)
         if reference_date is None:
             return _error('Invalid reference_date format', 400)
-        reference_date = reference_date.replace(tzinfo=None)
 
-        end_date = None
-        if end_date_str:
-            end_date = _parse_datetime(end_date_str)
-            if end_date is None:
-                return _error('Invalid end_date format', 400)
-            end_date = end_date.replace(tzinfo=None)
+        reference_date = reference_date.replace(tzinfo=None)
 
         logger.info(
             f"Next apsides: reference={reference_date.date()}, "
-            f"end={end_date.date() if end_date else None}, "
             f"bodies={bodies or 'all'}, events={events or 'both'}, "
             f"max_years={max_search_years}"
         )
@@ -1145,22 +1205,18 @@ def next_apsides(validated_data):
             bodies=bodies,
             events=events,
             max_search_years=max_search_years,
-            end_date=end_date,
         )
         if error:
             return _error(error, 500)
 
-        response = {
+        return jsonify({
             'reference_date':  reference_date.date().isoformat(),
-            'end_date':        end_date.date().isoformat() if end_date else None,
             'bodies_searched': bodies or list(astronomy_service.APSIDE_EVENT_BODIES.keys()),
             'events_searched': events or ['perigee', 'apogee'],
             'max_search_years': max_search_years,
             'count':           len(result),
             'events':          result,
-        }
-
-        return jsonify(response)
+        })
 
     except Exception as e:
         logger.error(f"Next apsides error: {str(e)}", exc_info=True)
@@ -1225,7 +1281,7 @@ def eclipses(validated_data):
     Find all solar and lunar eclipses within a given time window.
 
     Body param: reference_date — start of the search window (YYYY-MM-DD or ISO)
-    Body param: years_ahead    — how many years forward to search (1–100, default 5)
+    Body param: years_ahead    — how many years forward to search (1–50, default 5)
 
     Returns a chronological list of eclipses, each with:
       type, eclipse_type, datetime_utc, julian_day,
