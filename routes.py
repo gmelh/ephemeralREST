@@ -40,6 +40,7 @@ from datetime import datetime
 from flask import Blueprint, request, jsonify, g
 from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterSchema, AdminReviewSchema, SaveViewSchema, LoginSchema, Login2FASchema, SetPasswordSchema, SetupSchema, AccountChartSchema
 from output_config import OutputConfig
+from config import Config
 from email_service import EmailService
 import secrets as _secrets
 
@@ -49,6 +50,17 @@ logger = logging.getLogger(__name__)
 def _error(message: str, status: int):
     """Return a consistent error response including the HTTP status code."""
     return jsonify({'error': message, 'status': status}), status
+
+def _current_key_id():
+    """The authenticated caller's api_keys.id as an int, or None when there
+    isn't a real key behind the request. g.user['id'] is always a string
+    (users.py's _build_user_dict does str(key_record['id'])), and is the
+    literal 'guest' for a debug-mode session with no API key."""
+    try:
+        return int(g.user['id'])
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return None
+
 
 # Create blueprint
 api = Blueprint('api', __name__)
@@ -69,6 +81,113 @@ def init_routes(db, geo_service, astro_service, usage_track, auth_mgr):
     astronomy_service = astro_service
     usage_tracker     = usage_track
     auth_manager      = auth_mgr
+
+
+def _restore_chart_from_archive(chart_id: str) -> bool:
+    """
+    Rebuild a chart that expired from the cache, under its ORIGINAL id, from
+    chart_archive. Returns True if the chart exists again afterwards.
+
+    The archive holds a chart's inputs (name, moment, place), not its
+    results, so this recalculates. It uses the chart's most recent
+    recalculation if it has one, so a correction made after the first
+    calculation (e.g. a birth time that later became known) isn't undone.
+    Two things the archive never recorded are filled with server defaults:
+    the house system and the output configuration (which bodies are
+    included) — they belong to whoever calculated the chart, and aren't
+    something the person asking for it now should silently decide.
+
+    Never raises. Two different kinds of False:
+      - the chart was never archived: it genuinely doesn't exist, and the
+        caller's 404 is final;
+      - it IS archived but rebuilding it failed just now (geocoder down,
+        calculation error, storage error): that's temporary. g.chart_restore_
+        failed is set so _chart_missing() answers 503 rather than 404 —
+        clients such as MindForce's Sync remove an account's reference to a
+        chart on a definitive 404, and must never mistake a hiccup for that.
+    """
+    try:
+        inputs = db_manager.get_archive_inputs(chart_id)
+        if not inputs:
+            return False
+
+        location_info, error = geocoding_service.geocode_location(inputs['location'])
+        if error:
+            logger.warning(f"Restore of {chart_id} failed — could not geocode '{inputs['location']}': {error}")
+            g.chart_restore_failed = True
+            return False
+
+        dt_utc = _parse_datetime(inputs['datetime_utc'])
+        if dt_utc is None:
+            logger.warning(f"Restore of {chart_id} failed — unreadable archived datetime '{inputs['datetime_utc']}'")
+            g.chart_restore_failed = True
+            return False
+
+        output_cfg   = OutputConfig.merge({})
+        house_system = output_cfg.get('default_house_system')
+        result, error = astronomy_service.calculate_planetary_positions(
+            dt_utc,
+            location_info['latitude'],
+            location_info['longitude'],
+            house_system=house_system,
+            output_config=output_cfg,
+        )
+        if error:
+            logger.warning(f"Restore of {chart_id} failed — calculation error: {error}")
+            g.chart_restore_failed = True
+            return False
+
+        restored = db_manager.restore_chart(
+            chart_id       = chart_id,
+            chart_name     = inputs['chart_name'],
+            datetime_utc   = inputs['datetime_utc'],
+            datetime_local = inputs['datetime_local'],
+            location_id    = location_info['id'],
+            chart_data     = result,
+            house_system   = house_system,
+            created_at     = inputs['first_calculated_at'],
+        )
+        if restored:
+            g.chart_restored = True
+            logger.info(f"Restored expired chart {chart_id} from archive (inputs from {inputs['source']})")
+        else:
+            g.chart_restore_failed = True
+        return restored
+
+    except Exception as e:
+        logger.error(f"Restore of {chart_id} from archive failed: {e}", exc_info=True)
+        g.chart_restore_failed = True
+        return False
+
+
+def _get_chart_or_restore(chart_id: str):
+    """
+    db_manager.get_chart_by_id, falling back to the archive on a miss. Every
+    route that looks a chart up by an id someone else holds (a share link, an
+    account's manifest) goes through this, so an id keeps working after its
+    chart expires from the cache instead of the chart quietly becoming a 404.
+    """
+    chart = db_manager.get_chart_by_id(chart_id)
+    if chart:
+        return chart
+    if _restore_chart_from_archive(chart_id):
+        return db_manager.get_chart_by_id(chart_id)
+    return None
+
+
+def _chart_missing(chart_id: str):
+    """
+    The response for a chart lookup that came back empty: 404 when the chart
+    doesn't exist (never archived), 503 when it's archived but couldn't be
+    rebuilt right now. The distinction matters — see _restore_chart_from_
+    archive. Use it wherever _get_chart_or_restore returns None.
+    """
+    if getattr(g, 'chart_restore_failed', False):
+        return _error(
+            f'Chart {chart_id} is archived but could not be restored right now — try again shortly',
+            503,
+        )
+    return _error(f'Chart {chart_id} not found', 404)
 
 
 @api.route('/autocomplete', methods=['GET'])
@@ -119,9 +238,9 @@ def calculate(validated_data):
             return _error('chart_id is required when recalc is true', 400)
 
         if recalc and recalc_chart_id:
-            existing = db_manager.get_chart_by_id(recalc_chart_id)
+            existing = _get_chart_or_restore(recalc_chart_id)
             if not existing:
-                return _error(f'Chart {recalc_chart_id} not found', 404)
+                return _chart_missing(recalc_chart_id)
 
         # Get the authenticated user's output config
         user = getattr(g, 'user', {})
@@ -212,6 +331,7 @@ def calculate(validated_data):
                 datetime_utc   = dt_utc.isoformat(),
                 datetime_local = dt_local.isoformat(),
                 location       = location_info['formatted_address'],
+                key_id         = _current_key_id(),
             )
 
         # Build response
@@ -242,15 +362,18 @@ def calculate(validated_data):
 
 @api.route('/chart/<chart_id>', methods=['GET'])
 def get_chart(chart_id):
-    """Get a chart by its ID"""
+    """Get a chart by its ID. A chart that has expired from the cache is
+    rebuilt from the permanent archive under the same id (see
+    _restore_chart_from_archive)."""
     try:
-        chart_data = db_manager.get_chart_by_id(chart_id)
+        chart_data = _get_chart_or_restore(chart_id)
         if not chart_data:
-            return _error('Chart not found', 404)
+            return _chart_missing(chart_id)
 
-        stored = chart_data['chart_data']
+        stored   = chart_data['chart_data']
+        restored = getattr(g, 'chart_restored', False)
 
-        return jsonify({
+        response = {
             'chart_id':            chart_data['id'],
             'chart_name':          chart_data.get('chart_name', 'Untitled Chart'),
             'datetime_utc':        chart_data['datetime_utc'],
@@ -259,8 +382,11 @@ def get_chart(chart_id):
             'planetary_positions': stored.get('planetary_positions'),
             'house_cusps':         stored.get('house_cusps'),
             'access_count':        chart_data['access_count'],
-            'from_cache':          True
-        })
+            'from_cache':          not restored,
+        }
+        if restored:
+            response['restored_from_archive'] = True
+        return jsonify(response)
 
     except Exception as e:
         logger.error(f"Chart retrieval error: {str(e)}", exc_info=True)
@@ -283,9 +409,21 @@ def cache_stats():
 
 @api.route('/cache/cleanup', methods=['POST'])
 def cache_cleanup():
-    """Cleanup old cache entries (admin endpoint)"""
+    """Cleanup old cache entries (admin endpoint).
+
+    The threshold defaults to CACHE_EXPIRY_DAYS (3 years unless overridden)
+    and can be raised through the request body but not lowered below it —
+    this route is reachable with any valid API key, so without a floor a
+    single request with days=0 would purge every account's cached charts.
+    Shorter retention, if ever wanted, is an operator decision: set
+    CACHE_EXPIRY_DAYS, or run cleanup.py --days N directly on the server."""
     try:
-        days = request.json.get('days', 90) if request.json else 90
+        body = request.get_json(silent=True) or {}
+        try:
+            requested = int(body.get('days', Config.CACHE_EXPIRY_DAYS))
+        except (TypeError, ValueError):
+            return _error('days must be an integer', 400)
+        days = max(requested, Config.CACHE_EXPIRY_DAYS)
         deleted_count = db_manager.cleanup_old_cache(days)
         return jsonify({
             'message':         'Cache cleanup completed',
@@ -449,9 +587,9 @@ def secondary_progressions(validated_data, chart_id):
     """
     try:
         # Load natal chart
-        natal_chart = db_manager.get_chart_by_id(chart_id)
+        natal_chart = _get_chart_or_restore(chart_id)
         if not natal_chart:
-            return _error(f'Chart {chart_id} not found', 404)
+            return _chart_missing(chart_id)
 
         progression_date_str = validated_data['progression_date']
         location             = validated_data.get('location')
@@ -573,9 +711,9 @@ def solar_arc_directions(validated_data, chart_id):
     """
     try:
         # Load natal chart
-        natal_chart = db_manager.get_chart_by_id(chart_id)
+        natal_chart = _get_chart_or_restore(chart_id)
         if not natal_chart:
-            return _error(f'Chart {chart_id} not found', 404)
+            return _chart_missing(chart_id)
 
         progression_date_str = validated_data['progression_date']
         location             = validated_data.get('location')
@@ -701,9 +839,9 @@ def solar_return(validated_data, chart_id):
     Body param: output       — optional per-request output overrides
     """
     try:
-        natal_chart = db_manager.get_chart_by_id(chart_id)
+        natal_chart = _get_chart_or_restore(chart_id)
         if not natal_chart:
-            return _error(f'Chart {chart_id} not found', 404)
+            return _chart_missing(chart_id)
 
         return_year      = validated_data['return_year']
         location         = validated_data.get('location')
@@ -797,9 +935,9 @@ def lunar_return(validated_data, chart_id):
     Body param: output        — optional per-request output overrides
     """
     try:
-        natal_chart = db_manager.get_chart_by_id(chart_id)
+        natal_chart = _get_chart_or_restore(chart_id)
         if not natal_chart:
-            return _error(f'Chart {chart_id} not found', 404)
+            return _chart_missing(chart_id)
 
         return_year      = validated_data['return_year']
         return_month     = validated_data['return_month']
@@ -893,9 +1031,9 @@ def get_derived_charts(chart_id):
     e.g. GET /chart/<id>/derived?type=solar_return
     """
     try:
-        natal_chart = db_manager.get_chart_by_id(chart_id)
+        natal_chart = _get_chart_or_restore(chart_id)
         if not natal_chart:
-            return _error(f'Chart {chart_id} not found', 404)
+            return _chart_missing(chart_id)
 
         chart_type = request.args.get('type')
         derived    = db_manager.get_derived_charts_for_radix(chart_id, chart_type)
@@ -965,10 +1103,10 @@ def _account_key_id():
     no persistent identity across requests, so it can't sensibly
     participate in an account manifest at all — hence the explicit 403
     rather than trying to store something under a fake id."""
-    try:
-        return int(g.user['id']), None
-    except (TypeError, ValueError, KeyError):
+    key_id = _current_key_id()
+    if key_id is None:
         return None, _error('Account sync is not available for guest/debug sessions', 403)
+    return key_id, None
 
 
 @api.route('/account/charts/<chart_uuid>', methods=['PUT'])
@@ -1438,6 +1576,13 @@ def search_archive():
         location=location,
         limit=limit,
     )
+    # key_id records which account first calculated each chart. Any valid
+    # key can search the whole archive, so it's shown to admins only — it's
+    # for the operator's records, not something one account should be able
+    # to learn about another's charts.
+    if not g.user.get('admin'):
+        for r in results:
+            r.pop('key_id', None)
     return jsonify({
         'count':   len(results),
         'results': results,
@@ -1452,7 +1597,7 @@ def get_archive_entry(chart_id):
     with db_manager.get_connection() as conn:
         row = conn.execute(
             'SELECT chart_id, chart_name, datetime_utc, datetime_local, '
-            'location, first_calculated_at '
+            'location, first_calculated_at, key_id '
             'FROM chart_archive WHERE chart_id = ?',
             (chart_id,)
         ).fetchone()
@@ -1462,7 +1607,7 @@ def get_archive_entry(chart_id):
 
     recalculations = db_manager.get_recalculations(chart_id)
 
-    return jsonify({
+    entry = {
         'chart_id':            row['chart_id'],
         'chart_name':          row['chart_name'],
         'datetime_utc':        row['datetime_utc'],
@@ -1471,7 +1616,10 @@ def get_archive_entry(chart_id):
         'first_calculated_at': row['first_calculated_at'],
         'recalculation_count': len(recalculations),
         'recalculations':      recalculations,
-    })
+    }
+    if g.user.get('admin'):   # see search_archive for why key_id is admin-only
+        entry['key_id'] = row['key_id']
+    return jsonify(entry)
 
 
 

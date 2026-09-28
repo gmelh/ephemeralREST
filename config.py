@@ -128,7 +128,10 @@ RATE_LIMIT_PER_DAY=200
 # -----------------------------------------------------------------------------
 # Cache
 # -----------------------------------------------------------------------------
-CACHE_EXPIRY_DAYS=90
+# Days a main chart can go unaccessed before it (and its derived charts)
+# is removed from the cache. Default is 3 years. The permanent chart_archive
+# is never removed.
+CACHE_EXPIRY_DAYS=1095
 
 # -----------------------------------------------------------------------------
 # Login / 2FA / trusted devices
@@ -259,7 +262,7 @@ class Config:
     RATE_LIMIT_PER_DAY    = int(os.environ.get('RATE_LIMIT_PER_DAY', '200'))
 
     # Cache settings
-    CACHE_EXPIRY_DAYS = int(os.environ.get('CACHE_EXPIRY_DAYS', '90'))
+    CACHE_EXPIRY_DAYS = int(os.environ.get('CACHE_EXPIRY_DAYS', '1095'))
 
     # Login / 2FA / trusted devices
     TRUSTED_DEVICE_DAYS             = int(os.environ.get('TRUSTED_DEVICE_DAYS', '28'))

@@ -504,6 +504,18 @@ curl https://api.yourdomain.com/chart/a3f2c1d4-7e8b-4f2a-9c1d-3e4f5a6b7c8d \
 
 Returns `404` if the chart does not exist. The response structure is identical to the `/calculate` response.
 
+**Expired charts are restored automatically.** A chart that has not been accessed for `CACHE_EXPIRY_DAYS` (3 years by default) is removed from the cache, but its inputs stay in the permanent archive. Requesting an expired chart's id rebuilds it from the archive under the **same** `chart_id`, so share links and saved references keep working. The response then includes `"restored_from_archive": true` and `"from_cache": false`.
+
+What a restore does and does not reproduce:
+
+- The chart is recalculated from its archived name, moment and place. If it has ever been recalculated (for example a birth time that later became known), its **most recent** recalculation is used, not the original.
+- The archive did not record the house system or output configuration of the original request, so a restored chart uses the server defaults for both. Bodies or a house system the original calculation used beyond those defaults are not reproduced.
+- The location is re-geocoded from the archived address text.
+- **Derived charts are not restored.** They are removed together with their main chart and are not archived, so the main chart comes back but its derived charts must be recalculated (they receive new ids).
+- **`404` is definitive; `503` is temporary.** A chart that was never archived returns `404 Not Found` — it does not exist and will not come back. A chart that *is* archived but could not be rebuilt at that moment (for example the geocoder is unavailable) returns `503 Service Unavailable`; retry shortly. Clients may safely treat a `404` as final — MindForce's Sync uses it to remove an account's reference to a chart the server no longer has — and must not do so for a `503`.
+
+The same fallback applies wherever a chart id is accepted: `POST /calculate` with `recalc`, the progression, solar arc, solar return and lunar return endpoints, and `GET /chart/<chart_id>/derived`.
+
 ---
 
 ### Derived charts

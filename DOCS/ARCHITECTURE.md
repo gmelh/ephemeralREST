@@ -440,8 +440,10 @@ Migrations (SQLite only) run inline: `PRAGMA table_info` checks column presence,
 |---|---|
 | `charts` | Cached natal/event charts. UUID PK, `chart_data` JSON |
 | `derived_charts` | Progressions, returns, solar arc. FK → `charts` |
-| `chart_archive` | Append-only permanent record (`INSERT OR IGNORE`) |
-| `chart_recalculations` | Audit trail of recalculations with optional note |
+| `chart_archive` | Append-only permanent record (`INSERT OR IGNORE`) of each chart's inputs, plus `key_id` — the API key that first calculated it. Never removed by cache cleanup. An expired chart is rebuilt from it under its original id |
+| `chart_recalculations` | Audit trail of recalculations with optional note. A restore uses the latest entry here, so corrections survive expiry |
+
+**Expiry and restore.** Cache cleanup removes a main chart (and, with it, its derived charts) once the main chart's `last_accessed` is older than `CACHE_EXPIRY_DAYS` (default 1095). `chart_archive` and `chart_recalculations` are never touched. When a route later receives the id of an expired chart, `_get_chart_or_restore` (routes.py) recalculates it from the archive and re-inserts it under the same id (`DatabaseManager.restore_chart`); if another chart has since taken its dedup hash, the restored chart is stored under an id-derived hash so neither is displaced. Derived charts are not archived and cannot be restored. Lookups answer `404` only when a chart genuinely does not exist (never archived); if it is archived but the rebuild failed just now, they answer `503` (`_chart_missing`), so clients can treat `404` as definitive.
 
 **Views:**
 
@@ -944,7 +946,7 @@ All values set in `.env`. The `Config` class in `config.py` exposes them.
 | `RATE_LIMIT_PER_HOUR` | No | `300` | Global fallback rate limit |
 | `RATE_LIMIT_PER_DAY` | No | `2000` | Global fallback rate limit |
 | `CORS_ORIGINS` | No | `*` | Allowed CORS origins (comma-separated) |
-| `CACHE_EXPIRY_DAYS` | No | `90` | Chart cache TTL |
+| `CACHE_EXPIRY_DAYS` | No | `1095` | Days a main chart can go unaccessed before it, and the derived charts calculated from it, are removed from the cache (3 years). The permanent `chart_archive` is never removed |
 | `TRUSTED_DEVICE_DAYS` | No | `28` | Trusted-device token lifetime (database value takes precedence) |
 | `TWO_FACTOR_CODE_EXPIRY_MINUTES` | No | `10` | 2FA code validity window |
 | `PORTAL_URL` | Recommended | — | Public URL of the admin portal. Used in email links. Set this or use portal settings. |

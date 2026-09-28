@@ -40,7 +40,7 @@ Usage:
     python cleanup.py
 
     # Also clean up old chart/location cache entries older than N days
-    python cleanup.py --charts --days 90
+    python cleanup.py --charts            # uses CACHE_EXPIRY_DAYS (default 1095 = 3 years)
 
     # Full cleanup with summary
     python cleanup.py --all --days 60 --verbose
@@ -50,7 +50,8 @@ Usage:
 
 What is deleted:
     --place-cache   expired place_cache rows (leaves canonical_places + aliases intact)
-    --charts        chart rows not accessed in --days days
+    --charts        main chart rows not accessed in --days days (derived charts go with
+                    their main chart; chart_archive is never deleted)
                     location rows not used in --days days and not referenced by any chart
     --all           both of the above
 
@@ -94,8 +95,9 @@ def main():
     parser.add_argument(
         '--days',
         type=int,
-        default=90,
-        help='Age threshold in days for chart/location cleanup (default: 90)'
+        default=int(os.environ.get('CACHE_EXPIRY_DAYS', '1095')),
+        help='Age threshold in days for chart/location cleanup '
+             '(default: CACHE_EXPIRY_DAYS, else 1095 = 3 years)'
     )
     parser.add_argument(
         '--dry-run',

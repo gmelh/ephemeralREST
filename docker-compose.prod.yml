@@ -57,7 +57,7 @@ services:
       - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-10}
       - RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR:-50}
       - RATE_LIMIT_PER_DAY=${RATE_LIMIT_PER_DAY:-200}
-      - CACHE_EXPIRY_DAYS=${CACHE_EXPIRY_DAYS:-90}
+      - CACHE_EXPIRY_DAYS=${CACHE_EXPIRY_DAYS:-1095}
       # Public URL of the portal — used to build password-reset and
       # verification email links. Without this, those emails link to the
       # API instead of the portal (wrong — the API has no /verify.php or

@@ -94,6 +94,19 @@ PLACE_CACHE_EXPIRY_DAYS = 30
 _MYSQL_NOW_EXPR = "UTC_TIMESTAMP(6)"
 
 
+def _chart_hash(datetime_utc_iso: str, location_id: int, chart_name: str,
+                house_system: str = None) -> str:
+    """
+    The dedup key for a main chart: same moment + place + name + house system
+    resolves to the same cached chart. Shared by save_chart_to_cache and
+    restore_chart so a chart rebuilt from the archive is found by later
+    calculations exactly as the original was — if the two ever diverged, a
+    restored chart would silently stop matching its own inputs.
+    """
+    key = f"{datetime_utc_iso}_{location_id}_{chart_name}_{house_system or 'none'}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+
 def _translate_sql_mysql(sql: str) -> str:
     """
     Translate a SQLite-flavoured SQL statement into MySQL-compatible SQL.
@@ -769,7 +782,8 @@ class DatabaseManager:
                 datetime_utc        TEXT NOT NULL,
                 datetime_local      TEXT NOT NULL,
                 location            TEXT NOT NULL,
-                first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                key_id              INTEGER
             )
         ''')
 
@@ -778,6 +792,21 @@ class DatabaseManager:
         )
         cursor.execute(
             'CREATE INDEX IF NOT EXISTS idx_archive_datetime ON chart_archive(datetime_utc)'
+        )
+
+        # Migration: record which API key first calculated each archived
+        # chart. Deliberately NOT a foreign key to api_keys — the archive is
+        # permanent, and deleting a key must neither be blocked by it nor
+        # erase who calculated its charts. Ids are never reused, so a
+        # dangling key_id still identifies the (deleted) account. Entries
+        # archived before this column existed stay NULL: owner unknown.
+        cursor.execute("PRAGMA table_info(chart_archive)")
+        archive_columns = [column[1] for column in cursor.fetchall()]
+        if 'key_id' not in archive_columns:
+            cursor.execute("ALTER TABLE chart_archive ADD COLUMN key_id INTEGER")
+            logger.info("Migration: added key_id column to chart_archive table")
+        cursor.execute(
+            'CREATE INDEX IF NOT EXISTS idx_archive_key ON chart_archive(key_id)'
         )
 
         # ------------------------------------------------------------------
@@ -905,6 +934,23 @@ class DatabaseManager:
             if 'duplicate key name' in msg or 'already exists' in msg:
                 return
             raise
+
+    def _mysql_add_column_if_missing(self, cursor, table: str, column: str, definition: str):
+        """
+        MySQL has no ADD COLUMN IF NOT EXISTS (that's MariaDB-only), and this
+        file's MySQL schema had no column migrations until now — every table
+        was created complete. Check information_schema first so schema init
+        stays idempotent and upgrades an existing database in place.
+        """
+        cursor.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (table, column)
+        )
+        row = cursor.fetchone()
+        if row is not None and int(row['n']) == 0:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            logger.info(f"Migration: added {column} column to {table} table")
 
     def _init_schema_mysql(self, cursor):
         """
@@ -1245,11 +1291,16 @@ class DatabaseManager:
                 datetime_utc        VARCHAR(64) NOT NULL,
                 datetime_local      TEXT NOT NULL,
                 location            TEXT NOT NULL,
-                first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                first_calculated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                key_id              INT NULL
             ) {charset}
         ''')
         self._mysql_create_index(cursor, 'CREATE INDEX idx_archive_name     ON chart_archive(chart_name)')
         self._mysql_create_index(cursor, 'CREATE INDEX idx_archive_datetime ON chart_archive(datetime_utc)')
+        # Existing databases predate key_id — see the SQLite migration above
+        # for why this is intentionally not a foreign key.
+        self._mysql_add_column_if_missing(cursor, 'chart_archive', 'key_id', 'INT NULL')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_archive_key      ON chart_archive(key_id)')
 
         cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS chart_recalculations
@@ -1795,9 +1846,7 @@ class DatabaseManager:
         Hash includes datetime + location + chart_name + house_system.
         Different house systems for the same chart produce separate records.
         """
-        house_key  = house_system or 'none'
-        chart_key  = f"{datetime_utc.isoformat()}_{location_id}_{chart_name}_{house_key}"
-        chart_hash = hashlib.md5(chart_key.encode()).hexdigest()
+        chart_hash = _chart_hash(datetime_utc.isoformat(), location_id, chart_name, house_system)
 
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -2005,6 +2054,16 @@ class DatabaseManager:
                         access_count  = access_count + 1
                     WHERE id = ?
                 ''', (derived_id,))
+                # Retention is decided by the main chart's last_accessed
+                # (see cleanup_old_cache), so using a derived chart has to
+                # count as using the chart it belongs to — otherwise a main
+                # chart only ever reached through its derived charts could
+                # expire and take them with it.
+                cursor.execute('''
+                    UPDATE charts
+                    SET last_accessed = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                ''', (row['chart_id'],))
                 return {
                     'id':                 row['id'],
                     'chart_id':           row['chart_id'],
@@ -2162,6 +2221,7 @@ class DatabaseManager:
         datetime_utc:   str,
         datetime_local: str,
         location:       str,
+        key_id:         int = None,
     ) -> bool:
         """
         Permanently record a chart in the archive.
@@ -2173,6 +2233,13 @@ class DatabaseManager:
         Call this from the route layer where the resolved location string
         (formatted_address) is already available.
 
+        key_id is the api_keys.id of the account that calculated the chart,
+        so it's known who it came from. Because the first calculation wins,
+        it records whoever calculated it first — later identical
+        calculations by other accounts (which reuse the same chart_id) don't
+        replace it. None means unknown: entries archived before this was
+        tracked, or a calculation with no real key behind it (debug guest).
+
         Returns True if a new archive record was created, False if one
         already existed for this chart_id (i.e. a recalculation).
         """
@@ -2181,14 +2248,14 @@ class DatabaseManager:
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO chart_archive
-                (chart_id, chart_name, datetime_utc, datetime_local, location)
-                VALUES (?, ?, ?, ?, ?)
+                (chart_id, chart_name, datetime_utc, datetime_local, location, key_id)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (chart_id, chart_name, datetime_utc, datetime_local, location)
+                (chart_id, chart_name, datetime_utc, datetime_local, location, key_id)
             )
             created = cursor.rowcount > 0
         if created:
-            logger.info(f"Chart archived: {chart_id} ('{chart_name}', {location})")
+            logger.info(f"Chart archived: {chart_id} ('{chart_name}', {location}, key_id={key_id})")
         return created
 
     def record_recalculation(
@@ -2272,7 +2339,7 @@ class DatabaseManager:
             rows = conn.execute(
                 f"""
                 SELECT chart_id, chart_name, datetime_utc, datetime_local,
-                       location, first_calculated_at
+                       location, first_calculated_at, key_id
                 FROM chart_archive
                 {where}
                 ORDER BY first_calculated_at DESC
@@ -2282,6 +2349,108 @@ class DatabaseManager:
             ).fetchall()
 
         return [dict(r) for r in rows]
+
+    def get_archive_inputs(self, chart_id: str):
+        """
+        The inputs needed to rebuild an expired chart from the archive, or
+        None if it was never archived.
+
+        chart_archive is first-calculation-wins and is never updated, so on
+        its own it would silently undo a correction — e.g. a birth time that
+        became known after the chart was first calculated. Every recalculation
+        is appended to chart_recalculations, so the chart's last known state
+        is its most recent recalculation if there is one, and the original
+        archive entry otherwise. 'source' says which one was used.
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT chart_id, chart_name, datetime_utc, datetime_local,
+                       location, first_calculated_at
+                FROM chart_archive
+                WHERE chart_id = ?
+            ''', (chart_id,))
+            archived = cursor.fetchone()
+            if not archived:
+                return None
+
+            cursor.execute('''
+                SELECT chart_name, datetime_utc, datetime_local, location
+                FROM chart_recalculations
+                WHERE chart_id = ?
+                ORDER BY recalculated_at DESC, id DESC
+                LIMIT 1
+            ''', (chart_id,))
+            latest = cursor.fetchone()
+            src = latest if latest else archived
+            return {
+                'chart_id':            archived['chart_id'],
+                'chart_name':          src['chart_name'],
+                'datetime_utc':        src['datetime_utc'],
+                'datetime_local':      src['datetime_local'],
+                'location':            src['location'],
+                'first_calculated_at': archived['first_calculated_at'],
+                'source':              'recalculation' if latest else 'archive',
+            }
+
+    def restore_chart(
+            self,
+            chart_id:       str,
+            chart_name:     str,
+            datetime_utc:   str,
+            datetime_local: str,
+            location_id:    int,
+            chart_data:     Dict[str, Any],
+            house_system:   str = None,
+            created_at:     str = None,
+    ) -> bool:
+        """
+        Re-insert a chart that expired from the cache, under its ORIGINAL id,
+        so every reference to that id (share links, an account's manifest)
+        resolves again. Returns True if a chart with that id exists afterwards.
+
+        The dedup hash normally matches the chart's inputs, so a later
+        identical calculation finds the restored chart just as it would have
+        found the original. If a different chart already holds that hash —
+        someone recalculated the same inputs after the expiry and got a new
+        id — the restored chart gets a hash derived from its own id instead.
+        Both ids then resolve; nothing already in the cache is displaced.
+
+        Safe to call for an id that already exists (a concurrent request may
+        have restored it first): INSERT OR IGNORE, and the existence check at
+        the end is what's reported.
+        """
+        natural_hash = _chart_hash(datetime_utc, location_id, chart_name, house_system)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM charts WHERE id = ?', (chart_id,))
+            if cursor.fetchone():
+                return True
+
+            cursor.execute('SELECT id FROM charts WHERE chart_hash = ?', (natural_hash,))
+            clash = cursor.fetchone()
+            chart_hash = natural_hash if not clash else hashlib.md5(
+                f"{natural_hash}_restored_{chart_id}".encode()
+            ).hexdigest()
+
+            cursor.execute('''
+                INSERT OR IGNORE INTO charts
+                (id, chart_name, datetime_utc, datetime_local, location_id,
+                 chart_data, chart_hash, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+            ''', (
+                chart_id, chart_name, datetime_utc, datetime_local, location_id,
+                json.dumps(chart_data), chart_hash, created_at,
+            ))
+
+            cursor.execute('SELECT id FROM charts WHERE id = ?', (chart_id,))
+            exists = cursor.fetchone() is not None
+        if exists:
+            logger.info(
+                f"Chart {chart_id} restored from archive "
+                f"({'hash clash — used id-derived hash' if clash else 'original hash'})"
+            )
+        return exists
 
     # ==========================================================================
     # SMTP configuration methods
@@ -2670,10 +2839,16 @@ class DatabaseManager:
         Permanently delete an API key record and any service grants it holds.
         Service grants are removed first — MySQL's FK constraint on
         api_key_services.key_id would otherwise reject the delete.
+
+        The key's account_charts manifest goes with it (it's that account's
+        private list and means nothing without the key). chart_archive rows
+        are deliberately left alone — the archive is permanent, and its
+        key_id is how it stays known who calculated a chart.
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM api_key_services WHERE key_id = ?', (key_id,))
+            cursor.execute('DELETE FROM account_charts WHERE key_id = ?', (key_id,))
             cursor.execute('DELETE FROM api_keys WHERE id = ?', (key_id,))
             return cursor.rowcount > 0
 
@@ -3111,23 +3286,34 @@ class DatabaseManager:
                 'cities_import':        cities_meta,
             }
 
-    def cleanup_old_cache(self, days: int = 90) -> int:
+    def cleanup_old_cache(self, days: int = 1095) -> int:
         """
         Remove stale entries across charts, derived charts, views, and locations.
         All deletions run in a single transaction — if any step fails the whole
         cleanup rolls back, leaving the database in its previous state.
 
+        Retention is decided by the MAIN chart's last_accessed alone. A
+        derived chart has no expiry of its own: it lives exactly as long as
+        the chart it was calculated from and goes with it. (Reading a derived
+        chart refreshes its parent's last_accessed — see
+        get_derived_chart_by_id — so using any part of a family keeps the
+        whole family.) The default is 1095 days (3 years).
+
+        chart_archive and chart_recalculations are never touched here. The
+        archive keeps the inputs of every chart ever calculated, so a chart
+        whose cached data has expired can still be identified and
+        recalculated from it.
+
         Order of operations (FK constraints require this sequence):
-            1. Derived charts whose parent chart is expiring (cascade)
-            2. Derived charts that are stale independently
-            3. Natal charts that are stale
-            4. Views not accessed within the expiry window
-            5. Locations no longer referenced by any remaining chart
+            1. Derived charts whose main chart is expiring (cascade)
+            2. Main charts that are stale
+            3. Views not accessed within the expiry window
+            4. Locations no longer referenced by any remaining chart
         """
         with self.get_connection() as conn:
             cursor = conn.cursor()
 
-            # 1. Cascade-delete derived charts belonging to expiring natal charts
+            # 1. Cascade-delete derived charts belonging to expiring main charts
             cursor.execute('''
                 DELETE FROM derived_charts
                 WHERE chart_id IN (
@@ -3135,30 +3321,23 @@ class DatabaseManager:
                     WHERE last_accessed < datetime('now', '-' || ? || ' days')
                 )
             ''', (days,))
-            deleted_derived_cascade = cursor.rowcount
+            deleted_derived = cursor.rowcount
 
-            # 2. Derived charts that are themselves stale (parent chart still active)
-            cursor.execute('''
-                DELETE FROM derived_charts
-                WHERE last_accessed < datetime('now', '-' || ? || ' days')
-            ''', (days,))
-            deleted_derived_stale = cursor.rowcount
-
-            # 3. Natal charts
+            # 2. Main charts
             cursor.execute('''
                 DELETE FROM charts
                 WHERE last_accessed < datetime('now', '-' || ? || ' days')
             ''', (days,))
             deleted_charts = cursor.rowcount
 
-            # 4. Views not accessed within the expiry window
+            # 3. Views not accessed within the expiry window
             cursor.execute('''
                 DELETE FROM views
                 WHERE last_accessed < datetime('now', '-' || ? || ' days')
             ''', (days,))
             deleted_views = cursor.rowcount
 
-            # 5. Orphaned locations (no remaining chart references them)
+            # 4. Orphaned locations (no remaining chart references them)
             cursor.execute('''
                 DELETE FROM locations
                 WHERE last_used < datetime('now', '-' || ? || ' days')
@@ -3166,14 +3345,10 @@ class DatabaseManager:
             ''', (days,))
             deleted_locations = cursor.rowcount
 
-            total = (
-                deleted_derived_cascade + deleted_derived_stale +
-                deleted_charts + deleted_views + deleted_locations
-            )
+            total = deleted_derived + deleted_charts + deleted_views + deleted_locations
             logger.info(
-                f"Cache cleanup complete: {deleted_charts} charts, "
-                f"{deleted_derived_cascade + deleted_derived_stale} derived charts "
-                f"({deleted_derived_cascade} cascade, {deleted_derived_stale} stale), "
+                f"Cache cleanup complete ({days} day threshold): "
+                f"{deleted_charts} charts, {deleted_derived} derived charts (with their main charts), "
                 f"{deleted_views} views, {deleted_locations} locations — {total} total"
             )
             return total
