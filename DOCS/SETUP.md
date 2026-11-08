@@ -258,6 +258,40 @@ themselves are managed from ephemeral.rest — see `key_manager.py`'s
 `grant-service` / `revoke-service` / `set-services` / `list-grants`
 commands.
 
+### Account store (optional)
+
+`/account/store` gives every API key a private JSON document store, which
+client applications use to keep their own data on the server and sync it
+between devices (see "Account store" in `API_REFERENCE.md`). It is on by
+default; its tables are created automatically with the rest of the schema.
+
+```bash
+STORE_ENABLED=true              # false turns the endpoints off entirely
+STORE_REQUIRE_GRANT=false       # true: only keys granted the 'store' service
+                                # (admin keys always can)
+STORE_MAX_DOC_BYTES=1048576     # one document's content (1 MB)
+STORE_MAX_META_BYTES=2048       # one document's meta
+STORE_MAX_ACCOUNT_BYTES=52428800  # all live documents per account (50 MB)
+STORE_MAX_DOCS=10000            # documents per account
+STORE_TOMBSTONE_DAYS=180        # how long deletion markers are kept
+STORE_RATE_LIMIT_EXEMPT=false   # true: store requests don't count towards
+                                # the per-key hourly/daily rate limits
+```
+
+- With `STORE_REQUIRE_GRANT=true`, grant access per key with
+  `python key_manager.py grant-service` (service name `store`) or from the
+  portal's Keys page.
+- A full sync can take many requests. If clients hit `429`, either raise the
+  key class limits or set `STORE_RATE_LIMIT_EXEMPT=true`.
+- nginx's `client_max_body_size` (2m in the example below) must be larger
+  than `STORE_MAX_DOC_BYTES` plus a little for the request envelope — raise
+  both together.
+- Clients that send `If-Match` / `If-None-Match` from a browser need those
+  headers in `CORS_HEADERS` (they are in the default). The `ETag` response
+  header is exposed to browsers automatically.
+- Deletion markers are purged by `python cleanup.py --store` (also part of
+  `--all`); schedule it alongside your other cleanup, e.g. weekly from cron.
+
 ---
 
 ## 5. Initialise the database
@@ -489,6 +523,9 @@ cd /srv/ephemeral/app && git pull
 source .venv/bin/activate && pip install -r requirements.txt
 exit
 sudo systemctl restart ephemeral
+
+# Cache and account store cleanup (e.g. weekly from cron)
+cd /srv/ephemeral/app && .venv/bin/python cleanup.py --all
 ```
 
 ---

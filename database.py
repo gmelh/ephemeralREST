@@ -852,6 +852,39 @@ class DatabaseManager:
             )
         ''')
 
+        # Account store — general-purpose per-account JSON documents
+        # (account_store.py). Content is opaque to the server; namespace and
+        # doc_key are chosen by the client application. account_store_seq is
+        # each account's change counter, used by the store's change feed.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_documents
+            (
+                key_id      INTEGER NOT NULL,
+                namespace   TEXT    NOT NULL,
+                doc_key     TEXT    NOT NULL,
+                content     TEXT,
+                meta        TEXT,
+                revision    INTEGER NOT NULL,
+                seq         INTEGER NOT NULL,
+                size        INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL,
+                deleted_at  TEXT,
+                PRIMARY KEY (key_id, namespace, doc_key)
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_store_seq
+            (
+                key_id INTEGER PRIMARY KEY,
+                seq    INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_documents_feed '
+                       'ON account_documents (key_id, namespace, seq)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_account_documents_deleted '
+                       'ON account_documents (deleted_at)')
+
         # Account chart manifest — per-account list of "which charts are
         # mine", so a client can sync its local chart list across
         # machines. Never stores planetary_positions — that stays in the
@@ -1330,6 +1363,40 @@ class DatabaseManager:
                 last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             ) {charset}
         ''')
+
+        # Account store — general-purpose per-account JSON documents
+        # (account_store.py). namespace/doc_key use a binary collation so
+        # keys are case-sensitive, matching SQLite. DATETIME(6) rather than
+        # TIMESTAMP: values are written as naive UTC from Python, and
+        # DATETIME applies no session time-zone conversion.
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS account_documents
+            (
+                key_id      INT          NOT NULL,
+                namespace   VARCHAR(64)  CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                doc_key     VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                content     LONGTEXT,
+                meta        TEXT,
+                revision    BIGINT       NOT NULL,
+                seq         BIGINT       NOT NULL,
+                size        INT          NOT NULL DEFAULT 0,
+                created_at  DATETIME(6)  NOT NULL,
+                updated_at  DATETIME(6)  NOT NULL,
+                deleted_at  DATETIME(6)  NULL,
+                PRIMARY KEY (key_id, namespace, doc_key)
+            ) {charset}
+        ''')
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS account_store_seq
+            (
+                key_id INT    NOT NULL PRIMARY KEY,
+                seq    BIGINT NOT NULL DEFAULT 0
+            ) {charset}
+        ''')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_account_documents_feed '
+                                         'ON account_documents (key_id, namespace, seq)')
+        self._mysql_create_index(cursor, 'CREATE INDEX idx_account_documents_deleted '
+                                         'ON account_documents (deleted_at)')
 
         # Account chart manifest — per-account list of "which charts are
         # mine", so a client can sync its local chart list across
@@ -2840,7 +2907,8 @@ class DatabaseManager:
         Service grants are removed first — MySQL's FK constraint on
         api_key_services.key_id would otherwise reject the delete.
 
-        The key's account_charts manifest goes with it (it's that account's
+        The key's account_charts manifest and account store documents go
+        with it (it's that account's
         private list and means nothing without the key). chart_archive rows
         are deliberately left alone — the archive is permanent, and its
         key_id is how it stays known who calculated a chart.
@@ -2849,6 +2917,9 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute('DELETE FROM api_key_services WHERE key_id = ?', (key_id,))
             cursor.execute('DELETE FROM account_charts WHERE key_id = ?', (key_id,))
+            # Account store documents are equally private to the key.
+            cursor.execute('DELETE FROM account_documents WHERE key_id = ?', (key_id,))
+            cursor.execute('DELETE FROM account_store_seq WHERE key_id = ?', (key_id,))
             cursor.execute('DELETE FROM api_keys WHERE id = ?', (key_id,))
             return cursor.rowcount > 0
 

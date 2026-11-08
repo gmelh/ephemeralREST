@@ -115,7 +115,7 @@ MAX_MONTHLY_REQUESTS=10000
 # -----------------------------------------------------------------------------
 CORS_ORIGINS=*
 CORS_METHODS=GET,POST,PUT,DELETE,OPTIONS
-CORS_HEADERS=Content-Type,Authorization,X-Requested-With,X-API-Key
+CORS_HEADERS=Content-Type,Authorization,X-Requested-With,X-API-Key,If-Match,If-None-Match
 
 # -----------------------------------------------------------------------------
 # Rate limiting
@@ -132,6 +132,33 @@ RATE_LIMIT_PER_DAY=200
 # is removed from the cache. Default is 3 years. The permanent chart_archive
 # is never removed.
 CACHE_EXPIRY_DAYS=1095
+
+# -----------------------------------------------------------------------------
+# Account store — per-account JSON documents at /account/store
+# (see account_store.py and DOCS/API_REFERENCE.md)
+# -----------------------------------------------------------------------------
+# Turn the whole feature on or off.
+STORE_ENABLED=true
+
+# When true, only keys granted the 'store' service (Keys page / admin API)
+# can use it; admin keys always can. When false, any real API key can.
+STORE_REQUIRE_GRANT=false
+
+# Size limits, in bytes: one document's content, one document's meta, and
+# the total of all live documents per account. Plus a document count.
+STORE_MAX_DOC_BYTES=1048576
+STORE_MAX_META_BYTES=2048
+STORE_MAX_ACCOUNT_BYTES=52428800
+STORE_MAX_DOCS=10000
+
+# Days a deletion marker is kept so other devices can learn about the
+# delete. Purged by `python cleanup.py --store`. Keep this longer than any
+# device is likely to go without syncing.
+STORE_TOMBSTONE_DAYS=180
+
+# Syncing a whole namespace can take many requests. When true, store
+# requests don't count towards the per-key hourly/daily rate limits.
+STORE_RATE_LIMIT_EXEMPT=false
 
 # -----------------------------------------------------------------------------
 # Login / 2FA / trusted devices
@@ -253,7 +280,7 @@ class Config:
     # CORS settings
     CORS_ORIGINS  = os.environ.get('CORS_ORIGINS', '*').split(',')
     CORS_METHODS  = os.environ.get('CORS_METHODS', 'GET,POST,PUT,DELETE,OPTIONS').split(',')
-    CORS_HEADERS  = os.environ.get('CORS_HEADERS', 'Content-Type,Authorization,X-Requested-With,X-API-Key').split(',')
+    CORS_HEADERS  = os.environ.get('CORS_HEADERS', 'Content-Type,Authorization,X-Requested-With,X-API-Key,If-Match,If-None-Match').split(',')
 
     # Global rate limiting (fallback when user cfg has no per-user limits)
     RATE_LIMIT_ENABLED    = os.environ.get('RATE_LIMIT_ENABLED', 'True').lower() == 'true'
@@ -263,6 +290,16 @@ class Config:
 
     # Cache settings
     CACHE_EXPIRY_DAYS = int(os.environ.get('CACHE_EXPIRY_DAYS', '1095'))
+
+    # Account store (account_store.py)
+    STORE_ENABLED           = os.environ.get('STORE_ENABLED', 'true').strip().lower() in ('true', '1', 'yes')
+    STORE_REQUIRE_GRANT     = os.environ.get('STORE_REQUIRE_GRANT', 'false').strip().lower() in ('true', '1', 'yes')
+    STORE_MAX_DOC_BYTES     = int(os.environ.get('STORE_MAX_DOC_BYTES', '1048576'))
+    STORE_MAX_META_BYTES    = int(os.environ.get('STORE_MAX_META_BYTES', '2048'))
+    STORE_MAX_ACCOUNT_BYTES = int(os.environ.get('STORE_MAX_ACCOUNT_BYTES', '52428800'))
+    STORE_MAX_DOCS          = int(os.environ.get('STORE_MAX_DOCS', '10000'))
+    STORE_TOMBSTONE_DAYS    = int(os.environ.get('STORE_TOMBSTONE_DAYS', '180'))
+    STORE_RATE_LIMIT_EXEMPT = os.environ.get('STORE_RATE_LIMIT_EXEMPT', 'false').strip().lower() in ('true', '1', 'yes')
 
     # Login / 2FA / trusted devices
     TRUSTED_DEVICE_DAYS             = int(os.environ.get('TRUSTED_DEVICE_DAYS', '28'))
@@ -310,6 +347,15 @@ class Config:
                     "USE_GOOGLE=false but GOOGLE_MAPS_API_KEY is set — key will be ignored"
                 )
 
+        # Account store limits must be positive
+        if cls.STORE_ENABLED:
+            for name in ('STORE_MAX_DOC_BYTES', 'STORE_MAX_META_BYTES',
+                         'STORE_MAX_ACCOUNT_BYTES', 'STORE_MAX_DOCS', 'STORE_TOMBSTONE_DAYS'):
+                if getattr(cls, name) <= 0:
+                    errors.append(f"{name} must be greater than 0")
+            if cls.STORE_MAX_DOC_BYTES > cls.STORE_MAX_ACCOUNT_BYTES:
+                warnings.append("STORE_MAX_DOC_BYTES is larger than STORE_MAX_ACCOUNT_BYTES")
+
         # Check SECRET_KEY is set — required for API key encryption
         if not cls.SECRET_KEY or cls.SECRET_KEY == 'your-secret-key-here':
             if not cls.FLASK_DEBUG:
@@ -350,4 +396,6 @@ class Config:
             'cities_folder':        cls.CITIES_FOLDER,
             'key_store':            'database',
             'encryption':           'Fernet (AES-128)',
+            'account_store':        ('enabled' + (' (grant required)' if cls.STORE_REQUIRE_GRANT else ''))
+                                    if cls.STORE_ENABLED else 'disabled',
         }

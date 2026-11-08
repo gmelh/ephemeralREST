@@ -114,7 +114,10 @@ All responses are JSON objects. Successful responses contain the requested data.
 | `403` | Forbidden | Endpoint requires admin access |
 | `404` | Not found | Chart UUID does not exist, or endpoint path is wrong |
 | `409` | Conflict | Attempting to create something that already exists |
+| `412` | Precondition failed | Account store: the document changed since the revision you sent |
+| `413` | Payload too large | Account store: document or meta over the size limit |
 | `429` | Too many requests | Rate limit exceeded — wait before retrying |
+| `507` | Insufficient storage | Account store: your account's storage or document limit is reached |
 | `500` | Server error | Unexpected internal error — check server logs |
 
 When you receive a `429`, the response will tell you which limit was hit. Wait for the window to reset (one minute, one hour, or one day depending on which limit) before retrying. Do not retry immediately in a tight loop.
@@ -1171,6 +1174,131 @@ curl -X POST https://api.yourdomain.com/me/rotate \
 
 ---
 
+### Account store
+
+A private, general-purpose JSON document store for each API key. Use it to keep your application's own data on the server and sync it between devices: saved settings, layouts, drawings, notes, anything that serialises to JSON. ephemeralREST never interprets what you store; it only handles ownership, revisions, a change feed and size limits.
+
+Documents are addressed as **namespace / key**:
+
+| Part | Chosen by | Rules | Example |
+|---|---|---|---|
+| Namespace | Your application | 1–64 characters of lowercase `a-z 0-9 . _ -`, starting with a letter or digit. Use a reverse-domain style name so different applications can't collide. | `example.notes`, `myapp.layouts` |
+| Key | Your application | 1–255 characters. `/`-separated segments of `A-Z a-z 0-9 . _ ~ : @ ! $ & ' ( ) * + , ; = ^ -`; no empty, `.` or `..` segments. Case-sensitive. | `ASX/BHP`, `2026/11/07`, `^GSPC` |
+| Content | Your application | Any JSON value, up to the server's document size limit (1 MB by default). | `{"tabs": {...}}` |
+| Meta | Your application, optional | A small JSON object (2 KB by default) returned in listings, so you can show a list without downloading every document. | `{"name": "BHP", "tags": ["ASX"]}` |
+
+Documents are visible only to the key that wrote them. Deleting a key deletes its documents. Depending on how the server is configured, your key may need the `store` service granted before it can use these endpoints (`403` otherwise).
+
+**Revisions and safe updates.** Every write increases the document's `revision`, which is also returned as the `ETag` header. To avoid overwriting a change made on another device, send the revision you last read:
+
+| Header | Query alternative | Effect |
+|---|---|---|
+| `If-Match: 3` | `?if_match=3` | Write or delete only if the document is still at revision 3. Otherwise `412`, with the current document in `current`. |
+| `If-None-Match: *` | `?if_none_match=*` | Create only. `412` if the document already exists. |
+| *(none)* | | Unconditional write. |
+
+The query alternatives exist for browser clients whose server CORS settings don't allow those headers.
+
+**Change feed.** Each account has a counter, `seq`, that goes up by one on every write or delete in any namespace. Each document records the `seq` of its last change. To sync, remember the highest `seq` you've processed (`next_since` in a listing) and later ask only for what changed after it. A counter is used rather than timestamps because device clocks drift.
+
+**Deletion.** Deleting leaves a small marker (`"deleted": true`, no content) so other devices learn about the delete through the change feed. Markers are kept for a period set by the server (180 days by default), so a device that hasn't synced for longer than that won't see older deletions. Writing to a deleted key creates it again; its revision number keeps counting up, so an `If-Match` from before the delete can never match.
+
+#### `GET /account/store`
+
+Your namespaces, document counts, usage and the server's limits.
+
+```bash
+curl https://api.yourdomain.com/account/store \
+  -H "X-API-Key: eph_your_key_here"
+```
+
+```json
+{
+  "namespaces": [
+    { "namespace": "example.notes", "documents": 12, "bytes": 48213, "last_seq": 57 }
+  ],
+  "account_seq": 57,
+  "usage":  { "documents": 12, "bytes": 48213 },
+  "limits": { "max_doc_bytes": 1048576, "max_meta_bytes": 2048,
+              "max_account_bytes": 52428800, "max_documents": 10000 }
+}
+```
+
+#### `GET /account/store/<namespace>`
+
+The change feed for one namespace, oldest change first. Documents and deletion markers are both listed; content is left out unless asked for.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `since` | `0` | Only changes after this `seq`. `0` lists everything. |
+| `limit` | `100` | Page size, 1–500. |
+| `include` | | `content` to include each document's content (for a full pull or export). |
+
+```bash
+curl "https://api.yourdomain.com/account/store/example.notes?since=40" \
+  -H "X-API-Key: eph_your_key_here"
+```
+
+```json
+{
+  "namespace": "example.notes",
+  "items": [
+    { "namespace": "example.notes", "key": "2026/11/07", "revision": 3, "seq": 41,
+      "size": 812, "deleted": false, "meta": { "title": "Saturday" },
+      "created_at": "2026-11-07T08:12:03.512000Z", "updated_at": "2026-11-07T08:40:19.004000Z" },
+    { "namespace": "example.notes", "key": "drafts/old", "revision": 2, "seq": 42,
+      "size": 0, "deleted": true, "meta": null,
+      "created_at": "2026-10-01T02:00:00Z", "updated_at": "2026-11-07T08:41:00Z",
+      "deleted_at": "2026-11-07T08:41:00Z" }
+  ],
+  "has_more": false,
+  "next_since": 42,
+  "account_seq": 57
+}
+```
+
+While `has_more` is `true`, call again with `since=<next_since>`.
+
+#### `GET /account/store/<namespace>/<key>`
+
+One document, with its content. The revision is returned in the `ETag` header as well as the body. `404` if it doesn't exist or has been deleted.
+
+```bash
+curl https://api.yourdomain.com/account/store/example.notes/2026/11/07 \
+  -H "X-API-Key: eph_your_key_here"
+```
+
+#### `PUT /account/store/<namespace>/<key>`
+
+Create or replace a document. Returns `201` when created, `200` when replaced; the response is the document's details without its content.
+
+| Body field | Required | Description |
+|---|---|---|
+| `content` | Yes | Any JSON value. |
+| `meta` | No | JSON object, or `null` to clear it. If omitted on an update, the existing meta is kept. |
+
+```bash
+curl -X PUT https://api.yourdomain.com/account/store/example.notes/2026/11/07 \
+  -H "X-API-Key: eph_your_key_here" \
+  -H "Content-Type: application/json" \
+  -H "If-Match: 3" \
+  -d '{"content": {"text": "Revised note"}, "meta": {"title": "Saturday"}}'
+```
+
+#### `DELETE /account/store/<namespace>/<key>`
+
+Delete a document, leaving a deletion marker. Accepts `If-Match`. Returns the marker; `404` if there was no live document.
+
+**Store-specific responses**
+
+| Status | Meaning |
+|---|---|
+| `412` | Precondition failed: the document changed since the revision you sent (or already exists, for `If-None-Match: *`). The body's `current` holds the current document, or `null` if it no longer exists. |
+| `413` | The document's content or meta is larger than the server allows. |
+| `507` | Your account's storage or document limit is reached. |
+
+---
+
 ## Output configuration reference
 
 ### Top-level fields
@@ -1446,6 +1574,11 @@ Set or change a password. Supply either `token` (from email) or `email` + `curre
 | `POST` | `/me/output` | Update your output configuration |
 | `POST` | `/me/rotate` | Rotate your API key |
 | `POST` | `/me/forget-device` | Revoke a trusted-device token |
+| `GET` | `/account/store` | Your account store namespaces, usage and limits |
+| `GET` | `/account/store/<ns>` | Change feed / listing for a namespace |
+| `GET` | `/account/store/<ns>/<key>` | Read a stored document |
+| `PUT` | `/account/store/<ns>/<key>` | Create or replace a stored document |
+| `DELETE` | `/account/store/<ns>/<key>` | Delete a stored document |
 
 ### Admin endpoints (admin key required)
 

@@ -47,6 +47,7 @@ from auth import AuthManager, get_client_ip
 from geocoding import GeocodingService
 from astronomy import AstronomyService
 from routes import api, init_routes
+from account_store import init_account_store, store_api
 from middleware import setup_middleware, setup_request_logging
 from users import init_users, get_all_user_ids
 
@@ -202,6 +203,9 @@ def create_app(config_class=Config):
          origins=config_class.CORS_ORIGINS,
          methods=config_class.CORS_METHODS,
          allow_headers=config_class.CORS_HEADERS,
+         # Account store returns each document's revision as an ETag —
+         # browsers only let page scripts read headers listed here.
+         expose_headers=['ETag'],
          supports_credentials=True)
 
     # Initialize components
@@ -309,6 +313,11 @@ def create_app(config_class=Config):
         )
     logger.info(f"API authentication enabled for: {_protected}")
 
+    # Account store — general-purpose per-account JSON documents
+    # (/account/store). Registers its own blueprint and wraps its routes
+    # with the same API-key authentication as above.
+    account_store = init_account_store(app, db_manager, auth_manager, config_class)
+
     # Setup rate limiting with per-user dynamic limits
     if config_class.RATE_LIMIT_ENABLED:
         limiter = Limiter(
@@ -324,6 +333,10 @@ def create_app(config_class=Config):
         limiter.limit(
             _per_user_limit('per_minute', config_class.RATE_LIMIT_PER_MINUTE)
         )(app.view_functions['api.calculate'])
+
+        if account_store is not None and config_class.STORE_RATE_LIMIT_EXEMPT:
+            limiter.exempt(store_api)
+            logger.info("Account store exempt from per-user rate limits")
 
         logger.info("Per-user rate limiting enabled")
 

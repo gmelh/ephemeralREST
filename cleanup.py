@@ -53,7 +53,10 @@ What is deleted:
     --charts        main chart rows not accessed in --days days (derived charts go with
                     their main chart; chart_archive is never deleted)
                     location rows not used in --days days and not referenced by any chart
-    --all           both of the above
+    --store         account store deletion markers older than STORE_TOMBSTONE_DAYS
+                    (default 180) — the markers that tell other devices a
+                    document was deleted; live documents are never touched
+    --all           all of the above
 
 What is NEVER deleted:
     canonical_places   — permanent place identity
@@ -88,9 +91,14 @@ def main():
         help='Delete old chart and location cache entries'
     )
     parser.add_argument(
+        '--store',
+        action='store_true',
+        help='Purge account store deletion markers older than STORE_TOMBSTONE_DAYS'
+    )
+    parser.add_argument(
         '--all',
         action='store_true',
-        help='Run all cleanup tasks (place-cache + charts)'
+        help='Run all cleanup tasks (place-cache + charts + store)'
     )
     parser.add_argument(
         '--days',
@@ -113,12 +121,13 @@ def main():
     args = parser.parse_args()
 
     # Default to --place-cache if nothing specified
-    if not any([args.place_cache, args.charts, args.all]):
+    if not any([args.place_cache, args.charts, args.store, args.all]):
         args.place_cache = True
 
     if args.all:
         args.place_cache = True
         args.charts      = True
+        args.store       = True
 
     # Initialise database
     from database import create_database_manager
@@ -178,6 +187,20 @@ def main():
         else:
             deleted = db.cleanup_old_cache(args.days)
             print(f"Deleted {deleted} chart/location cache entries older than {args.days} days")
+            total_deleted += deleted
+
+    # --- Account store deletion markers ---
+    if args.store:
+        from account_store import AccountStore
+        store = AccountStore(db, Config)
+        days = Config.STORE_TOMBSTONE_DAYS
+        if args.dry_run:
+            count = store.count_expired_tombstones(days)
+            print(f"[DRY RUN] Would purge {count} account store deletion marker(s) "
+                  f"older than {days} days")
+        else:
+            deleted = store.purge_tombstones(days)
+            print(f"Purged {deleted} account store deletion marker(s) older than {days} days")
             total_deleted += deleted
 
     if args.verbose and not args.dry_run:
