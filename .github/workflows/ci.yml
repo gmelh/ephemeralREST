@@ -14,8 +14,8 @@ jobs:
   api:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt pytest
@@ -27,10 +27,10 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: "22"
+          node-version: "24"
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run build
@@ -38,7 +38,7 @@ jobs:
   installer:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: bash -n install/install.sh
       - run: shellcheck install/install.sh install/server-test.sh
       - name: Dry run, as people run it (piped into bash)
@@ -52,7 +52,7 @@ jobs:
   image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: docker build -t ephemeralrest:ci .
       - name: Starts and answers
         run: |
