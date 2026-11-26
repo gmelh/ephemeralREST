@@ -112,22 +112,29 @@ class EmailService:
         self.use_ssl     = cfg['use_ssl'].lower()  in ('true', '1', 'yes')
         self.admin_email = cfg['admin_email']
         self.base_url    = cfg['base_url'].rstrip('/')
-        # portal_url resolution order:
-        #   1. smtp_config table (set via admin SMTP page)
-        #   2. PORTAL_URL env var
-        #   3. base_url fallback (wrong for portal links — logs a warning)
-        _portal_url = cfg.get('portal_url', '').strip()
-        if not _portal_url:
-            _portal_url = os.environ.get('PORTAL_URL', '').strip()
-        if _portal_url:
-            self.portal_url = _portal_url.rstrip('/')
+        # Where links in emails point.
+        #   PUBLIC_URL set (the single-address install): the built-in web app,
+        #   at /verify and /set-password.
+        #   Otherwise (older two-service deployments): portal_url from the
+        #   SMTP settings, then PORTAL_URL, then the API's own base_url —
+        #   at ephemeralADMIN's /verify.php and /set-password.php (which this
+        #   server also redirects, should they land here).
+        from config import Config
+        if Config.PUBLIC_URL:
+            self.portal_url  = Config.PUBLIC_URL
+            self.link_suffix = ''
         else:
-            self.portal_url = self.base_url
-            logger.warning(
-                "portal_url is not configured — email links will use the API URL (%s) "
-                "instead of the portal URL. Set PORTAL_URL in .env.",
-                self.base_url
-            )
+            self.link_suffix = '.php'
+            _portal_url = cfg.get('portal_url', '').strip() or os.environ.get('PORTAL_URL', '').strip()
+            if _portal_url:
+                self.portal_url = _portal_url.rstrip('/')
+            else:
+                self.portal_url = self.base_url
+                logger.warning(
+                    "PUBLIC_URL is not set — email links will use the API URL (%s). "
+                    "Set PUBLIC_URL in .env to the address this server is reached at.",
+                    self.base_url
+                )
         self.enabled     = bool(self.host and self.user and self.password)
 
         if not self.enabled:
@@ -145,9 +152,9 @@ class EmailService:
             base_url: str = None, template: dict = None, url: str = None
     ) -> bool:
         """Send email verification link to a newly registered user."""
-        # Link goes to the portal's verify.php, which calls the API internally, unless the
-        # app that registered them gave its own (url, already checked against its origins).
-        verify_url = url or f"{self.portal_url}/verify.php?t={token}"
+        # The web app's page, unless the app that registered them gave its own
+        # (url, already checked against its origins).
+        verify_url = url or f"{self.portal_url}/verify{self.link_suffix}?t={token}"
         vars = {'name': name, 'verify_url': verify_url}
 
         if template:
@@ -271,7 +278,7 @@ ephemeralREST
 
     def send_set_password(self, to_email: str, name: str, token: str, template: dict = None, url: str = None) -> bool:
         """Send a link prompting the user to set a password (post email-verification)."""
-        set_password_url = url or f"{self.portal_url}/set-password.php?t={token}"
+        set_password_url = url or f"{self.portal_url}/set-password{self.link_suffix}?t={token}"
         vars = {'name': name, 'set_password_url': set_password_url}
 
         if template:
@@ -309,7 +316,7 @@ ephemeralREST
 
     def send_password_reset_required(self, to_email: str, name: str, token: str, template: dict = None, url: str = None) -> bool:
         """Notify a user that an admin has required them to set a new password."""
-        set_password_url = url or f"{self.portal_url}/set-password.php?t={token}"
+        set_password_url = url or f"{self.portal_url}/set-password{self.link_suffix}?t={token}"
         vars = {'name': name, 'set_password_url': set_password_url}
 
         if template:

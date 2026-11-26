@@ -660,6 +660,29 @@ ephemeralREST's own emails, so no site can see another's codes or tokens. Taking
 stops it at once. `POST /me/rotate {"email_key": false}` sends the `key-rotated-notice` email (no key
 in it) instead of `key-rotated`.
 
+### Sites, the admin address and the audit log (`sites.py`)
+
+A **site** is a domain key seen from the administrator's side: its sign-up addresses
+(`key_link_origins`), whether it may deliver its accounts' emails (`key_email_delivery`), the
+accounts made through it (`account_home`), and its rate limits. `POST /admin/sites` makes the key
+and applies the **site defaults** (`admin_settings`, name `site_defaults`).
+
+`ADMIN_URL` (or `ADMIN_DOMAIN`) names the admin address. A `before_request` hook answers 404 for
+every admin endpoint (`api.admin_*`, `admin_tools.*`, `sites.*`) at any other host, before
+authentication runs, and `/auth/status` tells the web app whether administration answers here
+(`config.admin_here`).
+
+An `after_request` hook writes every successful change under `/admin` (not `GET`) to
+`admin_audit`: who (key id and email), their address, the action (the endpoint's name), the
+target (site, key, service or template) and the request body with anything secret scrubbed. A
+change to a domain key through `/admin/keys/<id>/…` is filed under the site, so it shows on the
+site's page.
+
+Client addresses: `get_client_ip()` is `request.remote_addr`. Behind a proxy, `TRUST_PROXY`
+applies werkzeug's `ProxyFix` — only to requests from `TRUSTED_PROXIES` when that's set (the
+installer sets the shared Caddy's address), so other containers on the shared network can't claim
+another address with `X-Forwarded-For`.
+
 ### Adding a new email type
 
 1. Add a `send_*` method to `EmailService` following the existing pattern — accept `template: dict = None`, use `_substitute()` and `_render_template_html()` for the template path, and provide hardcoded fallback HTML.
@@ -747,7 +770,52 @@ Routes are organised in this order in `routes.py`:
 
 ---
 
-## 13. The admin portal (PHP)
+## 13. The web app (replaces the PHP admin portal)
+
+From version 1.0 the administration portal is part of this repository and served by the
+same process as the API, at one address:
+
+| Path | What answers |
+|------|--------------|
+| `/api/v1/...` | The API. `web.ApiPrefix` strips the prefix, so the routes are unchanged. |
+| `/calculate`, `/me`, … | The same API routes without the prefix, for older clients. |
+| Any other GET from a browser | The web app (`web/dist/index.html`), whose own router shows the page. |
+| `/*.php` | Redirects from the old portal's addresses (`/verify.php?t=…` → `/verify?t=…`). |
+
+How a request is told apart (`web._serve_web_app`, a `before_request` hook that runs before
+rate limiting): an `/api/v1` request always goes to the API. Otherwise, a GET that no API
+route matches is answered from `web/dist` — a file if one exists, else `index.html` when the
+`Accept` header asks for HTML. API clients therefore still get JSON 404s. Web app page
+addresses are chosen not to collide with API GET routes (the account page is `/account`,
+not `/me`; keys are `/keys`, not `/admin/keys`).
+
+**Sessions.** `/auth/login`, `/auth/login/2fa` and `/auth/setup` reuse `_do_login`,
+`_do_login_2fa` and `_do_setup` from `routes.py` — the same code as `/login`, `/login/2fa` and
+`/setup` — and, instead of returning the API key, set the `eph_session` cookie: a value
+signed with `SECRET_KEY` (itsdangerous) holding the key's id, its prefix, a hash of its
+password hash, a CSRF token and the sign-in time. It's httpOnly and `SameSite=Strict`.
+`AuthManager.require_api_key` accepts it when there's no `X-API-Key`; changes must carry
+`X-CSRF-Token`, and the cookie is ignored when the `Origin` header names another site. A
+session ends when it's idle for `SESSION_TIMEOUT` seconds, after `SESSION_MAX_HOURS`, or as
+soon as the key is disabled, its password changes or someone else rotates it (rotating your
+own key keeps you signed in: the cookie is re-issued in the same response). Trusted devices
+live in an httpOnly `eph_device` cookie mapping email → device token.
+
+**Rate limits** are checked before a route's own authentication, so
+`app._identify_for_rate_limits` looks the caller up first (key or session); per-key limits
+and the administrators' exemption depend on it.
+
+**The web app** (`web/`) is Preact + TypeScript built with esbuild, sharing MailStudio's
+shell (router, preferences, theme, form helpers, styles). `src/pages/` has one file per
+screen; `src/api.ts` is the API client; `src/endpoints.json` is the API tester's list.
+`npm run dev` rebuilds on change while `python app.py` serves it.
+
+**Administrator tools** that need the server (`admin_tools.py`): read-only settings, and the
+federation test, which sends requests from the server with the caller's own key.
+
+## 13b. The PHP admin portal (before 1.0)
+
+> Kept for deployments still running ephemeralADMIN separately; see `deploy/two-service/`.
 
 ### Authentication flow
 

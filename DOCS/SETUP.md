@@ -1,5 +1,10 @@
 # Deploying ephemeralREST
 
+> **This describes the older two-service setup** (ephemeralREST + a separate ephemeralADMIN
+> portal behind nginx), whose files are now in `deploy/two-service/`. For a new server, use the
+> one-line installer — see [`install/README.md`](../install/README.md). To move an existing
+> two-service server to it, see [MIGRATING.md](MIGRATING.md).
+
 This guide covers deploying the ephemeralREST API and ephemeralADMIN portal on a Linux server using nginx, Gunicorn, and PHP-FPM.
 
 ---

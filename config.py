@@ -171,36 +171,44 @@ TRUSTED_DEVICE_DAYS=28
 TWO_FACTOR_CODE_EXPIRY_MINUTES=10
 
 # -----------------------------------------------------------------------------
-# Email link URLs
-# SMTP config (host, port, user, password, from address) is set via the
-# admin portal and stored in the database. These two URL values must be set
-# here (or as env vars) because they are needed before the portal exists.
+# Address and web app
 # -----------------------------------------------------------------------------
-# Public-facing URL of this API — used in emails to build verification links.
-API_BASE_URL=http://localhost:5000
+# The one address this server is reached at, e.g. https://astro.example.com.
+# The web app is at /, the API at /api/v1 (and, for older clients, at the
+# root), and links in emails point here.
+PUBLIC_URL=http://localhost:5000
 
-# URL of the admin portal — used in set-password and password-reset emails.
-# Must point to the portal server, not the API.
-PORTAL_URL=http://localhost:3000
+# Whether anyone may create an account from the web app's Register page.
+ALLOW_REGISTRATION=true
 
-# -----------------------------------------------------------------------------
-# Portal branding and behaviour
-# These are read by the portal on every relevant page load (including
-# pre-login pages, via the public /public-config endpoint) — deliberately
-# config-only, not editable from within the portal itself, since they're
-# either deployment-time constants (site name) or security-relevant locks
-# (admin promotion) that shouldn't be changeable by anyone who merely has
-# portal access.
-# -----------------------------------------------------------------------------
-# Shown in the portal's title, header, and sidebar — including pre-login
-# pages (login, 2FA, etc.), via the public /public-config endpoint.
+# Signed-in browsers: logged out after this many idle seconds, and after
+# this many hours whatever happens.
+SESSION_TIMEOUT=1800
+SESSION_MAX_HOURS=168
+
+# Behind a reverse proxy (Caddy, nginx) that sets X-Forwarded-For/-Proto?
+TRUST_PROXY=false
+# Administration (everything under /admin, and the web app's admin pages) only at this
+# address, e.g. https://admin.example.com. Empty: at any address, as before.
+ADMIN_URL=
+# Only believe those headers from these addresses (comma separated). The installer sets the
+# server's shared Caddy (172.31.250.2): other containers share its network and could otherwise
+# claim to be any address. Empty: from any address, as before.
+TRUSTED_PROXIES=
+
+# Shown in the web app's header and the browser tab.
 SITE_NAME=ephemeralREST
 
-# Whether the portal's Keys page is allowed to grant admin status to other
-# keys at all. Set to false to lock this down entirely once your admin
-# accounts are established — enforced here (not just hidden in the portal
-# UI), so it can't be bypassed by calling the API directly.
+# Whether administrators may make other accounts administrators. Set to
+# false to lock this down once your admin accounts are established —
+# enforced by the API itself.
 ALLOW_ADMIN_PROMOTION=true
+
+# Older two-service deployments only (ephemeralADMIN as a separate portal):
+# with PUBLIC_URL unset, email links go to PORTAL_URL, falling back to
+# API_BASE_URL. Leave these out when PUBLIC_URL is set.
+# API_BASE_URL=http://localhost:5000
+# PORTAL_URL=http://localhost:3000
 """
 
 
@@ -211,6 +219,9 @@ def _bootstrap_env_if_missing(env_path: str = '.env') -> None:
     rather than merging with a partial file.
     """
     if os.path.exists(env_path):
+        return
+    # In the container (and tests) settings come from the environment itself.
+    if os.environ.get('EPHEMERAL_NO_ENV_FILE') or os.environ.get('EPHEMERAL_DATA_DIR'):
         return
 
     with open(env_path, 'w', encoding='utf-8') as fh:
@@ -232,6 +243,17 @@ _bootstrap_env_if_missing()
 load_dotenv()
 
 
+# In the container everything the server keeps lives under one directory
+# (EPHEMERAL_DATA_DIR, /data in the image); the paths below default to it.
+_DATA_DIR = os.environ.get('EPHEMERAL_DATA_DIR', '').strip()
+
+
+def _data_path(env_var: str, default: str, name: str) -> str:
+    if os.environ.get(env_var):
+        return os.environ[env_var]
+    return os.path.join(_DATA_DIR, name) if _DATA_DIR else default
+
+
 class Config:
     """Application configuration"""
 
@@ -249,7 +271,7 @@ class Config:
     # Folder watched on startup for a GeoNames cities5000 .txt file.
     # If a .txt file is present, the cities table is wiped, the file is
     # imported, and the file is deleted on completion.
-    CITIES_FOLDER = os.environ.get('CITIES_FOLDER', './cities')
+    CITIES_FOLDER = _data_path('CITIES_FOLDER', './cities', 'cities')
 
     # Google Maps API key (for geocoding and timezone) — required when USE_GOOGLE=true
     GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY')
@@ -257,7 +279,7 @@ class Config:
     # Database
     # DB_TYPE: 'sqlite' (default) or 'mysql'
     DB_TYPE       = os.environ.get('DB_TYPE', 'sqlite').strip().lower()
-    DATABASE_PATH = os.environ.get('DATABASE_PATH', 'ephemeral.db')
+    DATABASE_PATH = _data_path('DATABASE_PATH', 'ephemeral.db', 'ephemeral.db')
 
     # MySQL connection settings — only used when DB_TYPE=mysql
     MYSQL_HOST     = os.environ.get('MYSQL_HOST', 'localhost')
@@ -267,14 +289,14 @@ class Config:
     MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE', '')
 
     # Swiss Ephemeris
-    SWISS_EPHEMERIS_PATH = os.environ.get('SWISS_EPHEMERIS_PATH', './sweph')
+    SWISS_EPHEMERIS_PATH = _data_path('SWISS_EPHEMERIS_PATH', './sweph', 'sweph')
 
     # Logging
-    LOG_FILE  = os.environ.get('LOG_FILE', 'google_api_usage.log')
+    LOG_FILE  = _data_path('LOG_FILE', 'google_api_usage.log', 'logs/ephemeral.log')
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
 
     # API Usage tracking
-    USAGE_COUNT_FILE      = os.environ.get('USAGE_COUNT_FILE', 'api_usage_count.json')
+    USAGE_COUNT_FILE      = _data_path('USAGE_COUNT_FILE', 'api_usage_count.json', 'api_usage_count.json')
     MAX_MONTHLY_REQUESTS  = int(os.environ.get('MAX_MONTHLY_REQUESTS', '10000'))
 
     # CORS settings
@@ -310,6 +332,24 @@ class Config:
     # and enforced server-side here for ALLOW_ADMIN_PROMOTION specifically.
     SITE_NAME              = os.environ.get('SITE_NAME', 'ephemeralREST')
     ALLOW_ADMIN_PROMOTION  = os.environ.get('ALLOW_ADMIN_PROMOTION', 'true').strip().lower() in ('true', '1', 'yes')
+
+    # Web app (web.py). PUBLIC_URL is the one address everything lives at —
+    # the web app, the API under /api/v1, and the links in emails.
+    PUBLIC_URL         = os.environ.get('PUBLIC_URL', '').strip().rstrip('/')
+    ALLOW_REGISTRATION = os.environ.get('ALLOW_REGISTRATION', 'true').strip().lower() in ('true', '1', 'yes')
+    # Signed-in browsers: idle timeout (seconds, renewed on use) and the most
+    # a session can last before logging in again (hours).
+    SESSION_TIMEOUT    = int(os.environ.get('SESSION_TIMEOUT', '1800'))
+    SESSION_MAX_HOURS  = int(os.environ.get('SESSION_MAX_HOURS', '168'))
+    # Behind a reverse proxy (Caddy in the standard install): trust one hop of
+    # X-Forwarded-For/-Proto/-Host for client IPs and https detection.
+    TRUST_PROXY        = os.environ.get('TRUST_PROXY', 'false').strip().lower() in ('true', '1', 'yes')
+    TRUSTED_PROXIES    = [a.strip() for a in os.environ.get('TRUSTED_PROXIES', '').split(',') if a.strip()]
+    # Where administration answers (sites.py): everything under /admin, only at this address.
+    # ADMIN_DOMAIN (as the installer writes it) is the same as ADMIN_URL=https://ADMIN_DOMAIN.
+    ADMIN_URL          = (os.environ.get('ADMIN_URL', '').strip().rstrip('/')
+                          or (f"https://{os.environ['ADMIN_DOMAIN'].strip()}"
+                              if os.environ.get('ADMIN_DOMAIN', '').strip() else ''))
 
     @classmethod
     def validate(cls):
@@ -356,8 +396,16 @@ class Config:
             if cls.STORE_MAX_DOC_BYTES > cls.STORE_MAX_ACCOUNT_BYTES:
                 warnings.append("STORE_MAX_DOC_BYTES is larger than STORE_MAX_ACCOUNT_BYTES")
 
-        # Check SECRET_KEY is set — required for API key encryption
-        if not cls.SECRET_KEY or cls.SECRET_KEY == 'your-secret-key-here':
+        # Web app address
+        if not cls.PUBLIC_URL:
+            warnings.append("PUBLIC_URL is not set — links in emails may point to the wrong address")
+        elif os.environ.get('PORTAL_URL') or os.environ.get('API_PUBLIC_URL'):
+            warnings.append("PORTAL_URL / API_PUBLIC_URL are no longer used when PUBLIC_URL is set — you can remove them")
+
+        # Check SECRET_KEY is set — required for API key encryption. (Without
+        # one, a random key would be made at every start, and stored API keys
+        # could never be decrypted again.)
+        if not os.environ.get('SECRET_KEY') or cls.SECRET_KEY == 'your-secret-key-here':
             if not cls.FLASK_DEBUG:
                 errors.append("SECRET_KEY must be set to a secure value for API key encryption")
             else:

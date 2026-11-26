@@ -68,6 +68,16 @@ class AuthManager:
         def decorated_function(*args, **kwargs):
             api_key = request.headers.get('X-API-Key')
 
+            # No key: a signed-in browser (web app session cookie) will do.
+            if not api_key:
+                from web import session_user
+                user, refused = session_user()
+                if refused:
+                    return refused
+                if user:
+                    g.user = user
+                    return f(*args, **kwargs)
+
             # Debug mode with no key — inject a guest user and continue
             if self.debug_mode and not api_key:
                 g.user = _guest_user()
@@ -117,9 +127,8 @@ def _guest_user() -> dict:
 
 
 def get_client_ip() -> str:
-    """Get client IP address from request, handling proxies."""
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    elif request.headers.get('X-Real-IP'):
-        return request.headers.get('X-Real-IP')
+    """The client's address. Behind a trusted proxy (TRUST_PROXY, TRUSTED_PROXIES) it's already
+    the real one: the proxy middleware in app.py sets it. Forwarding headers aren't read here,
+    because anyone can send them, which would let a caller pick their own address and dodge
+    per-address rate limits and login throttling."""
     return request.remote_addr or 'unknown'

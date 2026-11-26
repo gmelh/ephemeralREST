@@ -35,7 +35,7 @@ Main application module for ephemeralREST
 Application factory pattern with dependency injection
 """
 import logging
-from flask import Flask, g
+from flask import Flask, g, request
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -50,6 +50,9 @@ from routes import api, init_routes
 from account_store import init_account_store, store_api
 from middleware import setup_middleware, setup_request_logging
 from users import init_users, get_all_user_ids
+from web import init_web
+from cities_import import import_cities_if_pending as _import_cities_if_pending
+from admin_tools import init_admin_tools
 
 
 def _get_rate_limit_key():
@@ -57,7 +60,7 @@ def _get_rate_limit_key():
     Rate limit key — uses user ID when authenticated, falls back to IP.
     Admin users are exempt and always bypass rate limiting.
     """
-    user = getattr(g, 'user', None)
+    user = getattr(g, 'user', None) or g.get('rate_user')
     if user:
         return f"user:{user['id']}"
     return f"ip:{get_remote_address()}"
@@ -74,7 +77,7 @@ def _per_user_limit(limit_type: str, global_limit: int):
     UNIT = {'per_minute': 'minute', 'per_hour': 'hour', 'per_day': 'day'}
 
     def limit_value():
-        user = getattr(g, 'user', None)
+        user = getattr(g, 'user', None) or g.get('rate_user')
         if user:
             if user.get('admin', False):
                 return f"999999 per {UNIT[limit_type]}"
@@ -85,100 +88,34 @@ def _per_user_limit(limit_type: str, global_limit: int):
     return limit_value
 
 
-def _import_cities_if_pending(db_manager, cities_folder: str, logger) -> None:
-    """
-    Check CITIES_FOLDER for a .txt file. If one is found:
-        1. Log that import is starting (startup will be slower).
-        2. Wipe the existing cities table.
-        3. Parse and bulk-insert the GeoNames cities5000 TSV format.
-        4. Save import metadata (filename, row count, timestamp) to the DB.
-        5. Delete the source file.
-    If the import fails partway through, the transaction is rolled back so
-    the existing cities data is preserved, and a loud error is logged.
-    """
-    import os, unicodedata
+def _identify_for_rate_limits():
+    """Find the caller's key (X-API-Key header or web app session) for the rate limiter."""
+    import users
+    from web import _read_session
+    api_key = request.headers.get('X-API-Key')
+    user = users.get_user_by_key(api_key) if api_key else None
+    if not user and not api_key:
+        found = _read_session()
+        if found:
+            user = users._build_user_dict(found[0], users._db_manager)
+    if user:
+        g.rate_user = user
 
-    if not cities_folder:
-        return
 
-    if not os.path.isdir(cities_folder):
-        logger.warning(f"CITIES_FOLDER '{cities_folder}' does not exist — skipping cities import check")
-        return
+def _proxied(wsgi_app, trusted):
+    """Believe one hop of X-Forwarded-For/-Proto/-Host, only from the `trusted` addresses (or
+    from anyone if none are given). A request from anywhere else keeps its own address."""
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    fixed = ProxyFix(wsgi_app, x_for=1, x_proto=1, x_host=1)
+    if not trusted:
+        return fixed
+    allowed = set(trusted)
 
-    txt_files = [f for f in os.listdir(cities_folder) if f.endswith('.txt')]
-    if not txt_files:
-        return
-
-    filepath = os.path.join(cities_folder, txt_files[0])
-    filename = txt_files[0]
-
-    logger.warning(
-        f"Cities import pending: found '{filename}' in {cities_folder}. "
-        "Startup will be slower while the cities table is rebuilt (~200k rows)."
-    )
-
-    # GeoNames cities5000.txt column indices
-    COL_GEONAME_ID   = 0
-    COL_NAME         = 1
-    COL_ASCII_NAME   = 2
-    COL_LATITUDE     = 4
-    COL_LONGITUDE    = 5
-    COL_COUNTRY_CODE = 8
-    COL_ADMIN1_CODE  = 10
-    COL_POPULATION   = 14
-    COL_TIMEZONE     = 17
-
-    BATCH_SIZE = 1000
-    rows       = []
-    total      = 0
-
-    try:
-        db_manager.clear_cities()
-        logger.info("Cities table cleared — beginning import")
-
-        with open(filepath, encoding='utf-8') as fh:
-            for line in fh:
-                parts = line.rstrip('\n').split('\t')
-                if len(parts) < 19:
-                    continue  # malformed line — skip silently
-
-                try:
-                    row = (
-                        int(parts[COL_GEONAME_ID]),
-                        parts[COL_NAME],
-                        parts[COL_ASCII_NAME].lower(),   # stored lowercase for LIKE matching
-                        parts[COL_COUNTRY_CODE],
-                        parts[COL_ADMIN1_CODE] or None,
-                        float(parts[COL_LATITUDE]),
-                        float(parts[COL_LONGITUDE]),
-                        parts[COL_TIMEZONE],
-                        int(parts[COL_POPULATION]) if parts[COL_POPULATION] else 0,
-                    )
-                except (ValueError, IndexError):
-                    continue  # skip lines with unparseable numeric fields
-
-                rows.append(row)
-                if len(rows) >= BATCH_SIZE:
-                    db_manager.bulk_insert_cities(rows)
-                    total += len(rows)
-                    rows = []
-
-            if rows:
-                db_manager.bulk_insert_cities(rows)
-                total += len(rows)
-
-        db_manager.save_cities_import_meta(filename, total)
-        logger.info(f"Cities import complete: {total} rows from '{filename}'")
-
-        os.remove(filepath)
-        logger.info(f"Cities source file '{filepath}' deleted after successful import")
-
-    except Exception as e:
-        logger.error(
-            f"Cities import FAILED for '{filename}': {e}. "
-            "Existing cities data has been preserved (transaction rolled back).",
-            exc_info=True
-        )
+    def choose(environ, start_response):
+        if environ.get('REMOTE_ADDR') in allowed:
+            return fixed(environ, start_response)
+        return wsgi_app(environ, start_response)
+    return choose
 
 
 def create_app(config_class=Config):
@@ -230,6 +167,17 @@ def create_app(config_class=Config):
 
     # Initialise database-backed user/key resolution
     init_users(db_manager)
+
+    # The web app, /api/v1 and browser sessions (web.py). Registered before
+    # the other request hooks so page loads skip rate limiting.
+    init_web(app, db_manager)
+    if config_class.TRUST_PROXY:
+        app.wsgi_app = _proxied(app.wsgi_app, config_class.TRUSTED_PROXIES)
+
+    # Rate limits are checked before a route's own authentication runs, so
+    # work out who's calling first — otherwise per-key limits and the admin
+    # exemption never apply and everyone shares their IP address's limit.
+    app.before_request(_identify_for_rate_limits)
 
     # Initialize routes with dependencies
     init_routes(
@@ -322,6 +270,13 @@ def create_app(config_class=Config):
         )
     logger.info(f"API authentication enabled for: {_protected}")
 
+    # Administrator tools for the web app (settings, federation test).
+    init_admin_tools(app, db_manager, auth_manager)
+
+    # Sites (domain keys), the admin address, and the admin audit log.
+    from sites import init_sites
+    init_sites(app, db_manager, auth_manager)
+
     # Account store — general-purpose per-account JSON documents
     # (/account/store). Registers its own blueprint and wraps its routes
     # with the same API-key authentication as above.
@@ -363,6 +318,10 @@ def setup_logging(config):
     )
     console_handler.setFormatter(console_formatter)
 
+    import os
+    log_dir = os.path.dirname(config.LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     file_handler = logging.FileHandler(config.LOG_FILE)
     file_handler.setLevel(logging.INFO)
     file_formatter = setup_request_logging()

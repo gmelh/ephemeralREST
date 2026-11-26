@@ -1,64 +1,64 @@
 ################################################################################
-################################################################################
-###                                                                          ###
-###                          Dockerfile                                     ###
-###                   Docker Container Definition                           ###
-###                                                                          ###
-################################################################################
+#  ephemeralREST — one image: the API and its web app.                         #
+#                                                                              #
+#  docker build -t ephemeralrest .                                             #
+#  docker run -p 8080:8080 -v ephemeral-data:/data \                           #
+#      -e SECRET_KEY=... -e PUBLIC_URL=http://localhost:8080 ephemeralrest     #
+#                                                                              #
+#  Everything the server keeps is under /data: the database, the Swiss         #
+#  Ephemeris files (sweph/), the cities list (cities/), logs and federation    #
+#  test files. Inside the container, `ephemeral` runs the admin commands.      #
 ################################################################################
 
-# Multi-stage build for Ephemeral REST
-FROM python:3.11-slim as builder
+# ---- The web app ---------------------------------------------------------------
+FROM node:22-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run typecheck && npm run build
 
-# Set working directory
-WORKDIR /app
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
+# ---- Python dependencies (pyswisseph needs a compiler) ---------------------------
+FROM python:3.11-slim AS deps
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
 COPY requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Final stage
+# ---- The image -------------------------------------------------------------------
 FROM python:3.11-slim
 
-# Set working directory
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    EPHEMERAL_DATA_DIR=/data \
+    EPHEMERAL_NO_ENV_FILE=1 \
+    EPHEMERAL_WEB_DIR=/app/web/dist \
+    DATABASE_PATH=/data/ephemeral.db \
+    SWISS_EPHEMERIS_PATH=/data/sweph \
+    CITIES_FOLDER=/data/cities \
+    LOG_FILE=/data/logs/ephemeral.log \
+    USAGE_COUNT_FILE=/data/api_usage_count.json \
+    FEDERATION_CONFIG_DIR=/data/federation \
+    FLASK_HOST=0.0.0.0 \
+    FLASK_PORT=8080
+
+RUN useradd --system --uid 10001 --home-dir /app ephemeral
 WORKDIR /app
 
-# Copy Python dependencies from builder
-COPY --from=builder /root/.local /root/.local
+COPY --from=deps /install /usr/local
+COPY *.py ./
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint
+COPY docker/ephemeral /usr/local/bin/ephemeral
+COPY --from=web /web/dist ./web/dist
+RUN chmod 755 /usr/local/bin/entrypoint /usr/local/bin/ephemeral \
+    && mkdir -p /data && chown ephemeral /data
 
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
+USER ephemeral
+VOLUME ["/data"]
+EXPOSE 8080
 
-# Copy application code
-COPY . .
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/ping', timeout=4)"
 
-# Create directories for ephemeris data and database
-RUN mkdir -p sweph data logs && \
-    chmod -R 755 sweph data logs
-
-# Expose port
-EXPOSE 5000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:5000/health')" || exit 1
-
-# Set environment variables
-# DB_TYPE defaults to 'sqlite' (config.py's own default) and isn't set here —
-# DATABASE_PATH below only takes effect in that case. Override DB_TYPE (and
-# set MYSQL_HOST/PORT/USER/PASSWORD/DATABASE) via `docker run -e` or
-# docker-compose.yml's environment: block to run against MySQL instead.
-ENV PYTHONUNBUFFERED=1 \
-    FLASK_HOST=0.0.0.0 \
-    FLASK_PORT=5000 \
-    DATABASE_PATH=/app/data/ephemeral.db \
-    LOG_FILE=/app/logs/google_api_usage.log \
-    USAGE_COUNT_FILE=/app/data/api_usage_count.json
-
-# Run with gunicorn
-CMD ["gunicorn", "-c", "gunicorn_config.py", "app:create_app()"]
+ENTRYPOINT ["entrypoint"]
+CMD ["gunicorn", "-c", "gunicorn_config.py", "--preload", "app:app"]

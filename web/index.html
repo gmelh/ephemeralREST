@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ephemeralREST</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <script>
+    // Apply the remembered light/dark choice before the first paint (see src/theme.ts).
+    try {
+      var theme = null, saved = /(?:^|;\s*)eph_pref_theme=([^;]*)/.exec(document.cookie);
+      try { theme = JSON.parse(decodeURIComponent(saved ? saved[1] : 'null')); } catch (e) {}
+      if (theme !== 'light' && theme !== 'dark') theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.dataset.theme = theme;
+    } catch (e) {}
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+</body>
+</html>

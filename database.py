@@ -286,7 +286,9 @@ class DatabaseManager:
             self.db_path = None
         else:
             self.mysql_config = None
-            self.db_path = db_path or os.environ.get('DATABASE_PATH', 'ephemeral.db')
+            self.db_path = db_path or os.environ.get('DATABASE_PATH') or (
+                os.path.join(os.environ['EPHEMERAL_DATA_DIR'], 'ephemeral.db')
+                if os.environ.get('EPHEMERAL_DATA_DIR') else 'ephemeral.db')
 
         self.init_database()
 
@@ -341,6 +343,8 @@ class DatabaseManager:
                                 itself (an admin decision), and whether it does
           account_home        — the domain key an account was registered through
           token_links         — the app links and sending key stored with a token
+          admin_settings      — install-wide choices for sites (the defaults for new ones)
+          admin_audit         — what administrators changed, and when
         """
         mysql   = self.db_type == 'mysql'
         charset = 'ENGINE=InnoDB DEFAULT CHARSET=utf8mb4' if mysql else ''
@@ -379,6 +383,30 @@ class DatabaseManager:
                 links      TEXT,
                 via_key_id {int_pk},
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+        # Administration: settings for sites (domain keys), and what administrators changed.
+        auto_pk = 'INT AUTO_INCREMENT PRIMARY KEY' if mysql else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS admin_settings
+            (
+                name       {str255} PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS admin_audit
+            (
+                id          {auto_pk},
+                at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                admin_id    {int_pk},
+                admin_email {str255} NOT NULL DEFAULT '',
+                ip          {str255} NOT NULL DEFAULT '',
+                action      {str255} NOT NULL,
+                target_type {str255} NOT NULL DEFAULT '',
+                target_id   {int_pk},
+                detail      TEXT
             ) {charset}
         ''')
 
@@ -438,6 +466,92 @@ class DatabaseManager:
             cursor.execute('DELETE FROM account_home WHERE api_key_id = ?', (key_id,))
             if home_key_id is not None:
                 cursor.execute('INSERT INTO account_home (api_key_id, home_key_id) VALUES (?, ?)', (key_id, home_key_id))
+
+    # -- Administration of sites ----------------------------------------------------
+
+    def get_admin_setting(self, name: str, default: Any = None) -> Any:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT value FROM admin_settings WHERE name = ?', (name,))
+            row = cursor.fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(dict(row)['value'])
+        except (TypeError, ValueError):
+            return default
+
+    def set_admin_setting(self, name: str, value: Any) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM admin_settings WHERE name = ?', (name,))
+            cursor.execute('INSERT INTO admin_settings (name, value) VALUES (?, ?)', (name, json.dumps(value)))
+
+    def record_admin_action(self, admin_id, admin_email: str, ip: str, action: str,
+                            target_type: str = '', target_id: Optional[int] = None, detail: str = '') -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO admin_audit (admin_id, admin_email, ip, action, target_type, target_id, detail)'
+                ' VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (admin_id, admin_email or '', ip or '', action, target_type or '', target_id, (detail or '')[:500]))
+
+    def list_admin_actions(self, before: Optional[int] = None, limit: int = 50,
+                           target_type: Optional[str] = None, target_id: Optional[int] = None) -> list:
+        where, args = [], []
+        if before:
+            where.append('id < ?')
+            args.append(int(before))
+        if target_type:
+            where.append('target_type = ?')
+            args.append(target_type)
+        if target_id is not None:
+            where.append('target_id = ?')
+            args.append(int(target_id))
+        sql = 'SELECT * FROM admin_audit' + (' WHERE ' + ' AND '.join(where) if where else '')
+        sql += ' ORDER BY id DESC LIMIT ?'
+        args.append(int(limit))
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, tuple(args))
+            rows = [dict(r) for r in cursor.fetchall()]
+        for row in rows:
+            if row.get('at') is not None and not isinstance(row['at'], str):
+                row['at'] = row['at'].isoformat()
+        return rows
+
+    def count_accounts_by_home(self) -> Dict[int, int]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT home_key_id, COUNT(*) AS n FROM account_home GROUP BY home_key_id')
+            return {int(dict(r)['home_key_id']): int(dict(r)['n']) for r in cursor.fetchall()}
+
+    def list_home_accounts(self, home_key_id: int) -> list:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'SELECT k.id, k.name, k.identifier, k.active, k.created_at, k.password_hash IS NOT NULL AS has_password'
+                ' FROM account_home h JOIN api_keys k ON k.id = h.api_key_id'
+                ' WHERE h.home_key_id = ? ORDER BY k.identifier', (home_key_id,))
+            rows = [dict(r) for r in cursor.fetchall()]
+        for row in rows:
+            row['has_password'] = bool(row['has_password'])
+            if row.get('created_at') is not None and not isinstance(row['created_at'], str):
+                row['created_at'] = row['created_at'].isoformat()
+        return rows
+
+    def clear_home(self, home_key_id: int) -> int:
+        """Accounts of a site that's deleted belong to no site (they keep ephemeralREST's emails)."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM account_home WHERE home_key_id = ?', (home_key_id,))
+            return cursor.rowcount
+
+    def forget_site(self, key_id: int) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            for table in ('key_link_origins', 'key_email_delivery'):
+                cursor.execute(f'DELETE FROM {table} WHERE api_key_id = ?', (key_id,))
 
     def save_token_links(self, token: str, links: Optional[dict], via_key_id: Optional[int]) -> None:
         if not links and via_key_id is None:

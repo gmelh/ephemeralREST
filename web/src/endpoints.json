@@ -1,0 +1,393 @@
+[
+  {
+    "group": "Health",
+    "method": "GET",
+    "path": "/health",
+    "label": "Health Check",
+    "desc": "Returns API server status, supported house systems, and server time.",
+    "body": null,
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Health",
+    "method": "GET",
+    "path": "/cache/stats",
+    "label": "Cache Stats",
+    "desc": "Returns counts for cached charts, derived charts, places, and place cache activity.",
+    "body": null,
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Health",
+    "method": "GET",
+    "path": "/autocomplete",
+    "label": "Autocomplete",
+    "desc": "Returns place name suggestions for a partial query string. Minimum 2 characters.",
+    "body": null,
+    "path_params": [],
+    "params": [
+      {
+        "key": "q",
+        "label": "Search query",
+        "placeholder": "e.g. London, UK",
+        "required": true
+      }
+    ]
+  },
+  {
+    "group": "Calculation",
+    "method": "POST",
+    "path": "/calculate",
+    "label": "Calculate Chart",
+    "desc": "Calculate a natal or event chart. Returns planetary positions, house cusps, and angles.",
+    "body": {
+      "chart_name": "Albert Einstein",
+      "datetime": "1879-03-14 11:30:00",
+      "location": "Ulm, Germany",
+      "house_system": "placidus"
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "POST",
+    "path": "/calculate",
+    "label": "Recalculate Chart",
+    "desc": "Force-recalculate an existing chart in place, preserving its chart_id. Paste a chart_id from a previous Calculate response into the body.",
+    "body": {
+      "chart_name": "Albert Einstein",
+      "datetime": "1879-03-14 11:30:00",
+      "location": "Ulm, Germany",
+      "house_system": "placidus",
+      "recalc": true,
+      "chart_id": ""
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "GET",
+    "path": "/chart/{id}",
+    "label": "Get Chart",
+    "desc": "Retrieve a previously calculated chart by UUID. Paste a chart_id from a Calculate response.",
+    "body": null,
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Chart ID",
+        "placeholder": "Paste a chart_id UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "POST",
+    "path": "/chart/{id}/progressions",
+    "label": "Secondary Progressions",
+    "desc": "Calculate secondary progressions (day-for-a-year) for a natal chart to a given date.",
+    "body": {
+      "progression_date": "2026-01-01",
+      "house_system": "placidus"
+    },
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Chart ID",
+        "placeholder": "Paste a chart_id UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "POST",
+    "path": "/chart/{id}/solar-arc",
+    "label": "Solar Arc Directions",
+    "desc": "Calculate solar arc directions for a natal chart. All planets are advanced by the Sun's progressed arc.",
+    "body": {
+      "progression_date": "2026-01-01",
+      "house_system": "placidus"
+    },
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Chart ID",
+        "placeholder": "Paste a chart_id UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "POST",
+    "path": "/chart/{id}/solar-return",
+    "label": "Solar Return",
+    "desc": "Find the exact solar return moment for a given year and cast the return chart. Location defaults to natal if not supplied.",
+    "body": {
+      "return_year": 2026,
+      "house_system": "placidus"
+    },
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Chart ID",
+        "placeholder": "Paste a chart_id UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "POST",
+    "path": "/chart/{id}/lunar-return",
+    "label": "Lunar Return",
+    "desc": "Find the exact lunar return moment for a given month and cast the return chart.",
+    "body": {
+      "return_year": 2026,
+      "return_month": 1,
+      "house_system": "placidus"
+    },
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Chart ID",
+        "placeholder": "Paste a chart_id UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Calculation",
+    "method": "GET",
+    "path": "/chart/{id}/derived",
+    "label": "List Derived Charts",
+    "desc": "List all derived charts for a radix chart. Optionally filter by type: progressions, solar_return, lunar_return, solar_arc.",
+    "body": null,
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Chart ID",
+        "placeholder": "Paste a chart_id UUID",
+        "required": true
+      }
+    ],
+    "params": [
+      {
+        "key": "type",
+        "label": "Filter by type",
+        "placeholder": "e.g. solar_return",
+        "required": false
+      }
+    ]
+  },
+  {
+    "group": "Derived Charts",
+    "method": "GET",
+    "path": "/derived/{id}",
+    "label": "Get Derived Chart",
+    "desc": "Retrieve a specific derived chart (progression, return, solar arc) by its UUID.",
+    "body": null,
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Derived Chart ID",
+        "placeholder": "Paste a derived chart UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Derived Charts",
+    "method": "DELETE",
+    "path": "/derived/{id}",
+    "label": "Delete Derived Chart",
+    "desc": "Permanently delete a derived chart by UUID. This cannot be undone.",
+    "body": null,
+    "path_params": [
+      {
+        "key": "id",
+        "label": "Derived Chart ID",
+        "placeholder": "Paste a derived chart UUID",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Astronomical Events",
+    "method": "POST",
+    "path": "/apsides",
+    "label": "Apsides",
+    "desc": "Lunar and planetary apside positions (perigee/apogee, perihelion/aphelion) for a given datetime. Optionally pass \"bodies\" to select specific bodies — omit for all bodies.",
+    "body": {
+      "datetime": "2026-03-29 12:00:00",
+      "bodies": [
+        "moon",
+        "mars",
+        "chiron"
+      ]
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Astronomical Events",
+    "method": "POST",
+    "path": "/apsides/next",
+    "label": "Next Apsides",
+    "desc": "Find every perigee/apogee and perihelion/aphelion event for each body across a forward window from a reference date — despite the name, returns all matching events in the window, not just the first. Supply \"end_date\" for an exact range end, or \"max_search_years\" (1-100) for a duration-based window.",
+    "body": {
+      "reference_date": "2026-03-29",
+      "end_date": "2026-06-01"
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Astronomical Events",
+    "method": "POST",
+    "path": "/lunations",
+    "label": "Lunations",
+    "desc": "Find New Moon, Full Moon, and Quarter events. Use direction (next/previous/both) or supply start_date and end_date for range mode (max 100 years).",
+    "body": {
+      "reference_date": "2026-03-29",
+      "direction": "next"
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Astronomical Events",
+    "method": "POST",
+    "path": "/eclipses",
+    "label": "Eclipses",
+    "desc": "Find solar and lunar eclipses within a time window (years_ahead: 1-100). Returns type, disc obscuration, magnitude, and Saros series data for each eclipse.",
+    "body": {
+      "reference_date": "2026-03-29",
+      "years_ahead": 5
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Astronomical Events",
+    "method": "POST",
+    "path": "/ephemeris",
+    "label": "Ephemeris",
+    "desc": "Planetary positions at noon UT for every day of a given month. No location required — house cusps not included.",
+    "body": {
+      "year": 2026,
+      "month": 3
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Self-service",
+    "method": "GET",
+    "path": "/me",
+    "label": "My Identity",
+    "desc": "Returns the identity, key type, admin flag, and rate limits for the authenticated key.",
+    "body": null,
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Self-service",
+    "method": "GET",
+    "path": "/me/output",
+    "label": "My Output Config",
+    "desc": "Returns the stored output config overrides for this key and the full effective (merged) configuration.",
+    "body": null,
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Self-service",
+    "method": "POST",
+    "path": "/me/output",
+    "label": "Update My Output Config",
+    "desc": "Save per-key output config overrides. Pass null to reset to server defaults.",
+    "body": {
+      "output_config": {
+        "heliocentric": false,
+        "bodies": {
+          "asteroids": false
+        }
+      }
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Utility",
+    "method": "POST",
+    "path": "/locations/resolve",
+    "label": "Resolve Location",
+    "desc": "Resolve a place name to its canonical record with coordinates and timezone.",
+    "body": {
+      "place_name": "Ulm, Germany"
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Views",
+    "method": "POST",
+    "path": "/views",
+    "label": "Save View",
+    "desc": "Save a new opaque JSON blob. Always generates a fresh UUID. Returns the view_id.",
+    "body": {
+      "data": {}
+    },
+    "path_params": [],
+    "params": []
+  },
+  {
+    "group": "Views",
+    "method": "PUT",
+    "path": "/views/{view_id}",
+    "label": "Update View",
+    "desc": "Update an existing view blob in place by UUID. Returns 404 if the view does not exist.",
+    "body": {
+      "data": {}
+    },
+    "path_params": [
+      {
+        "key": "view_id",
+        "label": "View UUID",
+        "placeholder": "e.g. a1b2c3d4-...",
+        "required": true
+      }
+    ],
+    "params": []
+  },
+  {
+    "group": "Views",
+    "method": "GET",
+    "path": "/views",
+    "label": "Get View",
+    "desc": "Retrieve a saved view by UUID. No authentication required.",
+    "body": null,
+    "path_params": [],
+    "params": [
+      {
+        "key": "v",
+        "label": "View UUID",
+        "placeholder": "e.g. a1b2c3d4-...",
+        "required": true
+      }
+    ]
+  }
+]

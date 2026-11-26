@@ -1,5 +1,10 @@
 # Self-Hosting ephemeralREST + ephemeralADMIN
 
+> **This describes the older two-service setup** (ephemeralREST + a separate ephemeralADMIN
+> portal behind nginx), whose files are now in `deploy/two-service/`. For a new server, use the
+> one-line installer — see [`install/README.md`](../install/README.md). To move an existing
+> two-service server to it, see [MIGRATING.md](MIGRATING.md).
+
 This is a guide for running your own independent copy of ephemeralREST
 (the API) and ephemeralADMIN (its admin portal) — whether you're
 evaluating it, developing against it, or running it long-term as your own

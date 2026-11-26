@@ -22,24 +22,28 @@ The source code is available on GitHub. As a user of this API you are entitled t
 
 ### Getting an API key
 
-All calculation endpoints require an API key. To get one:
+All calculation endpoints require an API key. To get one, open the server's web app — the
+server's address in a browser, e.g. `https://astro.yourdomain.com` — and:
 
-1. Go to the portal's registration page (`/register-user.php`) and enter your name and email address.
+1. Choose **Create an account** and enter your name and email address.
 2. Check your email and click the verification link.
 3. Click the set-password link in the follow-up email to choose a password.
-4. Your API key is emailed to you when you set your password. It looks something like this: `eph_a1b2c3d4e5f6...`
+4. Your API key is emailed to you when you set your password.
 
-**Your key is shown once and only once — in the activation email.** Save it somewhere safe immediately. If you lose it, you can rotate it via the portal and a new key will be emailed to you.
+**Your key is shown once and only once — in the activation email.** Save it somewhere safe immediately. If you lose it, log in to the web app and make a new one under **My account**; it is shown on screen and emailed to you.
 
-### Your key portal
+### Your account in the web app
 
-Once you have an account, sign in at `/login.php` with your email and password. The portal lets you:
+Log in to the web app with your email and password to:
 
-- View your key details and rate limits
-- Rotate your key if it has been compromised
-- Configure your output defaults (which bodies and fields are returned)
+- See your key's details and rate limits
+- Make a new key if the old one has been compromised
+- Choose your output defaults (which bodies and fields are returned)
+- Try any endpoint with the API tester
 
-Login uses two-factor authentication by email. If you tick "Remember this device", the 2FA step is skipped for 28 days (configurable by the operator) on that browser.
+Login uses two-factor authentication by email. If you tick "Remember this device", the code step is skipped for 28 days (configurable by the operator) on that browser.
+
+(Servers still running the separate ephemeralADMIN portal have the same pages at `/register-user.php` and `/login.php`.)
 
 ---
 
@@ -47,13 +51,17 @@ Login uses two-factor authentication by email. If you tick "Remember this device
 
 ### Base URL
 
-All endpoints are relative to the API base URL. This document uses:
+All endpoints are relative to the API base URL: the server's address followed by `/api/v1`.
+This document uses:
 
 ```
 https://api.yourdomain.com
 ```
 
-Replace this with the actual URL of the instance you are connecting to.
+Replace this with the actual base URL — for a standard install, `https://astro.yourdomain.com/api/v1`.
+
+Every endpoint also answers without the `/api/v1` prefix (`https://astro.yourdomain.com/calculate`),
+so clients written before version 1.0 keep working. New clients should use `/api/v1`.
 
 ### Authentication
 
@@ -1671,6 +1679,63 @@ Set or change a password. Supply either `token` (from email) or `email` + `curre
 
 ---
 
+## Web app endpoints
+
+These are used by the built-in web app. They are listed for completeness; API clients use
+`X-API-Key` instead.
+
+| Method | Endpoint | What it does |
+|--------|----------|--------------|
+| GET | `/auth/status` | Whether the server needs setting up, who is signed in, public settings |
+| POST | `/auth/setup` | First run: create the administrator, sign in, and return their API key once |
+| POST | `/auth/login` | `{email, password}` → signed in, or `{"2fa_required": true}`, or `{"must_change_password": true}` |
+| POST | `/auth/login/2fa` | `{email, code, remember_device}` → signed in |
+| POST | `/auth/logout` | `{forget_device: true}` also forgets this browser's trusted device |
+
+Signing in sets an httpOnly session cookie. A signed-in browser can call any endpoint that
+takes `X-API-Key`; requests that change something must also send the session's
+`X-CSRF-Token` (returned in `session.csrf_token`). The cookie is ignored on requests from
+another origin, and the browser never receives the API key.
+
+Administrator-only tools used by the web app:
+
+| Method | Endpoint | What it does |
+|--------|----------|--------------|
+| GET | `/admin/settings` | The server's configuration, read-only |
+| GET | `/admin/federation-test/services` | Federated services that can be tested (registered services with an address, and JSON test files in `FEDERATION_CONFIG_DIR`) |
+| POST | `/admin/federation-test/send` | `{service, method, path, query, body}` — sends the request from the server with your own key |
+
+---
+
+## Sites (administrators)
+
+A **site** is an app that uses ephemeralREST through a domain key — a hosted AstrologyStudio
+site, say. Everything here is for administrators, through the web app (Sites) or with an
+administrator's key.
+
+| Method | Endpoint | What it does |
+|--------|----------|--------------|
+| GET | `/admin/sites` | Every site: domain, name, status, accounts made through it, email delivery, rate limits; and `defaults` |
+| POST | `/admin/sites` | `{domain, name?, origins?}` — a new site: its domain key (in `api_key`, **shown once**), its sign-up addresses (`https://<domain>` unless given), and the defaults below. 409 if the domain has a key already |
+| GET | `/admin/sites/<id>` | One site, with `account_list` (accounts made through it) and `activity` (its last 20 admin changes) |
+| PUT | `/admin/sites/<id>` | Any of `name`, `origins`, `email_delivery_allowed`, `rate_per_minute`, `rate_per_hour`, `rate_per_day` (null: the class default), `active` (false suspends it: its key stops working) |
+| POST | `/admin/sites/<id>/rotate` | A new key for the site, shown once; the old one stops working at once |
+| DELETE | `/admin/sites/<id>` | Remove the site. Its accounts belong to no site (they keep their keys, and get ephemeralREST's own emails) |
+| GET / PUT | `/admin/site-defaults` | What a new site starts with: `email_delivery_allowed` and the three rate limits |
+| GET | `/admin/audit?before=` | What administrators changed, newest first, 50 at a time (`next` is the `before` for the next page) |
+
+To move an account from one site to another, use `PUT /admin/keys/<id>/home`.
+
+**The audit log** records every change made under `/admin` — not reads — with who made it, their
+address, what it was about and the request (with passwords, keys, tokens and codes taken out).
+
+**The admin address.** With `ADMIN_URL` set (the installer's `--admin-domain` sets it), every
+endpoint under `/admin` answers only at that address. At any other address it's a 404, as if it
+weren't there, and the web app shows administrators their own account there, with a link to the
+admin address. Without `ADMIN_URL`, administration answers at any address, as before.
+
+---
+
 ## Endpoint quick reference
 
 ### Public endpoints (no `X-API-Key` required)
@@ -1762,4 +1827,12 @@ Set or change a password. Supply either `token` (from email) or `email` + `curre
 | `GET` | `/admin/email-templates/<name>` | Get an email template |
 | `POST` | `/admin/email-templates/<name>` | Update an email template |
 | `POST` | `/admin/email-templates/<name>/reset` | Reset template to default |
+| `GET` | `/admin/sites` | Every site (domain key) |
+| `POST` | `/admin/sites` | A new site and its key (shown once) |
+| `GET` | `/admin/sites/<id>` | One site, its accounts and recent changes |
+| `PUT` | `/admin/sites/<id>` | Change a site (addresses, email delivery, limits, suspend) |
+| `POST` | `/admin/sites/<id>/rotate` | A new key for a site |
+| `DELETE` | `/admin/sites/<id>` | Remove a site |
+| `GET` / `PUT` | `/admin/site-defaults` | What new sites start with |
+| `GET` | `/admin/audit` | What administrators changed |
 | `GET` | `/views?v=` | No | Retrieve a view by UUID |

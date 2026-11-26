@@ -43,6 +43,7 @@ from output_config import OutputConfig
 from config import Config
 from email_service import EmailService
 import secrets as _secrets
+from version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -545,16 +546,23 @@ def setup(validated_data):
     can store it in the session — the user does not need to see or
     record it.
     """
+    payload, status = _do_setup(
+        validated_data['name'], validated_data['email'], validated_data['password'])
+    return jsonify(payload), status
+
+
+def _do_setup(name: str, email: str, password: str):
+    """Create the first administrator. Returns (payload, status); the payload
+    includes the plaintext API key on success."""
     from werkzeug.security import generate_password_hash
     from key_crypto import KeyCrypto
     from config import Config
 
     if not db_manager.is_database_empty():
-        return _error('Setup has already been completed', 403)
+        return {'error': 'Setup has already been completed', 'status': 403}, 403
 
-    name     = validated_data['name'].strip()
-    email    = validated_data['email'].strip().lower()
-    password = validated_data['password']
+    name     = name.strip()
+    email    = email.strip().lower()
 
     crypto    = KeyCrypto(Config.SECRET_KEY)
     plaintext = KeyCrypto.generate_key()
@@ -578,20 +586,20 @@ def setup(validated_data):
 
     logger.info(f"Setup: initial admin account created for '{email}' (key_id={key_id})")
 
-    return jsonify({
+    return {
         'message':    'Setup complete. Administrator account created.',
         'id':         key_id,
         'name':       name,
         'identifier': email,
         'admin':      True,
         'api_key':    plaintext,
-    }), 201
+    }, 201
 
 
 @api.route('/ping', methods=['GET'])
 def ping():
     """Public availability check — no auth required."""
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'version': __version__})
 
 
 @api.route('/health', methods=['GET'])
@@ -604,6 +612,7 @@ def health():
 
         return jsonify({
             'status':                   'healthy',
+            'version':                  __version__,
             'timestamp':                datetime.now().isoformat(),
             'api_usage':                usage_tracker.get_usage_stats(),
             'celestial_bodies':         list(astronomy_service.PLANETS.keys()),
@@ -652,7 +661,9 @@ def public_config():
     return jsonify({
         'site_name':             Config.SITE_NAME,
         'trusted_device_days':   Config.TRUSTED_DEVICE_DAYS,
-        'portal_url':            os.environ.get('PORTAL_URL', ''),
+        'portal_url':            Config.PUBLIC_URL or os.environ.get('PORTAL_URL', ''),
+        'public_url':            Config.PUBLIC_URL,
+        'version':               __version__,
         'allow_admin_promotion': Config.ALLOW_ADMIN_PROMOTION,
     })
 
@@ -1974,6 +1985,10 @@ def register(validated_data):
     """
     import secrets as _secrets
 
+    from config import Config
+    if not Config.ALLOW_REGISTRATION:
+        return _error('Registration is closed on this server', 403)
+
     email = validated_data['email'].strip().lower()
     name  = validated_data['name'].strip()
 
@@ -2210,12 +2225,18 @@ def login(validated_data):
           supplied). The decrypted API key is included for the portal
           session; it is not stored anywhere new.
     """
-    email    = validated_data['email'].strip().lower()
-    password = validated_data['password']
-    device_token = validated_data.get('device_token')
+    payload, status = _do_login(
+        validated_data['email'], validated_data['password'], validated_data.get('device_token'))
+    return jsonify(payload), status
+
+
+def _do_login(email: str, password: str, device_token):
+    """Check a password (and trusted device). Returns (payload, status): identity
+    plus plaintext api_key when complete, or a must_change_password / 2fa_required step."""
+    email    = email.strip().lower()
 
     # Generic error to avoid revealing whether an email is registered
-    invalid = lambda: _error('Invalid email or password', 401)
+    invalid = lambda: ({'error': 'Invalid email or password', 'status': 401}, 401)
 
     key_record = db_manager.get_api_key_by_identifier(email)
     if not key_record or not key_record.get('active'):
@@ -2234,10 +2255,10 @@ def login(validated_data):
     key_id = key_record['id']
 
     if key_record.get('must_change_password'):
-        return jsonify({
+        return {
             'must_change_password': True,
             'email': email,
-        })
+        }, 200
 
     from key_crypto import KeyCrypto
     from config import Config
@@ -2249,7 +2270,7 @@ def login(validated_data):
         device = db_manager.get_trusted_device(device_token)
         if device and device['api_key_id'] == key_id:
             logger.info(f"Login: '{email}' (key_id={key_id}) — trusted device, 2FA skipped")
-            return jsonify(_user_identity_response(key_record, plaintext_key))
+            return _user_identity_response(key_record, plaintext_key), 200
 
     # Skip 2FA for admins when SMTP is not configured — avoids a catch-22
     # where the admin cannot log in to set up SMTP because 2FA needs SMTP.
@@ -2259,7 +2280,7 @@ def login(validated_data):
             logger.info(
                 f"Login: '{email}' (key_id={key_id}) — admin, SMTP not configured, 2FA skipped"
             )
-            return jsonify(_user_identity_response(key_record, plaintext_key))
+            return _user_identity_response(key_record, plaintext_key), 200
 
     # No valid trusted device — send 2FA code
     import secrets as _secrets
@@ -2286,7 +2307,7 @@ def login(validated_data):
         )
         logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA code sent")
 
-    return jsonify(response)
+    return response, 200
 
 
 @api.route('/login/2fa', methods=['POST'])
@@ -2302,19 +2323,25 @@ def login_2fa(validated_data):
     long-lived cookie (TRUSTED_DEVICE_DAYS, default 28) — supplying this
     token on a future /login call will skip the 2FA step.
     """
-    email = validated_data['email'].strip().lower()
-    code  = validated_data['code'].strip()
-    remember_device = validated_data.get('remember_device', False)
+    payload, status = _do_login_2fa(
+        validated_data['email'], validated_data['code'], validated_data.get('remember_device', False))
+    return jsonify(payload), status
+
+
+def _do_login_2fa(email: str, code: str, remember_device: bool):
+    """Check an emailed 2FA code. Returns (payload, status)."""
+    email = email.strip().lower()
+    code  = code.strip()
 
     key_record = db_manager.get_api_key_by_identifier(email)
     if not key_record or not key_record.get('active'):
-        return _error('Invalid email or code', 401)
+        return {'error': 'Invalid email or code', 'status': 401}, 401
 
     key_id = key_record['id']
 
     code_record = db_manager.get_valid_2fa_code(key_id, code)
     if not code_record:
-        return _error('Invalid or expired verification code', 401)
+        return {'error': 'Invalid or expired verification code', 'status': 401}, 401
 
     db_manager.mark_2fa_code_used(code_record['id'])
 
@@ -2333,7 +2360,7 @@ def login_2fa(validated_data):
         response['device_token_expires_days'] = Config.TRUSTED_DEVICE_DAYS
 
     logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA verified")
-    return jsonify(response)
+    return response, 200
 
 
 @api.route('/password/forgot', methods=['POST'])
@@ -2570,6 +2597,9 @@ def _resolve_template(name: str) -> dict:
 @api.route('/admin/email-templates/<name>', methods=['GET'])
 def admin_get_email_template(name):
     """Return the resolved template (DB overrides merged onto defaults)."""
+    user = getattr(g, 'user', None) or {}
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
     if name not in _TEMPLATE_CONTENT_DEFAULTS:
         return _error(f"Unknown template '{name}'", 404)
     return jsonify(_resolve_template(name))
@@ -2578,6 +2608,9 @@ def admin_get_email_template(name):
 @api.route('/admin/email-templates/<name>', methods=['POST'])
 def admin_set_email_template(name):
     """Save appearance and content overrides for a named template."""
+    user = getattr(g, 'user', None) or {}
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
     if name not in _TEMPLATE_CONTENT_DEFAULTS:
         return _error(f"Unknown template '{name}'", 404)
     data = request.get_json(silent=True) or {}
@@ -2590,6 +2623,9 @@ def admin_set_email_template(name):
 @api.route('/admin/email-templates/<name>/reset', methods=['POST'])
 def admin_reset_email_template(name):
     """Delete DB overrides for a named template, reverting to code defaults."""
+    user = getattr(g, 'user', None) or {}
+    if not user.get('admin'):
+        return _error('Admin access required', 403)
     if name not in _TEMPLATE_CONTENT_DEFAULTS:
         return _error(f"Unknown template '{name}'", 404)
     db_manager.reset_email_template(name)
@@ -2706,12 +2742,26 @@ def admin_get_key(key_id):
     return jsonify(record)
 
 
+def _protect_own_key(user, key_id: int, action: str):
+    """Refuse to let an administrator lock themselves (or everyone) out."""
+    if str(key_id) == str(user.get('id')):
+        return _error(f'You cannot {action} your own key', 400)
+    record = db_manager.get_api_key_by_id(key_id)
+    if record and record.get('admin') and record.get('active') and db_manager.count_admin_keys() <= 1:
+        return _error(f'Cannot {action} the last admin key', 400)
+    return None
+
+
 @api.route('/admin/keys/<int:key_id>/disable', methods=['POST'])
 def admin_disable_key(key_id):
     """Deactivate an API key. Admin only."""
     user = getattr(g, 'user', {})
     if not user.get('admin'):
         return _error('Admin access required', 403)
+
+    refused = _protect_own_key(user, key_id, 'disable')
+    if refused:
+        return refused
 
     updated = db_manager.update_api_key(key_id, active=0)
     if not updated:
@@ -2884,6 +2934,10 @@ def admin_delete_key(key_id):
     user = getattr(g, 'user', {})
     if not user.get('admin'):
         return _error('Admin access required', 403)
+
+    refused = _protect_own_key(user, key_id, 'delete')
+    if refused:
+        return refused
 
     deleted = db_manager.delete_api_key(key_id)
     if not deleted:

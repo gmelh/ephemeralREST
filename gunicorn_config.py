@@ -41,7 +41,9 @@ bind = f"{os.environ.get('FLASK_HOST', '0.0.0.0')}:{os.environ.get('FLASK_PORT',
 backlog = 2048
 
 # Worker processes
-workers = multiprocessing.cpu_count() * 2 + 1
+# WEB_CONCURRENCY sets the number of workers; by default up to 4, which is
+# plenty for a small server (each worker holds its own copy of the app).
+workers = int(os.environ.get('WEB_CONCURRENCY') or min(multiprocessing.cpu_count() * 2 + 1, 4))
 worker_class = 'sync'
 worker_connections = 1000
 timeout = 120
@@ -52,8 +54,9 @@ max_requests = 1000
 max_requests_jitter = 50
 
 # Logging
-accesslog = 'access.log'
-errorlog = 'error.log'
+# '-' is the console (docker logs); set GUNICORN_ACCESS_LOG / _ERROR_LOG to a file to keep them there.
+accesslog = os.environ.get('GUNICORN_ACCESS_LOG', '-')
+errorlog = os.environ.get('GUNICORN_ERROR_LOG', '-')
 loglevel = 'info'
 access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
 
@@ -62,7 +65,7 @@ proc_name = 'ephemeral_api'
 
 # Server mechanics
 daemon = False
-pidfile = 'gunicorn.pid'
+pidfile = os.environ.get('GUNICORN_PID_FILE') or None
 umask = 0
 user = None
 group = None

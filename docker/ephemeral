@@ -1,0 +1,3 @@
+#!/bin/sh
+# Admin commands inside the container: ephemeral --help
+exec python /app/cli.py "$@"
