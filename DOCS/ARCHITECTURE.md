@@ -393,6 +393,22 @@ Secondary progressions, solar arc, solar return, and lunar return all:
 
 **Solar and lunar returns** use Newton's method to find the exact JD when the body returns to its natal longitude (converges in ≤50 iterations to ~0.36 arc-second precision).
 
+**Secondary progressions and solar arc** use a day for a year: the progressed moment is
+`natal_jd + (target_jd − natal_jd) / 365.24219` (`_progressed_moment` in `astronomy.py`). Earlier
+versions added the target's calendar days, which gave the sky on the target date. New results carry
+`progression_method: "day_for_a_year"`, `years_elapsed` and `progressed_jd`; a progression saved by an
+older version (no `progression_method`) is worked out again when `GET /derived/{id}` reads it, and
+saved in place.
+
+### Ayanamsas
+
+Every calculation result carries a top-level `ayanamsa` map: Lahiri, Krishnamurti, Fagan-Bradley
+and B.V. Raman, in degrees, for the chart's moment (the ephemeris: one map per date). They're the
+true ayanamsas (with nutation) from `swe.get_ayanamsa_ex_ut`, so `(tropical − ayanamsa) mod 360`
+matches Swiss Ephemeris' own sidereal mode exactly; an app works out sidereal positions itself,
+and Whole Sign cusps from the sidereal Ascendant. Setting the sidereal mode is global in Swiss
+Ephemeris, so `ayanamsas()` holds `_sidereal_mode_lock` and puts Fagan-Bradley back afterwards.
+
 ### Apsides and lunations
 
 **Apsides** — scan for `distance_speed` sign changes at coarse intervals, refine with bisection.
@@ -433,6 +449,15 @@ Migrations (SQLite only) run inline: `PRAGMA table_info` checks column presence,
 | `email_verifications` | One-time tokens for email verification and password set/reset. `used` flag, `expires_at` |
 | `login_2fa_codes` | Short-lived 6-digit codes for the 2FA login step. `used` flag, `expires_at` |
 | `trusted_devices` | Long-lived device tokens that skip 2FA. `api_key_id` FK, `expires_at` |
+
+**App sign-up and email delivery** (both backends, `_init_app_links_schema`):
+
+| Table | Purpose |
+|---|---|
+| `key_link_origins` | Origins a domain key may point sign-up email links at |
+| `key_email_delivery` | Whether a domain key may deliver its accounts' emails (`allowed`, set by an admin) and whether it does (`mode`: `ephemeral` or `self`) |
+| `account_home` | The domain key an account was registered through |
+| `token_links` | The app links (and sending key) stored with a verification or reset token |
 
 **Charts:**
 
@@ -598,7 +623,42 @@ Every email type (except raw 2FA codes) can be customised via the Email Template
 | `user-activated` | User sets password for first time — contains `{api_key}` |
 | `2fa-code` | Login requires 2FA — contains `{code}`, `{expiry_minutes}` |
 | `key-rotated` | Key rotated — contains `{api_key}` |
+| `key-rotated-notice` | Key rotated with `{"email_key": false}` — says so, without the key |
 | `test` | SMTP test send |
+
+### Sign-up from an app's own pages (app links)
+
+An app with a **domain key** can send `links` with `/register` and `/password/forgot`, so the
+verify and set-password emails link to its own pages (`https://app.example.com/auth/verify?t={token}`)
+instead of the portal's. The app's page then posts the token back (`POST /register/complete`
+confirms the address and sets the password in one step).
+
+- Only a domain key may send `links`, and only to origins registered for it
+  (`key_link_origins`; `PUT /keys/self/link-origins`): https on its own domain or a subdomain, or
+  `localhost`. `app_links.check_origin_for_key` does the check.
+- The links are stored with the token (`token_links`), so the follow-on set-password email reuses them.
+- An account registered through a domain key records it as its home (`account_home`).
+
+### Email delivery by the app
+
+The ephemeralREST admin can allow a domain key to send its accounts' emails itself
+(`PUT /admin/keys/{id}/email-delivery {"allowed": true}`, or `key_manager.py email-delivery
+--allow`); the key then switches it on with `PUT /keys/self/email-delivery {"mode": "self"}`. From
+then on, for accounts whose home is that key, and only when the call carries that key, the answer
+gets a `deliver` object instead of an email being sent:
+
+| Endpoint | `deliver` |
+|---|---|
+| `POST /register` | `{"kind": "verify", "token", "expires_at"}` |
+| `POST /register/complete` | `{"kind": "welcome"}` |
+| `POST /login` (code needed) | `{"kind": "login_code", "code", "expires_at"}` |
+| `POST /password/forgot` | `{"kind": "password_reset", "token", "expires_at"}` |
+| `POST /me/rotate` (with `X-Site-Key`) | `{"kind": "key_replaced"}` |
+
+Every other account (made on the portal, through another key, or moved in with a key) keeps
+ephemeralREST's own emails, so no site can see another's codes or tokens. Taking the permission away
+stops it at once. `POST /me/rotate {"email_key": false}` sends the `key-rotated-notice` email (no key
+in it) instead of `key-rotated`.
 
 ### Adding a new email type
 
@@ -825,6 +885,15 @@ python3 key_manager.py set-limits --identifier user@example.com --per-minute 30
 
 # Set class defaults
 python3 key_manager.py class-limits --per-minute 10 --per-hour 100 --per-day 500
+
+# Sign-up links for an app's domain key: show, add or remove the origins it may link to
+python3 key_manager.py link-origins --identifier astro.example.com --add https://astro.example.com
+
+# Let that app send its own accounts' emails (it then switches it on from its settings)
+python3 key_manager.py email-delivery --identifier astro.example.com --allow
+
+# Move an account to an app's domain key (or --clear)
+python3 key_manager.py set-home --identifier user@example.com --home astro.example.com
 ```
 
 `create` now prompts for an optional password during key creation. If left blank, `must_change_password=1` is set and the user must set a password via the portal before they can log in.

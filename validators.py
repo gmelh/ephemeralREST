@@ -344,6 +344,36 @@ class RegisterSchema(Schema):
     """Schema for POST /register — self-serve registration by email."""
     email = fields.Email(required=True)
     name  = fields.Str(required=True, validate=validate.Length(min=1, max=100))
+    # Optional app links ({token} placeholder), only with the app's domain key: see routes.py
+    links = fields.Dict(keys=fields.Str(), values=fields.Str(), load_default=None, allow_none=True)
+
+
+class RegisterCompleteSchema(Schema):
+    """Schema for POST /register/complete — verify the email and set the password in one step."""
+    token    = fields.Str(required=True, validate=validate.Length(min=10, max=255))
+    password = fields.Str(required=True, validate=validate.Length(min=8, max=200))
+
+
+class LinkOriginsSchema(Schema):
+    """Schema for PUT /keys/self/link-origins and the admin equivalent."""
+    origins = fields.List(fields.Str(validate=validate.Length(min=8, max=255)), required=True,
+                          validate=validate.Length(max=10))
+
+
+class EmailDeliverySchema(Schema):
+    """Schema for PUT /keys/self/email-delivery."""
+    mode = fields.Str(required=True, validate=validate.OneOf(['self', 'ephemeral']))
+
+
+class AdminEmailDeliverySchema(Schema):
+    """Schema for PUT /admin/keys/<id>/email-delivery."""
+    allowed = fields.Bool(load_default=None, allow_none=True)
+    mode    = fields.Str(load_default=None, allow_none=True, validate=validate.OneOf(['self', 'ephemeral']))
+
+
+class AccountHomeSchema(Schema):
+    """Schema for PUT /admin/keys/<id>/home — which domain key delivers this account's emails."""
+    home_key_id = fields.Int(load_default=None, allow_none=True)
 
 
 class SetupSchema(Schema):

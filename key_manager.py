@@ -764,6 +764,74 @@ def _read_int(prompt: str, default) -> int | None:
 # Argument parser
 # ---------------------------------------------------------------------------
 
+def _find_key(db, identifier):
+    record = next((k for k in db.get_all_api_keys(include_inactive=True) if k['identifier'] == identifier), None)
+    if not record:
+        print(f"ERROR: No key found for '{identifier}'")
+        sys.exit(1)
+    return record
+
+
+def cmd_link_origins(args):
+    """Show, add or remove the origins a domain key may point sign-up email links at."""
+    from app_links import check_origin_for_key
+    db     = get_db()
+    record = _find_key(db, args.identifier)
+    if record.get('key_type') != 'domain':
+        print(f"ERROR: '{args.identifier}' is a {record.get('key_type')} key; only domain keys have link origins")
+        sys.exit(1)
+    origins = db.get_link_origins(record['id'])
+    for origin in args.add or []:
+        normal, reason = check_origin_for_key(origin, record['identifier'])
+        if not normal:
+            print(f"ERROR: {origin}: {reason}")
+            sys.exit(1)
+        if normal not in origins:
+            origins.append(normal)
+    for origin in args.remove or []:
+        origins = [o for o in origins if o != origin.rstrip('/')]
+    if len(origins) > 10:
+        print("ERROR: at most 10 origins per key")
+        sys.exit(1)
+    if args.add or args.remove:
+        db.set_link_origins(record['id'], origins)
+    print(f"Link origins for '{args.identifier}':")
+    for origin in origins or ['(none)']:
+        print(f"  {origin}")
+
+
+def cmd_email_delivery(args):
+    """Allow (or stop) a domain key's app sending its own accounts' emails."""
+    db     = get_db()
+    record = _find_key(db, args.identifier)
+    if record.get('key_type') != 'domain':
+        print(f"ERROR: '{args.identifier}' is a {record.get('key_type')} key; only domain keys can send emails")
+        sys.exit(1)
+    if args.allow or args.deny:
+        delivery = db.set_email_delivery(record['id'], allowed=bool(args.allow))
+    else:
+        delivery = db.get_email_delivery(record['id'])
+    print(f"Email delivery for '{args.identifier}': allowed={delivery['allowed']}, mode={delivery['mode']}")
+
+
+def cmd_set_home(args):
+    """Set (or clear) the domain key an account belongs to."""
+    db     = get_db()
+    record = _find_key(db, args.identifier)
+    home   = None
+    if not args.clear:
+        if not args.home:
+            print("ERROR: give --home DOMAIN or --clear")
+            sys.exit(1)
+        home_record = _find_key(db, args.home)
+        if home_record.get('key_type') != 'domain':
+            print(f"ERROR: '{args.home}' isn't a domain key")
+            sys.exit(1)
+        home = home_record['id']
+    db.set_account_home(record['id'], home)
+    print(f"'{args.identifier}' now belongs to: {args.home if home else '(no site)'}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Ephemeral.REST — Key Management CLI',
@@ -873,6 +941,25 @@ def main():
     # migrate
     sub.add_parser('migrate', help='Import from ./users/*.cfg files')
 
+    # link-origins
+    p = sub.add_parser('link-origins', help="Show, add or remove a domain key's sign-up link origins")
+    p.add_argument('--identifier', required=True, help='The domain key, e.g. getstudioapps.com')
+    p.add_argument('--add', action='append', help='An origin to add, e.g. https://astro.getstudioapps.com')
+    p.add_argument('--remove', action='append', help='An origin to remove')
+
+    # email-delivery
+    p = sub.add_parser('email-delivery', help="Allow or stop a domain key's app sending its accounts' emails")
+    p.add_argument('--identifier', required=True, help='The domain key')
+    g_ = p.add_mutually_exclusive_group()
+    g_.add_argument('--allow', action='store_true')
+    g_.add_argument('--deny', action='store_true')
+
+    # set-home
+    p = sub.add_parser('set-home', help='Set which domain key an account belongs to')
+    p.add_argument('--identifier', required=True, help="The account's email")
+    p.add_argument('--home', help='The domain key it belongs to')
+    p.add_argument('--clear', action='store_true', help="It doesn't belong to any site")
+
     # verify
     p = sub.add_parser('verify', help='Test a plaintext key')
     p.add_argument('--key', help='The plaintext API key to test')
@@ -898,6 +985,9 @@ def main():
         'update-service':     cmd_update_service,
         'unregister-service': cmd_unregister_service,
         'list-services':      cmd_list_services,
+        'link-origins':   cmd_link_origins,
+        'email-delivery': cmd_email_delivery,
+        'set-home':       cmd_set_home,
         'migrate':      cmd_migrate,
         'verify':       cmd_verify,
     }

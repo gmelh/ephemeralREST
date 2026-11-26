@@ -306,6 +306,15 @@ def create_app(config_class=Config):
         'api.admin_force_password_reset',
         'api.get_chart',
         'api.locations_resolve',
+        # Apps with their own sign-up pages (domain keys) and their admin controls
+        'api.get_own_link_origins',
+        'api.set_own_link_origins',
+        'api.get_own_email_delivery',
+        'api.set_own_email_delivery',
+        'api.admin_get_link_origins',
+        'api.admin_set_link_origins',
+        'api.admin_set_email_delivery',
+        'api.admin_set_account_home',
     ]
     for _endpoint in _protected:
         app.view_functions[_endpoint] = auth_manager.require_api_key(

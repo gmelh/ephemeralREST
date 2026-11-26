@@ -328,7 +328,138 @@ class DatabaseManager:
                 self._init_schema_mysql(cursor)
             else:
                 self._init_schema_sqlite(cursor)
+            self._init_app_links_schema(cursor)
             logger.info(f"Database initialized successfully ({self.db_type})")
+
+    def _init_app_links_schema(self, cursor):
+        """
+        Tables for apps that handle sign-up themselves (both backends). Kept apart from
+        api_keys and email_verifications so nothing that reads those changes:
+
+          key_link_origins    — origins a domain key may point sign-up email links at
+          key_email_delivery  — whether a domain key may deliver its accounts' emails
+                                itself (an admin decision), and whether it does
+          account_home        — the domain key an account was registered through
+          token_links         — the app links and sending key stored with a token
+        """
+        mysql   = self.db_type == 'mysql'
+        charset = 'ENGINE=InnoDB DEFAULT CHARSET=utf8mb4' if mysql else ''
+        int_pk  = 'INT' if mysql else 'INTEGER'
+        str255  = 'VARCHAR(255)' if mysql else 'TEXT'
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS key_link_origins
+            (
+                api_key_id {int_pk} NOT NULL,
+                origin     {str255} NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (api_key_id, origin)
+            ) {charset}
+        ''')
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS key_email_delivery
+            (
+                api_key_id {int_pk} PRIMARY KEY,
+                allowed    {int_pk} NOT NULL DEFAULT 0,
+                mode       {str255} NOT NULL DEFAULT 'ephemeral',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS account_home
+            (
+                api_key_id  {int_pk} PRIMARY KEY,
+                home_key_id {int_pk} NOT NULL,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS token_links
+            (
+                token      {str255} PRIMARY KEY,
+                links      TEXT,
+                via_key_id {int_pk},
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) {charset}
+        ''')
+
+    # ==========================================================================
+    # App links and email delivery (see _init_app_links_schema)
+    # ==========================================================================
+
+    def get_link_origins(self, key_id: int) -> list:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT origin FROM key_link_origins WHERE api_key_id = ? ORDER BY origin', (key_id,))
+            return [dict(row)['origin'] for row in cursor.fetchall()]
+
+    def set_link_origins(self, key_id: int, origins: list) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM key_link_origins WHERE api_key_id = ?', (key_id,))
+            for origin in origins:
+                cursor.execute('INSERT INTO key_link_origins (api_key_id, origin) VALUES (?, ?)', (key_id, origin))
+
+    def get_email_delivery(self, key_id: int) -> Dict[str, Any]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT allowed, mode FROM key_email_delivery WHERE api_key_id = ?', (key_id,))
+            row = cursor.fetchone()
+        if not row:
+            return {'allowed': False, 'mode': 'ephemeral'}
+        row = dict(row)
+        allowed = bool(row['allowed'])
+        return {'allowed': allowed, 'mode': row['mode'] if allowed else 'ephemeral'}
+
+    def set_email_delivery(self, key_id: int, allowed: bool = None, mode: str = None) -> Dict[str, Any]:
+        current = self.get_email_delivery(key_id)
+        if allowed is None:
+            allowed = current['allowed']
+        if mode is None:
+            mode = current['mode']
+        if not allowed:
+            mode = 'ephemeral'   # taking the permission away puts ephemeralREST back in charge
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM key_email_delivery WHERE api_key_id = ?', (key_id,))
+            cursor.execute('INSERT INTO key_email_delivery (api_key_id, allowed, mode) VALUES (?, ?, ?)',
+                           (key_id, 1 if allowed else 0, mode))
+        return {'allowed': bool(allowed), 'mode': mode}
+
+    def get_account_home(self, key_id: int) -> Optional[int]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT home_key_id FROM account_home WHERE api_key_id = ?', (key_id,))
+            row = cursor.fetchone()
+        return int(dict(row)['home_key_id']) if row else None
+
+    def set_account_home(self, key_id: int, home_key_id: Optional[int]) -> None:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM account_home WHERE api_key_id = ?', (key_id,))
+            if home_key_id is not None:
+                cursor.execute('INSERT INTO account_home (api_key_id, home_key_id) VALUES (?, ?)', (key_id, home_key_id))
+
+    def save_token_links(self, token: str, links: Optional[dict], via_key_id: Optional[int]) -> None:
+        if not links and via_key_id is None:
+            return
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO token_links (token, links, via_key_id) VALUES (?, ?, ?)',
+                           (token, json.dumps(links or {}), via_key_id))
+
+    def get_token_links(self, token: str) -> Dict[str, Any]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT links, via_key_id FROM token_links WHERE token = ?', (token,))
+            row = cursor.fetchone()
+        if not row:
+            return {'links': {}, 'via_key_id': None}
+        row = dict(row)
+        try:
+            links = json.loads(row['links'] or '{}')
+        except Exception:
+            links = {}
+        return {'links': links, 'via_key_id': row['via_key_id']}
 
     def _init_schema_sqlite(self, cursor):
         """Initialize the SQLite database with all required tables"""

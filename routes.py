@@ -38,7 +38,7 @@ import logging
 import pytz
 from datetime import datetime
 from flask import Blueprint, request, jsonify, g
-from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterSchema, AdminReviewSchema, SaveViewSchema, LoginSchema, Login2FASchema, SetPasswordSchema, SetupSchema, AccountChartSchema
+from validators import validate_request, CalculateSchema, AutocompleteSchema, ProgressionSchema, SolarReturnSchema, LunarReturnSchema, ApsideSchema, LunationSchema, NextApsideSchema, EphemerisSchema, EclipseSchema, RegisterSchema, AdminReviewSchema, SaveViewSchema, LoginSchema, Login2FASchema, SetPasswordSchema, SetupSchema, AccountChartSchema, RegisterCompleteSchema, LinkOriginsSchema, EmailDeliverySchema, AdminEmailDeliverySchema, AccountHomeSchema
 from output_config import OutputConfig
 from config import Config
 from email_service import EmailService
@@ -158,6 +158,86 @@ def _restore_chart_from_archive(chart_id: str) -> bool:
         logger.error(f"Restore of {chart_id} from archive failed: {e}", exc_info=True)
         g.chart_restore_failed = True
         return False
+
+
+def _refresh_old_progressed(derived: dict, chart_data: dict) -> dict:
+    """
+    Progressions and solar arcs saved before day for a year was fixed were calculated for the
+    target date itself (natal JD plus calendar days), so they showed that day's sky. Recalculate
+    one of those when it's read, from its natal chart and target date, and save it in place.
+    The natal location is used for its ASC and MC: the old ones didn't record another.
+    """
+    chart_type = derived.get('chart_type')
+    if chart_type not in ('secondary_progression', 'solar_arc'):
+        return chart_data
+    if chart_data.get('progression_method') == astronomy_service.PROGRESSION_METHOD:
+        return chart_data
+    try:
+        natal_chart = _get_chart_or_restore(derived['chart_id'])
+        if not natal_chart:
+            return chart_data
+        natal_dt_utc = datetime.fromisoformat(natal_chart['datetime_utc']).replace(tzinfo=None)
+        target       = datetime.fromisoformat(str(derived['reference_date'])[:10])
+        house_system = (chart_data.get('house_cusps') or {}).get('system')
+        location     = natal_chart.get('location') or {}
+        obs_lat      = location.get('latitude')
+        obs_lon      = location.get('longitude')
+        output_cfg   = OutputConfig.merge(getattr(g, 'user', {}).get('output', {}))
+        natal_positions = natal_chart['chart_data'].get('planetary_positions', {})
+        if chart_type == 'secondary_progression':
+            result, error = astronomy_service.calculate_secondary_progressions(
+                natal_dt_utc, target, obs_lat, obs_lon, house_system=house_system, output_config=output_cfg)
+        else:
+            result, error = astronomy_service.calculate_solar_arc_directions(
+                natal_positions, natal_dt_utc, target, obs_lat, obs_lon,
+                house_system=house_system, output_config=output_cfg)
+        if error or not result:
+            logger.warning(f"Couldn't recalculate derived chart {derived.get('id')}: {error}")
+            return chart_data
+        positions = result.get('planetary_positions', {})
+        for frame in ('geocentric', 'heliocentric'):
+            if positions.get(frame):
+                positions[frame] = _filter_to_natal_bodies(positions[frame], natal_positions.get(frame, {}))
+        db_manager.save_derived_chart(
+            chart_id=derived['chart_id'],
+            chart_type=chart_type,
+            reference_date=str(derived['reference_date'])[:10],
+            chart_data=result,
+            chart_name=derived.get('chart_name') or 'Untitled',
+            secondary_chart_id=derived.get('secondary_chart_id'),
+        )
+        logger.info(f"Recalculated derived chart {derived.get('id')} ({chart_type}) day for a year")
+        return result
+    except Exception as e:
+        logger.warning(f"Couldn't recalculate derived chart {derived.get('id')}: {e}")
+        return chart_data
+
+
+def _stored_ayanamsa(stored: dict, datetime_utc=None):
+    """
+    The ayanamsas for a stored chart or derived chart. Charts calculated since they were
+    added carry them; for older ones they're worked out from the chart's own moment: the
+    progressed moment for progressions, the natal moment for solar arc directions (natal
+    positions plus the arc), the return moment for returns, else the chart's datetime.
+    """
+    if stored.get('ayanamsa'):
+        return stored['ayanamsa']
+    try:
+        method = stored.get('method')
+        if method == 'solar_arc_directions' and stored.get('natal_jd'):
+            return astronomy_service.ayanamsas(stored['natal_jd'])
+        for key in ('progressed_jd', 'return_jd'):
+            if stored.get(key):
+                return astronomy_service.ayanamsas(stored[key])
+        if datetime_utc:
+            dt = _parse_datetime(str(datetime_utc))
+            if dt is not None:
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(pytz.UTC).replace(tzinfo=None)
+                return astronomy_service.ayanamsas_at(dt)
+    except Exception as e:
+        logger.warning(f"Couldn't work out the ayanamsas for a stored chart: {e}")
+    return None
 
 
 def _get_chart_or_restore(chart_id: str):
@@ -346,6 +426,7 @@ def calculate(validated_data):
         }
 
         response['planetary_positions'] = result.get('planetary_positions')
+        response['ayanamsa']            = result.get('ayanamsa')
 
         meta = output_cfg.get('meta', {})
         if meta.get('from_cache', True):
@@ -381,6 +462,7 @@ def get_chart(chart_id):
             'location':            chart_data['location'],
             'planetary_positions': stored.get('planetary_positions'),
             'house_cusps':         stored.get('house_cusps'),
+            'ayanamsa':            _stored_ayanamsa(stored, chart_data['datetime_utc']),
             'access_count':        chart_data['access_count'],
             'from_cache':          not restored,
         }
@@ -526,6 +608,14 @@ def health():
             'api_usage':                usage_tracker.get_usage_stats(),
             'celestial_bodies':         list(astronomy_service.PLANETS.keys()),
             'supported_house_systems':  list(astronomy_service.HOUSE_SYSTEMS.keys()),
+            'ayanamsas':                list(astronomy_service.AYANAMSAS.keys()),
+            # What apps with their own sign-up pages can rely on (see "App links").
+            'registration': {
+                'open':           True,
+                'app_links':      True,
+                'complete':       True,
+                'email_delivery': True,
+            },
             'default_output_config':    OutputConfig.as_dict(),
             'registered_users':         get_all_user_ids(),
             'cache_stats':              cache_stats_data,
@@ -576,8 +666,7 @@ def secondary_progressions(validated_data, chart_id):
     """
     Calculate secondary progressions for an existing natal chart.
 
-    Day-for-a-year method: progressed JD = natal JD + days elapsed.
-    Calculation performed at noon UT on the progressed day.
+    Day-for-a-year method: progressed JD = natal JD + (target JD - natal JD) / 365.24219.
 
     URL param:  chart_id         — UUID of the natal chart
     Body param: progression_date — date to progress to (YYYY-MM-DD or ISO)
@@ -677,12 +766,14 @@ def secondary_progressions(validated_data, chart_id):
             'natal_datetime_utc': natal_chart['datetime_utc'],
             'progression_date':   prog_date.date().isoformat(),
             'days_elapsed':       result['days_elapsed'],
+            'years_elapsed':      result['years_elapsed'],
             'progressed_jd':      result['progressed_jd'],
             'method':             'secondary_progressions',
             'house_cusps':        result.get('house_cusps'),
         }
 
         response['planetary_positions'] = result.get('planetary_positions')
+        response['ayanamsa']            = result.get('ayanamsa')
         if prog_location_info:
             response['location'] = {k: v for k, v in prog_location_info.items() if k != 'id'}
 
@@ -805,6 +896,8 @@ def solar_arc_directions(validated_data, chart_id):
             'natal_datetime_utc': natal_chart['datetime_utc'],
             'direction_date':     direction_date.date().isoformat(),
             'days_elapsed':       result['days_elapsed'],
+            'years_elapsed':      result['years_elapsed'],
+            'progressed_jd':      result['progressed_jd'],
             'solar_arc_geo':      result.get('solar_arc_geo'),
             'solar_arc_helio':    result.get('solar_arc_helio'),
             'method':             'solar_arc_directions',
@@ -812,6 +905,7 @@ def solar_arc_directions(validated_data, chart_id):
         }
 
         response['planetary_positions'] = result.get('planetary_positions')
+        response['ayanamsa']            = result.get('ayanamsa')
         if dir_location_info:
             response['location'] = {k: v for k, v in dir_location_info.items() if k != 'id'}
 
@@ -907,6 +1001,7 @@ def solar_return(validated_data, chart_id):
         }
 
         response['planetary_positions'] = result.get('planetary_positions')
+        response['ayanamsa']            = result.get('ayanamsa')
         if location_info:
             response['location'] = {k: v for k, v in location_info.items() if k != 'id'}
 
@@ -1013,6 +1108,7 @@ def lunar_return(validated_data, chart_id):
         }
 
         response['planetary_positions'] = result.get('planetary_positions')
+        response['ayanamsa']            = result.get('ayanamsa')
         if location_info:
             response['location'] = {k: v for k, v in location_info.items() if k != 'id'}
 
@@ -1058,13 +1154,15 @@ def get_derived_chart(derived_id):
         if not derived:
             return _error(f'Derived chart {derived_id} not found', 404)
 
-        chart_data = derived.pop('chart_data')
+        chart_data = _refresh_old_progressed(derived, derived.pop('chart_data'))
         derived['planetary_positions'] = chart_data.get('planetary_positions')
         derived['house_cusps']         = chart_data.get('house_cusps')
+        derived['ayanamsa']            = _stored_ayanamsa(chart_data)
 
         # Include return-specific metadata if present
         for key in ['return_datetime_utc', 'natal_sun_longitude', 'natal_moon_longitude',
-                    'solar_arc_geo', 'solar_arc_helio', 'days_elapsed', 'method',
+                    'solar_arc_geo', 'solar_arc_helio', 'days_elapsed', 'years_elapsed',
+                    'progressed_jd', 'progression_method', 'method',
                     'return_year', 'return_month']:
             if key in chart_data:
                 derived[key] = chart_data[key]
@@ -1213,6 +1311,7 @@ def apsides(validated_data):
             'julian_day':        result['julian_day'],
             'lunar_apsides':     result['lunar_apsides'],
             'planetary_apsides': result['planetary_apsides'],
+            'ayanamsa':          result['ayanamsa'],
         })
 
     except Exception as e:
@@ -1404,6 +1503,7 @@ def ephemeris(validated_data):
             'month':      result['month'],
             'month_name': month_name,
             'days':       result['days'],
+            'ayanamsa':   result['ayanamsa'],
         })
 
     except Exception as e:
@@ -1624,6 +1724,234 @@ def get_archive_entry(chart_id):
 
 
 # ---------------------------------------------------------------------------
+# App links and email delivery
+#
+# An app (such as AstrologyStudio) can handle sign-up on its own pages:
+#   - its domain key registers the origins it owns (/keys/self/link-origins);
+#   - /register and /password/forgot then take `links`, URL templates with a {token}
+#     placeholder, so the emails link to the app instead of the portal. Only a domain key
+#     can send links, and only to its own registered origins: otherwise anyone could send
+#     someone else's reset link to a site of their own and take over the account;
+#   - an account registered through a domain key has that key as its home. If the admin
+#     has allowed it and the key has asked for it (/keys/self/email-delivery), its home
+#     app sends that account's emails itself: the response carries a `deliver` object
+#     instead of ephemeralREST emailing. Never for any other account.
+# ---------------------------------------------------------------------------
+
+from urllib.parse import urlsplit, quote
+from app_links import normalise_origin as _normalise_origin, check_origin_for_key as _check_origin_for_key
+
+_LINK_KINDS       = ('verify', 'set_password')
+_MAX_LINK_ORIGINS = 10
+
+
+def _optional_caller_key():
+    """
+    The key record for an X-API-Key sent to a public route, or None without one.
+    Returns (record, error_response): an unknown key is refused rather than ignored.
+    """
+    api_key = request.headers.get('X-API-Key')
+    if not api_key:
+        return None, None
+    from users import get_user_by_key
+    user = get_user_by_key(api_key)
+    if not user:
+        return None, _error('Invalid API key.', 401)
+    return db_manager.get_api_key_by_id(int(user['id'])), None
+
+
+def _check_links(links, caller):
+    """Validate app links against the caller's domain key. Returns (links or None, error_response)."""
+    if not links:
+        return None, None
+    if caller is None:
+        return None, (jsonify({'error': 'link-needs-domain-key', 'status': 401,
+                               'message': 'Links need the X-API-Key of the domain key whose site they point at.'}), 401)
+    if caller.get('key_type') != 'domain':
+        return None, (jsonify({'error': 'link-needs-domain-key', 'status': 403,
+                               'message': 'Only a domain key can send app links.'}), 403)
+    allowed = set(db_manager.get_link_origins(caller['id']))
+    checked = {}
+    for kind, template in links.items():
+        if kind not in _LINK_KINDS:
+            return None, _error(f"Unknown link '{kind}'; expected {', '.join(_LINK_KINDS)}", 400)
+        if not isinstance(template, str) or len(template) > 500 or template.count('{token}') != 1:
+            return None, _error(f"links.{kind} must contain {{token}} exactly once", 400)
+        sample = urlsplit(template.replace('{token}', 'TOKENTOKEN'))
+        if 'TOKENTOKEN' not in sample.path and 'TOKENTOKEN' not in sample.query:
+            return None, _error(f"links.{kind}: {{token}} must be in the path or the query", 400)
+        origin = _normalise_origin(template)
+        if origin not in allowed:
+            return None, (jsonify({'error': 'link-not-allowed', 'status': 422, 'origin': origin,
+                                   'message': f"{origin} isn't one of this key's link origins."}), 422)
+        checked[kind] = template
+    return checked, None
+
+
+def _link_url(links: dict, kind: str, token: str):
+    template = (links or {}).get(kind)
+    return template.replace('{token}', quote(token, safe='')) if template else None
+
+
+def _delivers_for(account_key_id: int, caller) -> bool:
+    """True if `caller` is the account's home domain key, allowed to and asking to send its emails."""
+    if not caller or caller.get('key_type') != 'domain':
+        return False
+    if db_manager.get_account_home(account_key_id) != caller['id']:
+        return False
+    delivery = db_manager.get_email_delivery(caller['id'])
+    return delivery['allowed'] and delivery['mode'] == 'self'
+
+
+def _expires_in(hours: float = 0, minutes: float = 0) -> str:
+    from datetime import timedelta
+    return (datetime.utcnow() + timedelta(hours=hours, minutes=minutes)).replace(microsecond=0).isoformat() + 'Z'
+
+
+def _domain_key_or_403():
+    """The authenticated caller's key record if it's a domain key, else (None, 403)."""
+    record = db_manager.get_api_key_by_id(int(g.user['id'])) if str(g.user.get('id', '')).isdigit() else None
+    if not record or record.get('key_type') != 'domain':
+        return None, _error('Only a domain key can use this.', 403)
+    return record, None
+
+
+def _save_link_origins(record, origins):
+    normalised = []
+    for origin in origins:
+        normal, reason = _check_origin_for_key(origin, record['identifier'])
+        if not normal:
+            return None, _error(f"{origin}: {reason}", 400)
+        if normal not in normalised:
+            normalised.append(normal)
+    if len(normalised) > _MAX_LINK_ORIGINS:
+        return None, _error(f'At most {_MAX_LINK_ORIGINS} origins per key', 400)
+    db_manager.set_link_origins(record['id'], normalised)
+    return normalised, None
+
+
+def _key_app_settings(record) -> dict:
+    return {
+        'domain':         record['identifier'],
+        'origins':        db_manager.get_link_origins(record['id']),
+        'email_delivery': db_manager.get_email_delivery(record['id']),
+    }
+
+
+@api.route('/keys/self/link-origins', methods=['GET'])
+def get_own_link_origins():
+    """A domain key's link origins and email delivery setting."""
+    record, error = _domain_key_or_403()
+    if error:
+        return error
+    return jsonify(_key_app_settings(record))
+
+
+@api.route('/keys/self/link-origins', methods=['PUT'])
+@validate_request(LinkOriginsSchema)
+def set_own_link_origins(validated_data):
+    """
+    Replace a domain key's link origins. Each must be the key's own domain or a subdomain of
+    it, over https (http only for localhost), with no path: at most 10.
+    Body: { "origins": ["https://astro.example.com"] }
+    """
+    record, error = _domain_key_or_403()
+    if error:
+        return error
+    origins, error = _save_link_origins(record, validated_data['origins'])
+    if error:
+        return error
+    logger.info(f"Link origins for key {record['id']} ({record['identifier']}): {origins}")
+    return jsonify(_key_app_settings(record))
+
+
+@api.route('/keys/self/email-delivery', methods=['GET'])
+def get_own_email_delivery():
+    record, error = _domain_key_or_403()
+    if error:
+        return error
+    return jsonify(db_manager.get_email_delivery(record['id']))
+
+
+@api.route('/keys/self/email-delivery', methods=['PUT'])
+@validate_request(EmailDeliverySchema)
+def set_own_email_delivery(validated_data):
+    """
+    Ask to send this key's accounts' emails yourself ("self") or have ephemeralREST send them
+    ("ephemeral"). "self" needs the admin's permission first.
+    """
+    record, error = _domain_key_or_403()
+    if error:
+        return error
+    delivery = db_manager.get_email_delivery(record['id'])
+    if validated_data['mode'] == 'self' and not delivery['allowed']:
+        return jsonify({'error': 'email-delivery-not-allowed', 'status': 403,
+                        'message': "The ephemeralREST admin hasn't allowed this key to send its accounts' emails."}), 403
+    delivery = db_manager.set_email_delivery(record['id'], mode=validated_data['mode'])
+    logger.info(f"Email delivery for key {record['id']} ({record['identifier']}): {delivery['mode']}")
+    return jsonify(delivery)
+
+
+@api.route('/admin/keys/<int:key_id>/link-origins', methods=['GET'])
+def admin_get_link_origins(key_id):
+    if not g.user.get('admin'):
+        return _error('Admin access required', 403)
+    record = db_manager.get_api_key_by_id(key_id)
+    if not record:
+        return _error('Key not found', 404)
+    return jsonify(_key_app_settings(record))
+
+
+@api.route('/admin/keys/<int:key_id>/link-origins', methods=['PUT'])
+@validate_request(LinkOriginsSchema)
+def admin_set_link_origins(validated_data, key_id):
+    if not g.user.get('admin'):
+        return _error('Admin access required', 403)
+    record = db_manager.get_api_key_by_id(key_id)
+    if not record:
+        return _error('Key not found', 404)
+    if record.get('key_type') != 'domain':
+        return _error('Only domain keys have link origins', 400)
+    origins, error = _save_link_origins(record, validated_data['origins'])
+    if error:
+        return error
+    return jsonify(_key_app_settings(record))
+
+
+@api.route('/admin/keys/<int:key_id>/email-delivery', methods=['PUT'])
+@validate_request(AdminEmailDeliverySchema)
+def admin_set_email_delivery(validated_data, key_id):
+    """Allow (or stop) a domain key sending its accounts' emails itself. Body: { "allowed": true }"""
+    if not g.user.get('admin'):
+        return _error('Admin access required', 403)
+    record = db_manager.get_api_key_by_id(key_id)
+    if not record:
+        return _error('Key not found', 404)
+    if record.get('key_type') != 'domain':
+        return _error('Only domain keys can send emails for their accounts', 400)
+    delivery = db_manager.set_email_delivery(key_id, allowed=validated_data.get('allowed'), mode=validated_data.get('mode'))
+    logger.info(f"Admin: email delivery for key {key_id} ({record['identifier']}) now {delivery}")
+    return jsonify(delivery)
+
+
+@api.route('/admin/keys/<int:key_id>/home', methods=['PUT'])
+@validate_request(AccountHomeSchema)
+def admin_set_account_home(validated_data, key_id):
+    """Set or clear the domain key an account belongs to (whose app may deliver its emails)."""
+    if not g.user.get('admin'):
+        return _error('Admin access required', 403)
+    if not db_manager.get_api_key_by_id(key_id):
+        return _error('Key not found', 404)
+    home = validated_data.get('home_key_id')
+    if home is not None:
+        home_record = db_manager.get_api_key_by_id(home)
+        if not home_record or home_record.get('key_type') != 'domain':
+            return _error('home_key_id must be a domain key', 400)
+    db_manager.set_account_home(key_id, home)
+    return jsonify({'key_id': key_id, 'home_key_id': home})
+
+
+# ---------------------------------------------------------------------------
 # Registration — self-serve, email verification
 # ---------------------------------------------------------------------------
 
@@ -1639,12 +1967,22 @@ def register(validated_data):
     once that's done. The underlying API key is generated immediately but
     is never shown to the user; it is decrypted transparently on login.
 
-    Body: { "name": "...", "email": "..." }
+    Body: { "name": "...", "email": "...", "links": { "verify": "https://app/…?t={token}" } }
+
+    links is optional, and needs the X-API-Key of a domain key whose origins include it (see
+    "App links and email delivery"). An account registered with a domain key belongs to it.
     """
     import secrets as _secrets
 
     email = validated_data['email'].strip().lower()
     name  = validated_data['name'].strip()
+
+    caller, error = _optional_caller_key()
+    if error:
+        return error
+    links, error = _check_links(validated_data.get('links'), caller)
+    if error:
+        return error
 
     # Don't reveal whether the email is already registered
     all_keys = db_manager.get_all_api_keys(include_inactive=True)
@@ -1676,19 +2014,30 @@ def register(validated_data):
         email=email,
         token=token,
     )
+    via_key_id = caller['id'] if caller and caller.get('key_type') == 'domain' else None
+    db_manager.save_token_links(token, links, via_key_id)
+    if via_key_id:
+        db_manager.set_account_home(key_id, via_key_id)
 
-    email_svc = EmailService()
-    email_svc.send_registration_verification(
-        email, name, token,
-        template=_resolve_template('registration-verification')
-    )
-
-    logger.info(f"Registration: '{email}' (key_id={key_id}) — verification sent")
-
-    return jsonify({
+    response = {
         'message': 'Verification email sent. Click the link in the email to verify your address.',
         'email':   email,
-    }), 201
+    }
+    if _delivers_for(key_id, caller):
+        # The app sends it, with its own branding: ephemeralREST sends nothing.
+        response['deliver'] = {'kind': 'verify', 'token': token, 'expires_at': _expires_in(hours=24)}
+        logger.info(f"Registration: '{email}' (key_id={key_id}) — verification handed to key {caller['id']}")
+    else:
+        email_svc = EmailService()
+        email_svc.send_registration_verification(
+            email, name, token,
+            template=_resolve_template('registration-verification'),
+            url=_link_url(links, 'verify', token),
+        )
+        logger.info(f"Registration: '{email}' (key_id={key_id}) — verification sent"
+                    + (f" (links via key {via_key_id})" if links else ''))
+
+    return jsonify(response), 201
 
 
 @api.route('/register/verify', methods=['GET'])
@@ -1728,26 +2077,87 @@ def verify_email():
 
     logger.info(f"Email verified: '{email}' (key_id={key_id}) — account activated")
 
-    # Issue a set-password token (reuses the email_verifications table)
+    # Issue a set-password token (reuses the email_verifications table). It carries on with
+    # the same app's links, if the registration had them.
+    extras = db_manager.get_token_links(token)
     set_password_token = _secrets.token_urlsafe(32)
     db_manager.create_email_verification(
         api_key_id=key_id,
         email=email,
         token=set_password_token,
     )
+    db_manager.save_token_links(set_password_token, extras['links'], extras['via_key_id'])
 
-    email_svc = EmailService()
-    email_svc.send_set_password(
-        email, key_record.get('name', ''), set_password_token,
-        template=_resolve_template('set-password')
-    )
-    logger.info(f"Set-password link emailed to '{email}' (key_id={key_id})")
-
-    return jsonify({
+    response = {
         'message':    'Email verified. Check your email for a link to set your password.',
         'email':      email,
         'key_active': True,
-    })
+    }
+    caller, _ = _optional_caller_key()
+    if _delivers_for(key_id, caller):
+        response['deliver'] = {'kind': 'set_password', 'token': set_password_token, 'expires_at': _expires_in(hours=24)}
+    else:
+        email_svc = EmailService()
+        email_svc.send_set_password(
+            email, key_record.get('name', ''), set_password_token,
+            template=_resolve_template('set-password'),
+            url=_link_url(extras['links'], 'set_password', set_password_token),
+        )
+        logger.info(f"Set-password link emailed to '{email}' (key_id={key_id})")
+
+    return jsonify(response)
+
+
+@api.route('/register/complete', methods=['POST'])
+@validate_request(RegisterCompleteSchema)
+def register_complete(validated_data):
+    """
+    Finish a registration in one step, for apps with their own sign-up pages: check the
+    verification token from the registration email, activate the account and set its
+    password. Answers like a completed login (identity plus api_key), so the app can keep
+    the key. Only for a registration that hasn't been finished yet.
+
+    Body: { "token": "...", "password": "..." }
+    """
+    from werkzeug.security import generate_password_hash
+
+    token  = validated_data['token'].strip()
+    record = db_manager.get_email_verification(token)
+    if not record:
+        return _error('Invalid, expired, or already used verification link', 400)
+
+    key_id     = record['api_key_id']
+    key_record = db_manager.get_api_key_by_id(key_id)
+    if not key_record:
+        return _error('Account not found', 500)
+    if key_record.get('password_hash'):
+        # Already finished (or a password-reset token): that's /password/set's job.
+        return _error('This account is already set up. Log in, or use Forgot password.', 409)
+
+    db_manager.update_api_key(key_id, active=1, password_hash=generate_password_hash(validated_data['password']),
+                              must_change_password=0)
+    db_manager.mark_email_verification_used(token)
+    db_manager.delete_trusted_devices_for_key(key_id)
+    key_record = db_manager.get_api_key_by_id(key_id)
+    logger.info(f"Registration completed: '{key_record['identifier']}' (key_id={key_id})")
+
+    from key_crypto import KeyCrypto
+    from config import Config
+    plaintext = KeyCrypto(Config.SECRET_KEY).decrypt(key_record['key_enc'])
+    response  = _user_identity_response(key_record, plaintext)
+
+    caller, _ = _optional_caller_key()
+    if _delivers_for(key_id, caller):
+        response['deliver'] = {'kind': 'welcome'}
+    else:
+        try:
+            EmailService().send_user_key_activated(
+                key_record['identifier'], key_record.get('name', ''), plaintext,
+                template=_resolve_template('user-activated'),
+            )
+        except Exception as e:
+            logger.error(f"Failed to send the activation email to '{key_record['identifier']}': {e}")
+    return jsonify(response)
 
 
 # ---------------------------------------------------------------------------
@@ -1858,18 +2268,25 @@ def login(validated_data):
     db_manager.invalidate_2fa_codes(key_id)
     db_manager.create_2fa_code(key_id, code, expiry_minutes=Config.TWO_FACTOR_CODE_EXPIRY_MINUTES)
 
-    email_svc = EmailService()
-    email_svc.send_2fa_code(
-        email, key_record.get('name', ''), code,
-        expiry_minutes=Config.TWO_FACTOR_CODE_EXPIRY_MINUTES,
-        template=_resolve_template('2fa-code')
-    )
-    logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA code sent")
-
-    return jsonify({
+    response = {
         '2fa_required': True,
         'email': email,
-    })
+    }
+    caller, _ = _optional_caller_key()
+    if _delivers_for(key_id, caller):
+        response['deliver'] = {'kind': 'login_code', 'code': code,
+                               'expires_at': _expires_in(minutes=Config.TWO_FACTOR_CODE_EXPIRY_MINUTES)}
+        logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA code handed to key {caller['id']}")
+    else:
+        email_svc = EmailService()
+        email_svc.send_2fa_code(
+            email, key_record.get('name', ''), code,
+            expiry_minutes=Config.TWO_FACTOR_CODE_EXPIRY_MINUTES,
+            template=_resolve_template('2fa-code')
+        )
+        logger.info(f"Login: '{email}' (key_id={key_id}) — 2FA code sent")
+
+    return jsonify(response)
 
 
 @api.route('/login/2fa', methods=['POST'])
@@ -1936,19 +2353,27 @@ def password_forgot():
     import secrets as _secrets
 
     data  = request.get_json(silent=True) or {}
-    email = data.get('email', '').strip().lower()
+    email = (data.get('email') or '').strip().lower()
 
     # Validate email format minimally
     if not email or '@' not in email:
         return _error('A valid email address is required', 400)
 
-    _generic_response = jsonify({
-        'message': 'If that email address is registered, a password reset link has been sent.'
-    })
+    caller, error = _optional_caller_key()
+    if error:
+        return error
+    raw_links = data.get('links')
+    if raw_links is not None and not isinstance(raw_links, dict):
+        return _error('links must be an object', 400)
+    links, error = _check_links(raw_links, caller)
+    if error:
+        return error
+
+    _generic = {'message': 'If that email address is registered, a password reset link has been sent.'}
 
     key_record = db_manager.get_api_key_by_identifier(email)
     if not key_record or not key_record.get('active'):
-        return _generic_response
+        return jsonify(_generic)
 
     key_id = key_record['id']
 
@@ -1958,7 +2383,13 @@ def password_forgot():
         email=email,
         token=token,
     )
+    via_key_id = caller['id'] if caller and caller.get('key_type') == 'domain' else None
+    db_manager.save_token_links(token, links, via_key_id)
 
+    if _delivers_for(key_id, caller):
+        logger.info(f"Password reset for '{email}' (key_id={key_id}) handed to key {caller['id']}")
+        return jsonify({**_generic, 'deliver': {'kind': 'password_reset', 'token': token,
+                                                'expires_at': _expires_in(hours=24)}})
     try:
         email_svc = EmailService()
         email_svc.send_password_reset_required(
@@ -1966,12 +2397,13 @@ def password_forgot():
             key_record.get('name', ''),
             token,
             template=_resolve_template('password-reset-required'),
+            url=_link_url(links, 'set_password', token),
         )
         logger.info(f"Password reset requested for '{email}' (key_id={key_id})")
     except Exception as e:
         logger.error(f"Failed to send password reset email to '{email}': {e}")
 
-    return _generic_response
+    return jsonify(_generic)
 
 
 @api.route('/password/set', methods=['POST'])
@@ -2021,6 +2453,11 @@ def set_password(validated_data):
 
     key_id          = key_record['id']
     is_new_account  = token is not None  # token path = first-time setup
+    # An account whose own site sends its emails gets them from the site, not from here.
+    if is_new_account:
+        caller, _ = _optional_caller_key()
+        if _delivers_for(key_id, caller):
+            is_new_account = False
 
     new_hash = generate_password_hash(new_password)
     db_manager.update_api_key(key_id, password_hash=new_hash, must_change_password=0)
@@ -2076,6 +2513,12 @@ _TEMPLATE_CONTENT_DEFAULTS = {
         'subject':     'Your API key has been rotated',
         'header_text': 'API Key Rotated',
         'body_text':   'Hi {name},\n\nYour API key for {identifier} has been rotated.\n\nNew key:\n\n{api_key}\n\nSave this key — it will not be shown again.',
+        'footer_text': 'ephemeralREST',
+    },
+    'key-rotated-notice': {
+        'subject':     'Your API key was replaced',
+        'header_text': 'API Key Replaced',
+        'body_text':   "Hi {name},\n\nThe API key for {identifier} was replaced on {date}. The old key no longer works.\n\nIf you replaced it, there's nothing more to do. If you didn't, log in and replace it again straight away, then change your password.",
         'footer_text': 'ephemeralREST',
     },
     'user-activated': {
@@ -2833,28 +3276,46 @@ def me_rotate():
     key_enc   = crypto.encrypt(plaintext)
     prefix    = crypto.prefix(plaintext)
 
+    # Optional body: {"email_key": false} emails a notice without the new key (the app
+    # showing it to the person instead). An X-Site-Key that's the account's home domain key,
+    # delivering itself, sends nothing: the response says what to deliver.
+    body      = request.get_json(silent=True) or {}
+    email_key = body.get('email_key', True) is not False
+    site_key  = request.headers.get('X-Site-Key')
+    site      = None
+    if site_key:
+        from users import get_user_by_key
+        site_user = get_user_by_key(site_key)
+        site = db_manager.get_api_key_by_id(int(site_user['id'])) if site_user else None
+
     updated = db_manager.update_api_key(key_id, key_enc=key_enc, key_prefix=prefix)
     if not updated:
         return _error('Failed to rotate key', 500)
 
     logger.info(f"Self-rotated key {key_id} (identifier={record['identifier']})")
 
-    # Send the new key by email
-    to_email = record.get('identifier')  # identifier is always the email address
-
-    if to_email:
-        email_svc = EmailService()
-        email_svc.send_key_rotated(to_email, record.get('name', ''), record['identifier'], plaintext, template=_resolve_template('key-rotated'))
-        logger.info(f"Key rotation email sent to '{to_email}' (key_id={key_id})")
-
-    return jsonify({
+    response = {
         'message':    'Key rotated successfully',
         'key_id':     key_id,
         'identifier': record['identifier'],
         'key_prefix': prefix,
         'api_key':    plaintext,
         'warning':    'Save this key — it will not be shown again',
-    })
+    }
+
+    to_email = record.get('identifier')  # identifier is the email address for user keys
+    if _delivers_for(key_id, site):
+        response['deliver'] = {'kind': 'key_replaced'}
+    elif to_email and '@' in to_email:
+        email_svc = EmailService()
+        if email_key:
+            email_svc.send_key_rotated(to_email, record.get('name', ''), record['identifier'], plaintext, template=_resolve_template('key-rotated'))
+        else:
+            email_svc.send_key_rotated_notice(to_email, record.get('name', ''), record['identifier'],
+                                              template=_resolve_template('key-rotated-notice'))
+        logger.info(f"Key rotation email sent to '{to_email}' (key_id={key_id}, with key: {email_key})")
+
+    return jsonify(response)
 
 
 @api.route('/me/output', methods=['POST'])

@@ -35,11 +35,17 @@ Astronomical calculations module
 Handles Swiss Ephemeris calculations for planetary positions
 """
 import logging
+import threading
+import pytz
 import swisseph as swe
 from datetime import datetime
 from typing import Tuple, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+# Swiss Ephemeris keeps the sidereal mode as global state: setting it and reading the
+# ayanamsa must not interleave between threads.
+_sidereal_mode_lock = threading.Lock()
 
 
 class AstronomyService:
@@ -108,10 +114,49 @@ class AstronomyService:
         'gauquelin':     b'G',
     }
 
+    # Ayanamsas returned with every calculation, so a client can show sidereal positions:
+    # sidereal longitude = (tropical longitude - ayanamsa) mod 360. Response key -> Swiss
+    # Ephemeris sidereal mode.
+    AYANAMSAS = {
+        'lahiri':        swe.SIDM_LAHIRI,
+        'krishnamurti':  swe.SIDM_KRISHNAMURTI,
+        'fagan_bradley': swe.SIDM_FAGAN_BRADLEY,
+        'raman':         swe.SIDM_RAMAN,         # B.V. Raman
+    }
+
     def __init__(self, ephemeris_path: str):
         self.ephemeris_path = ephemeris_path
         swe.set_ephe_path(ephemeris_path)
         logger.info(f"Swiss Ephemeris path set to: {ephemeris_path}")
+
+    def ayanamsas(self, jd: float) -> Dict[str, float]:
+        """
+        The ayanamsas in AYANAMSAS at a moment (Julian day, UT), in degrees.
+
+        These are the true ayanamsas (with nutation), because the tropical positions this
+        service returns are apparent positions, with nutation. Subtracting one from a tropical
+        longitude gives exactly what Swiss Ephemeris returns for that body with FLG_SIDEREAL;
+        the same goes for the ASC, the MC and house cusps (whole sign cusps excepted: those
+        start at the sign of the sidereal ASC).
+        """
+        values = {}
+        with _sidereal_mode_lock:
+            try:
+                for name, mode in self.AYANAMSAS.items():
+                    swe.set_sid_mode(mode, 0, 0)
+                    _, value = swe.get_ayanamsa_ex_ut(jd, swe.FLG_SWIEPH)
+                    values[name] = round(value, 7)
+            finally:
+                # Swiss Ephemeris' own default. Nothing else here uses sidereal mode.
+                swe.set_sid_mode(swe.SIDM_FAGAN_BRADLEY, 0, 0)
+        return values
+
+    def ayanamsas_at(self, dt_utc: datetime) -> Dict[str, float]:
+        """ayanamsas() for a UTC datetime."""
+        return self.ayanamsas(swe.julday(
+            dt_utc.year, dt_utc.month, dt_utc.day,
+            dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+        ))
 
     def calculate_planetary_positions(
             self,
@@ -251,6 +296,7 @@ class AstronomyService:
             result = {
                 'planetary_positions': planetary_positions,
                 'house_cusps':         house_cusps,
+                'ayanamsa':            self.ayanamsas(jd),
             }
 
             return result, None
@@ -442,6 +488,31 @@ class AstronomyService:
     # Secondary Progressions
     # ==========================================================================
 
+    # Day for a year: each tropical year of life after birth is one day after birth.
+    TROPICAL_YEAR_DAYS = 365.24219
+    # Marks progressed and solar arc results made this way. Derived charts saved before it
+    # (made with natal JD + calendar days, which gave the target date's sky) are recalculated.
+    PROGRESSION_METHOD = 'day_for_a_year'
+
+    def _progressed_moment(self, natal_jd: float, progression_date: datetime) -> Tuple[float, float, int]:
+        """
+        The progressed moment for a target date, day for a year.
+
+        Returns (progressed_jd, years_elapsed, days_elapsed): the Julian day (UT) of the
+        progressed chart, the years of life from birth to the target, and the calendar days
+        between the natal date and the target date (kept for clients that show it).
+        """
+        if progression_date.tzinfo is not None:
+            progression_date = progression_date.astimezone(pytz.UTC).replace(tzinfo=None)
+        target_jd = swe.julday(
+            progression_date.year, progression_date.month, progression_date.day,
+            progression_date.hour + progression_date.minute / 60.0 + progression_date.second / 3600.0
+        )
+        years_elapsed = (target_jd - natal_jd) / self.TROPICAL_YEAR_DAYS
+        natal_y, natal_m, natal_d, _ = swe.revjul(natal_jd)
+        days_elapsed = (progression_date.date() - datetime(natal_y, natal_m, natal_d).date()).days
+        return natal_jd + years_elapsed, years_elapsed, days_elapsed
+
     def calculate_secondary_progressions(
             self,
             natal_dt_utc: datetime,
@@ -454,9 +525,8 @@ class AstronomyService:
         """
         Calculate secondary progressions using the day-for-a-year method.
 
-        Each day after birth corresponds to one year of life.
-        Progressed JD = natal JD + days elapsed since birth.
-        Calculation is performed at noon (12:00 UT) on the progressed day.
+        Each day after birth corresponds to one year of life:
+        progressed JD = natal JD + (target JD - natal JD) / 365.24219.
 
         Args:
             natal_dt_utc:     Natal datetime in UTC
@@ -484,23 +554,13 @@ class AstronomyService:
                 natal_dt_utc.hour + natal_dt_utc.minute / 60.0 + natal_dt_utc.second / 3600.0
             )
 
-            # Progressed Julian day — day-for-a-year at noon UT
-            # Days elapsed = number of days between natal date and progression date
-            # Strip timezone info from both before subtracting to avoid
-            # offset-naive vs offset-aware comparison errors
-            natal_date_only  = natal_dt_utc.replace(
-                hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-            )
-            prog_date_only   = progression_date.replace(
-                hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-            )
-            days_elapsed     = (prog_date_only - natal_date_only).days
-            progressed_jd    = natal_jd + days_elapsed + 0.5  # noon UT
+            # Progressed Julian day: day for a year
+            progressed_jd, years_elapsed, days_elapsed = self._progressed_moment(natal_jd, progression_date)
 
             logger.info(
                 f"Secondary progressions: natal={natal_dt_utc.date()}, "
                 f"target={progression_date.date()}, "
-                f"days_elapsed={days_elapsed}, progressed_jd={progressed_jd:.4f}"
+                f"years={years_elapsed:.4f}, progressed_jd={progressed_jd:.4f}"
             )
 
             # Calculate positions at progressed JD — same flow as natal
@@ -523,10 +583,16 @@ class AstronomyService:
             if error:
                 return None, error
 
-            result['progressed_jd']  = progressed_jd
-            result['natal_jd']       = natal_jd
-            result['days_elapsed']   = days_elapsed
-            result['method']         = 'secondary_progressions'
+            result['progressed_jd']       = progressed_jd
+            result['natal_jd']            = natal_jd
+            result['days_elapsed']        = days_elapsed
+            result['years_elapsed']       = years_elapsed
+            result['method']              = 'secondary_progressions'
+            result['progression_method']  = self.PROGRESSION_METHOD
+            result['observer']            = (
+                {'latitude': observer_lat, 'longitude': observer_lon}
+                if observer_lat is not None and observer_lon is not None else None
+            )
 
             return result, None
 
@@ -556,8 +622,8 @@ class AstronomyService:
 
         For heliocentric: arc = progressed Earth longitude - natal Earth longitude.
 
-        Progressed Sun/Earth is calculated at noon UT on the progressed JD
-        (natal JD + days elapsed), matching the secondary progression method.
+        Progressed Sun/Earth is calculated at the progressed moment, day for a year,
+        matching the secondary progression method.
 
         Args:
             natal_positions:  The natal chart_data dict (geocentric/heliocentric)
@@ -592,15 +658,8 @@ class AstronomyService:
                 natal_dt_utc.hour + natal_dt_utc.minute / 60.0 + natal_dt_utc.second / 3600.0
             )
 
-            # Strip timezone info before subtracting
-            natal_date_only = natal_dt_utc.replace(
-                hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-            )
-            prog_date_only  = progression_date.replace(
-                hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-            )
-            days_elapsed    = (prog_date_only - natal_date_only).days
-            progressed_jd   = natal_jd + days_elapsed + 0.5  # noon UT
+            # The progressed moment: day for a year, as for secondary progressions
+            progressed_jd, years_elapsed, days_elapsed = self._progressed_moment(natal_jd, progression_date)
 
             # --- Geocentric solar arc ---
             geo_arc = None
@@ -704,8 +763,14 @@ class AstronomyService:
                 'progressed_jd':        progressed_jd,
                 'natal_jd':             natal_jd,
                 'days_elapsed':         days_elapsed,
+                'years_elapsed':        years_elapsed,
+                'progression_method':   self.PROGRESSION_METHOD,
+                'observer':             ({'latitude': observer_lat, 'longitude': observer_lon}
+                                         if observer_lat is not None and observer_lon is not None else None),
                 'house_cusps':          directed_cusps if cfg.get('geocentric', True) else None,
                 'planetary_positions':  planetary_positions,
+                # Directed positions are natal positions plus the arc, so the natal moment's.
+                'ayanamsa':             self.ayanamsas(natal_jd),
             }
 
             return result, None
@@ -1200,6 +1265,7 @@ class AstronomyService:
                 'planetary_apsides': planetary_apsides,
                 'datetime_utc':      dt_utc.isoformat(),
                 'julian_day':        jd,
+                'ayanamsa':          self.ayanamsas(jd),
             }, None
 
         except Exception as e:
@@ -1444,6 +1510,7 @@ class AstronomyService:
             'sun_longitude':    round(sun[0],  6),
             'moon_longitude':   round(moon[0], 6),
             'sun_moon_angle':   round(angle,   6),
+            'ayanamsa':         self.ayanamsas(jd),
         }
 
     # ==========================================================================
@@ -1760,6 +1827,7 @@ class AstronomyService:
             'julian_day':   round(jd, 6),
             'longitude':    round(longitude,   6),
             'distance_au':  round(distance_au, 8),
+            'ayanamsa':     self.ayanamsas(jd),
         }
 
     # ==========================================================================
@@ -1819,6 +1887,7 @@ class AstronomyService:
             active_bodies.pop('mc',  None)
 
             days = {}
+            ayanamsa = {}   # date -> ayanamsas at that day's noon UT, beside 'days'
 
             for day in range(1, days_in_month + 1):
                 date_str = f"{year:04d}-{month:02d}-{day:02d}"
@@ -1870,15 +1939,17 @@ class AstronomyService:
                     day_entry['geocentric'] = geocentric
                 if cfg.get('heliocentric', True):
                     day_entry['heliocentric'] = heliocentric
+                ayanamsa[date_str] = self.ayanamsas(jd)
 
                 days[date_str] = day_entry
 
             logger.info(f"Monthly ephemeris calculated: {year}-{month:02d} ({days_in_month} days)")
 
             return {
-                'year':  year,
-                'month': month,
-                'days':  days,
+                'year':     year,
+                'month':    month,
+                'days':     days,
+                'ayanamsa': ayanamsa,
             }, None
 
         except Exception as e:

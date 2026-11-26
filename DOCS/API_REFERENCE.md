@@ -236,6 +236,54 @@ To omit house cusps entirely from the response, pass `null` or omit the `house_s
 
 ---
 
+## Ayanamsas (sidereal positions)
+
+Every position the API returns is tropical. To let a client show sidereal positions without a
+second request, every calculation also returns four ayanamsas, in degrees, for the moment its
+positions are for:
+
+```json
+"ayanamsa": {
+  "lahiri": 23.3812555,
+  "krishnamurti": 23.2844032,
+  "fagan_bradley": 24.2644632,
+  "raman": 21.9349542
+}
+```
+
+| Key | Ayanamsa | Swiss Ephemeris mode |
+|---|---|---|
+| `lahiri` | Lahiri (Chitrapaksha) | `SIDM_LAHIRI` |
+| `krishnamurti` | Krishnamurti (KP) | `SIDM_KRISHNAMURTI` |
+| `fagan_bradley` | Fagan-Bradley | `SIDM_FAGAN_BRADLEY` |
+| `raman` | B.V. Raman | `SIDM_RAMAN` |
+
+**Sidereal longitude = (tropical longitude − ayanamsa) mod 360.** The values are true ayanamsas
+(they include nutation), matching the API's apparent tropical positions, so the result equals
+Swiss Ephemeris' own sidereal position for that body, geocentric or heliocentric. The same
+subtraction works for the ASC, MC and house cusps, except **whole sign** cusps: in a sidereal
+chart they start at the sign of the sidereal ASC, so work them out from that.
+
+Where the ayanamsa is in each response, and which moment it's for:
+
+| Endpoint | Where | Moment |
+|---|---|---|
+| `POST /calculate`, `GET /chart/{id}` | `ayanamsa` | the chart |
+| `POST /chart/{id}/progressions` | `ayanamsa` | the progressed moment |
+| `POST /chart/{id}/solar-arc` | `ayanamsa` | the natal moment (directed positions are natal positions plus the arc) |
+| `POST /chart/{id}/solar-return`, `/lunar-return` | `ayanamsa` | the return moment |
+| `GET /derived/{id}` | `ayanamsa` | as for the chart type above |
+| `POST /apsides` | `ayanamsa` | the requested moment |
+| `POST /ephemeris` | `ayanamsa`, keyed by date like `days` | noon UT of each day |
+| `POST /lunations`, `POST /apsides/next` | `ayanamsa` in each event | the event |
+
+Charts saved before ayanamsas were added get theirs worked out when they're read. Note that a
+tropical return converted this way is not a sidereal return: a sidereal solar return happens
+when the Sun comes back to its sidereal natal longitude, which is about 20 minutes later than
+the tropical return for each year since birth (about 20 hours by age 60).
+
+---
+
 ## Output configuration
 
 Every API key has an output configuration stored against it that controls which bodies and fields appear in responses. The server has a set of defaults, and your key can override any of them.
@@ -527,7 +575,9 @@ Derived charts are charts calculated by modifying or relating to an existing nat
 
 #### `POST /chart/<chart_id>/progressions`
 
-Secondary progressions use the **day-for-a-year** method: each day after birth corresponds to one year of life. The progressed chart is calculated at noon UT on the Julian day corresponding to the progressed date.
+Secondary progressions use the **day-for-a-year** method: each day after birth corresponds to one year of life. The progressed moment is `natal JD + (target JD − natal JD) / 365.24219`, so a chart progressed 60.69 years is calculated for 60.69 days after birth.
+
+> Before this was fixed, progressions (and solar arcs, which use the progressed Sun) were calculated for the target date itself, so they showed that day's sky. Derived charts saved the old way are recalculated the first time they're read through `GET /derived/{id}`, from their natal chart and target date, and saved in place. Results made the new way carry `"progression_method": "day_for_a_year"`.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -553,7 +603,8 @@ curl -X POST https://api.yourdomain.com/chart/a3f2c1d4-.../progressions \
   "chart_type": "secondary_progression",
   "progression_date": "2026-03-21",
   "days_elapsed": 53279,
-  "progressed_jd": 2460756.5,
+  "years_elapsed": 145.8731,
+  "progressed_jd": 2407623.3731,
   "natal_chart_id": "a3f2c1d4-...",
   "planetary_positions": {
     "sun":  { "longitude": 66.31, "retrograde": false, "...": "..." },
@@ -599,7 +650,7 @@ curl -X POST https://api.yourdomain.com/chart/a3f2c1d4-.../solar-arc \
 }
 ```
 
-The `solar_arc_geo` and `solar_arc_helio` values are the arcs applied — approximately one degree per year of life.
+The `solar_arc_geo` and `solar_arc_helio` values are the arcs applied — approximately one degree per year of life. The response also gives `years_elapsed` and `progressed_jd`, the progressed moment the arc was measured at.
 
 ---
 
@@ -1415,11 +1466,106 @@ The registration flow:
 3. A second email is sent with a link to set a password.
 4. Once the password is set, the account is active and the API key is emailed once.
 
+An app with its own sign-up pages can send `links` and finish with `POST /register/complete` instead: see **Sign-up from your own app** below.
+
 ---
 
 #### `GET /register/verify?t=<token>`
 
 Verify an email address. Intended to be called by the portal's `verify.php` page, which renders the result.
+
+---
+
+### Sign-up from your own app
+
+An app such as AstrologyStudio can keep people on its own pages for sign-up, password resets
+and (if the admin allows it) the emails themselves. Everything below is optional: without it,
+the portal flow above works exactly as before.
+
+**1. Link origins (domain keys only).** A domain key lists the web addresses (origins) of its
+own site, which sign-up emails may link to:
+
+```bash
+curl -X PUT https://api.yourdomain.com/keys/self/link-origins \
+  -H "X-API-Key: eph_domain_key" -H "Content-Type: application/json" \
+  -d '{"origins": ["https://astro.example.com"]}'
+```
+
+Each origin must be the key's own domain or a subdomain of it, over `https` (plain `http` only
+for `localhost`), with no path: at most 10. `GET /keys/self/link-origins` shows them, with the
+key's `email_delivery` setting. A user key gets `403`. Admins can use
+`GET`/`PUT /admin/keys/{id}/link-origins` or `key_manager.py link-origins`.
+
+**2. Links on `/register` and `/password/forgot`.** Send the domain key as `X-API-Key` and
+`links`, URL templates with one `{token}` in the path or query:
+
+```json
+{
+  "name": "Jane Smith",
+  "email": "jane@example.com",
+  "links": {
+    "verify": "https://astro.example.com/auth/verify?t={token}",
+    "set_password": "https://astro.example.com/auth/set-password?t={token}"
+  }
+}
+```
+
+| Problem | Response |
+|---|---|
+| `links` with no key | `401` `{"error": "link-needs-domain-key"}` |
+| `links` with a user key | `403` `{"error": "link-needs-domain-key"}` |
+| A link to an origin the key hasn't registered | `422` `{"error": "link-not-allowed", "origin": "…"}`, and no email is sent |
+| No `{token}`, or `{token}` elsewhere | `400` |
+
+The check exists because `/register` and `/password/forgot` need no key: without it, anyone
+could send someone else's reset link to a site of their own. An account registered with a
+domain key **belongs** to that key (its home), which matters for step 4.
+
+#### `POST /register/complete`
+
+Finish a registration in one step, from the `verify` link's token: verify the address, activate
+the account and set its password. No authentication required.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `token` | string | Yes | The token from the verification link |
+| `password` | string | Yes | 8–200 characters |
+
+Answers like a completed login (identity fields and `api_key`), so the app can keep the key. The
+activation email with the key is still sent, unless the app delivers this account's emails.
+A used or expired token gets `400`, and an account that's already set up gets `409`.
+
+**3. Replacing a key without emailing it.** `POST /me/rotate` takes an optional body
+`{"email_key": false}`: the new key is returned as before, but the email is a notice without
+it (template `key-rotated-notice`).
+
+**4. The app sending the emails (admin's permission).** An admin allows a domain key with
+`PUT /admin/keys/{id}/email-delivery {"allowed": true}` (or
+`key_manager.py email-delivery --identifier example.com --allow`). The key then switches it on
+with `PUT /keys/self/email-delivery {"mode": "self"}` (`"ephemeral"` switches it off). From then
+on, for **accounts that belong to that key only**, and only when the request carries that key,
+ephemeralREST sends nothing and adds a `deliver` object for the app to send instead:
+
+| Endpoint | `deliver` |
+|---|---|
+| `POST /register` | `{"kind": "verify", "token": "…", "expires_at": "…"}` |
+| `GET /register/verify` | `{"kind": "set_password", "token": "…", "expires_at": "…"}` |
+| `POST /register/complete` | `{"kind": "welcome"}` |
+| `POST /login` (code needed) | `{"kind": "login_code", "code": "123456", "expires_at": "…"}` |
+| `POST /password/forgot` | `{"kind": "password_reset", "token": "…", "expires_at": "…"}` |
+| `POST /me/rotate` with `X-Site-Key: <domain key>` | `{"kind": "key_replaced"}` |
+
+Any other account (made on the portal, through another site, or with no site) keeps getting
+ephemeralREST's own emails, and no site ever sees its codes or tokens: anyone holding those
+could take the account over. Removing the admin's permission puts ephemeralREST back in charge
+at once. An admin can move an account to a site with `PUT /admin/keys/{id}/home
+{"home_key_id": 12}` or `key_manager.py set-home`.
+
+`GET /health` tells apps what's supported:
+
+```json
+"registration": { "open": true, "app_links": true, "complete": true, "email_delivery": true }
+```
 
 ---
 
@@ -1540,6 +1686,7 @@ Set or change a password. Supply either `token` (from email) or `email` + `curre
 | `POST` | `/login/2fa` | Complete login with 2FA code |
 | `POST` | `/password/forgot` | Request a password reset email |
 | `POST` | `/password/set` | Set or change a password |
+| `POST` | `/register/complete` | Verify and set the password in one step (apps with their own sign-up) |
 | `GET` | `/autocomplete?q=` | Location autocomplete |
 | `GET` | `/chart/<id>` | Retrieve a chart (public sharing) |
 | `GET` | `/views?v=<uuid>` | Retrieve a saved view |
@@ -1574,6 +1721,10 @@ Set or change a password. Supply either `token` (from email) or `email` + `curre
 | `POST` | `/me/output` | Update your output configuration |
 | `POST` | `/me/rotate` | Rotate your API key |
 | `POST` | `/me/forget-device` | Revoke a trusted-device token |
+| `GET` | `/keys/self/link-origins` | A domain key's link origins and email delivery |
+| `PUT` | `/keys/self/link-origins` | Replace a domain key's link origins |
+| `GET` | `/keys/self/email-delivery` | Whether the key's app sends its accounts' emails |
+| `PUT` | `/keys/self/email-delivery` | Switch that on (`self`) or off (`ephemeral`) |
 | `GET` | `/account/store` | Your account store namespaces, usage and limits |
 | `GET` | `/account/store/<ns>` | Change feed / listing for a namespace |
 | `GET` | `/account/store/<ns>/<key>` | Read a stored document |
@@ -1591,6 +1742,10 @@ Set or change a password. Supply either `token` (from email) or `email` + `curre
 | `POST` | `/admin/keys/<id>/enable` | Enable a key |
 | `POST` | `/admin/keys/<id>/rotate` | Rotate a key |
 | `POST` | `/admin/keys/<id>/limits` | Set per-key rate limits |
+| `GET` | `/admin/keys/<id>/link-origins` | A domain key's link origins |
+| `PUT` | `/admin/keys/<id>/link-origins` | Replace a domain key's link origins |
+| `PUT` | `/admin/keys/<id>/email-delivery` | Allow a domain key's app to send its accounts' emails |
+| `PUT` | `/admin/keys/<id>/home` | Set which domain key an account belongs to |
 | `GET` | `/admin/keys/<id>/output` | Key output config |
 | `POST` | `/admin/keys/<id>/output` | Update key output config |
 | `POST` | `/admin/keys/<id>/set-admin` | Grant or revoke admin flag |

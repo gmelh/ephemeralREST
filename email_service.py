@@ -53,6 +53,7 @@ base_url      ←→  API_BASE_URL      (default http://localhost:5000)
 
 import logging
 import os
+from datetime import datetime
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -141,11 +142,12 @@ class EmailService:
 
     def send_registration_verification(
             self, to_email: str, name: str, token: str,
-            base_url: str = None, template: dict = None
+            base_url: str = None, template: dict = None, url: str = None
     ) -> bool:
         """Send email verification link to a newly registered user."""
-        # Link goes to the portal's verify.php, which calls the API internally.
-        verify_url = f"{self.portal_url}/verify.php?t={token}"
+        # Link goes to the portal's verify.php, which calls the API internally, unless the
+        # app that registered them gave its own (url, already checked against its origins).
+        verify_url = url or f"{self.portal_url}/verify.php?t={token}"
         vars = {'name': name, 'verify_url': verify_url}
 
         if template:
@@ -267,9 +269,9 @@ ephemeralREST
 </body></html>"""
         return self._send(to_email, subject, text_body, html_body)
 
-    def send_set_password(self, to_email: str, name: str, token: str, template: dict = None) -> bool:
+    def send_set_password(self, to_email: str, name: str, token: str, template: dict = None, url: str = None) -> bool:
         """Send a link prompting the user to set a password (post email-verification)."""
-        set_password_url = f"{self.portal_url}/set-password.php?t={token}"
+        set_password_url = url or f"{self.portal_url}/set-password.php?t={token}"
         vars = {'name': name, 'set_password_url': set_password_url}
 
         if template:
@@ -305,9 +307,9 @@ ephemeralREST
 </body></html>"""
         return self._send(to_email, subject, text_body, html_body)
 
-    def send_password_reset_required(self, to_email: str, name: str, token: str, template: dict = None) -> bool:
+    def send_password_reset_required(self, to_email: str, name: str, token: str, template: dict = None, url: str = None) -> bool:
         """Notify a user that an admin has required them to set a new password."""
-        set_password_url = f"{self.portal_url}/set-password.php?t={token}"
+        set_password_url = url or f"{self.portal_url}/set-password.php?t={token}"
         vars = {'name': name, 'set_password_url': set_password_url}
 
         if template:
@@ -340,6 +342,35 @@ ephemeralREST
 </p>
 <p style="color:#666;font-size:13px;">Or copy this link: <a href="{set_password_url}">{set_password_url}</a></p>
 <p style="color:#666;font-size:13px;">This link expires in 24 hours.</p>
+<hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
+<p style="color:#999;font-size:12px;">ephemeralREST</p>
+</body></html>"""
+        return self._send(to_email, subject, text_body, html_body)
+
+    def send_key_rotated_notice(self, to_email: str, name: str, identifier: str, template: dict = None) -> bool:
+        """Tell a key holder their key was replaced, without the new key (the app showed it)."""
+        when = datetime.utcnow().strftime('%d %B %Y, %H:%M UTC')
+        vars = {'name': name, 'identifier': identifier, 'date': when}
+        if template:
+            subject   = template.get('subject') or 'Your API key was replaced'
+            text_body = self._substitute(template.get('body_text') or '', vars)
+            html_body = self._render_template_html(template, vars)
+        else:
+            subject   = 'Your ephemeralREST API key was replaced'
+            text_body = f"""Hello {name},
+
+The API key for {identifier} was replaced on {when}. The old key no longer works.
+
+If you replaced it, there's nothing more to do. If you didn't, log in and replace it
+again straight away, then change your password.
+
+ephemeralREST
+"""
+            html_body = f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:40px auto;color:#333;">
+<h2 style="color:#1F4E79;">Your API key was replaced</h2>
+<p>Hello {name},</p>
+<p>The API key for <strong>{identifier}</strong> was replaced on {when}. The old key no longer works.</p>
+<p>If you replaced it, there's nothing more to do. If you didn't, log in and replace it again straight away, then change your password.</p>
 <hr style="border:none;border-top:1px solid #eee;margin:28px 0;">
 <p style="color:#999;font-size:12px;">ephemeralREST</p>
 </body></html>"""
