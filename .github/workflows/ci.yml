@@ -1,0 +1,62 @@
+# Checks run on every push and pull request (and before every release).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q tests
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+
+  installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install/install.sh
+      - run: shellcheck install/install.sh install/server-test.sh
+      - name: Dry run, as people run it (piped into bash)
+        run: |
+          bash install/install.sh --dry-run --dir /tmp/eph --domain api.example.com --admin-domain admin.example.com --yes --skip-dns-check < /dev/null
+          grep -q '^admin.example.com {' /tmp/eph/ephemeral.caddy
+          shellcheck /tmp/eph/ephemeral
+          docker network create studioapps
+          docker compose --project-directory /tmp/eph config --quiet
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ephemeralrest:ci .
+      - name: Starts and answers
+        run: |
+          docker run -d --name eph -p 8080:8080 -e SECRET_KEY=ci-secret-0123456789abcdef0123456789 -e USE_GOOGLE=false ephemeralrest:ci
+          for i in $(seq 1 30); do curl -fsS localhost:8080/api/v1/ping && break; sleep 2; done
+          curl -fsS -H 'Accept: text/html' localhost:8080/ | grep -q '<div id="app">'
+          docker exec eph ephemeral version

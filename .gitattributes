@@ -1,0 +1,4 @@
+# Scripts run on Linux: keep Linux line endings, even when checked out on Windows.
+*.sh text eol=lf
+docker/ephemeral text eol=lf
+Dockerfile text eol=lf

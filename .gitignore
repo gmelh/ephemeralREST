@@ -128,3 +128,7 @@ temp/
 ephemeral.rest.zip
 *.zip
 
+
+# Built web app
+web/node_modules/
+web/dist/
