@@ -19,8 +19,10 @@ COPY web/ ./
 RUN npm run typecheck && npm run build
 
 # ---- Python dependencies (pyswisseph needs a compiler) ---------------------------
+# pyswisseph has a ready-made wheel for amd64 only; for arm64 it's compiled here, which needs
+# the C library's headers (libc6-dev) as well as gcc: --no-install-recommends leaves them out.
 FROM python:3.11-slim AS deps
-RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt

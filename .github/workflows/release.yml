@@ -1,34 +1,93 @@
-# Publishes a release when a version tag is pushed (e.g. git tag -a v1.0.0 && git push origin v1.0.0):
+# Publishes a release when a version tag is pushed (e.g. git tag -a v1.0.0 && git push origin v1.0.0),
+# or by hand: Actions → Release → Run workflow, giving a tag that already exists (to build again).
 #   1. runs all the checks (ci.yml);
-#   2. builds the image for Intel/AMD and ARM servers and pushes it to GHCR,
-#      tagged 1.0.0, 1.0, 1 and latest;
+#   2. builds the image for Intel/AMD and ARM servers, each on its own kind of machine (no
+#      emulation), and pushes it to GHCR as one image, tagged 1.0.0, 1.0, 1 and latest;
 #      a pre-release tag like v1.0.0-rc.1 gets only its own version tag, never latest;
-#   3. creates a GitHub release with install.sh and its SHA-256 checksum attached.
+#   3. creates the GitHub release with install.sh and its SHA-256 checksum attached (or, run
+#      again, replaces those two files on it).
 name: Release
 
 on:
   push:
     tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The version tag to build and release (it must exist already), e.g. v1.0.2"
+        required: true
 
 permissions:
   contents: read
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/ephemeralrest
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   checks:
     uses: ./.github/workflows/ci.yml
 
-  image:
+  # One build per platform, on a machine of that kind. Each pushes its image by digest only;
+  # the next job puts them together under the version tags.
+  build:
     needs: checks
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-qemu-action@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Keep the digest for the next job
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -40,20 +99,21 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
-            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
-      - uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=semver,pattern={{major}},value=${{ env.TAG }},enable=${{ !startsWith(env.TAG, 'v0.') }}
+            type=raw,value=latest,enable=${{ !contains(env.TAG, '-') }}
+      - name: One image for both platforms, under the version tags
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # shellcheck disable=SC2046  # each tag and digest is meant to be its own argument
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+      - name: Check it has both platforms
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${TAG#v}" | tee inspect.txt
+          grep -q 'linux/amd64' inspect.txt && grep -q 'linux/arm64' inspect.txt
 
   release:
     needs: image
@@ -62,6 +122,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
       - name: Installer and checksum
         run: |
           cp install/install.sh install.sh
@@ -69,7 +131,6 @@ jobs:
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: |
           sum=$(cut -d' ' -f1 install.sh.sha256)
           version=${TAG#v}
@@ -88,5 +149,9 @@ jobs:
             echo
             echo "install.sh SHA-256: \`${sum}\`"
           } > notes.md
-          gh release create "$TAG" install.sh install.sh.sha256 \
-            --title "ephemeralREST ${version}" --notes-file notes.md $prerelease
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" install.sh install.sh.sha256 --clobber  # built again
+          else
+            gh release create "$TAG" install.sh install.sh.sha256 \
+              --title "ephemeralREST ${version}" --notes-file notes.md $prerelease
+          fi
