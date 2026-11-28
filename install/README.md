@@ -10,7 +10,8 @@ Before you run it, point an address at the server: in your domain's DNS settings
 **A record** for, say, `api.example.com` with the server's IP address, and another for the
 admin address if you want one (`admin.example.com`). The installer checks them, installs
 Docker if needed, sets up the server's **shared Caddy** and starts ephemeralREST behind it,
-downloads the Swiss Ephemeris files and the GeoNames cities list, and tells you where to create
+downloads the Swiss Ephemeris files (all of them, about 120 MB) and the GeoNames cities list
+(with the names of states, regions and countries), and tells you where to create
 the administrator account.
 
 Then open the address (the admin address, if you gave one). The first person to do so creates
@@ -51,9 +52,10 @@ certificate is carried over so Let's Encrypt isn't asked again. The old setup is
 | `ephemeral logs caddy` | Follow the shared Caddy's log (certificates, errors) |
 | `ephemeral reset-password EMAIL` | Prints a link to set a new password — works even before email is set up |
 | `ephemeral keys ...` | Manage keys from the command line (`ephemeral keys --help`) |
-| `ephemeral fetch-ephemeris` | Download the Swiss Ephemeris files again |
-| `ephemeral import-cities` | Download and import the cities list again |
+| `ephemeral fetch-ephemeris` | Download any Swiss Ephemeris files that are missing: all of them, about 120 MB, for 13201 BC – 17191 AD (`--minimal`: 1800–2399 only) |
+| `ephemeral import-cities` | Download and import the cities list again, with the names of states, regions, counties and countries |
 | `ephemeral restart` | Restart, picking up changes to `.env` |
+| `ephemeral check-db` | Check the connection to the database (for MySQL, also its TLS) |
 
 Copy the `backups` folder off the server now and then (or turn on your hosting
 provider's snapshots): a backup on the same server doesn't help if the server is lost.
@@ -79,6 +81,65 @@ encrypted with it; a backup is useless without it. The installer keeps it when r
 Any setting ephemeralREST understands can go in `.env` (see the examples at the end of the
 file), followed by `ephemeral restart`. Email (SMTP) is set up in the web app, under Email.
 
+## Using MySQL (Vultr Managed MySQL)
+
+ephemeralREST keeps its data in a built-in SQLite database unless you give it a MySQL one. For a
+managed database, such as Vultr Managed MySQL:
+
+1. **Create the database.** On the database's page in the Vultr console, under
+   *Users & Databases*, add a database (`ephemeral`, say) and, if you like, a user of its own.
+   ephemeralREST makes its tables the first time it starts; it doesn't create the database.
+2. **Let the server in.** Under *Trusted Sources*, add the ephemeralREST server's IP address (or
+   put both on the same VPC and use the database's private host). Until then the connection
+   times out.
+3. **Download the certificate.** *Download Signed Certificate* on the database's page gives you
+   the CA certificate (`ca-certificate.crt`). Copy it to the server, for example with
+   `scp ca-certificate.crt root@your-server:`. With it, ephemeralREST checks it's really talking
+   to your database.
+4. **Put the password in a file**, so it isn't on the command line where other users of the
+   server could see it (or leave out `--mysql-password-file` to be asked for it):
+
+   ```sh
+   install -m 600 /dev/null /root/mysql-password && nano /root/mysql-password
+   ```
+5. **Install**, with the host, port and user from the database's *Connection Details*:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/gmelh/ephemeralREST/main/install/install.sh | sudo bash -s -- \
+     --domain api.example.com --admin-domain admin.example.com \
+     --mysql-host vultr-prod-xxxx.vultrdb.com --mysql-port 16751 --mysql-user vultradmin \
+     --mysql-password-file /root/mysql-password --mysql-database ephemeral \
+     --mysql-ca /root/ca-certificate.crt
+   ```
+
+   Before ephemeralREST starts, the installer connects once and checks the account can make
+   tables. If anything's wrong (the password, the trusted sources, the certificate), it stops,
+   says which, and starts nothing:
+
+   ```
+   ✓ Connected to MySQL 8.0.x at vultradmin@vultr-prod-xxxx.vultrdb.com:16751/ephemeral
+   ✓ TLS TLS_AES_256_GCM_SHA384 (certificate checked against MYSQL_SSL_CA)
+   ✓ This account can create tables
+   ```
+
+   You can delete `/root/mysql-password` afterwards: the password is kept in `.env`.
+
+The settings go in `.env` (`DB_TYPE=mysql`, `MYSQL_HOST`, …, `MYSQL_SSL_CA=/data/mysql-ca.pem`,
+`MYSQL_SSL_MODE=VERIFY_CA`), and running the installer again keeps them. To change one, run it
+again with the new `--mysql-...` option, so it's checked before it's used.
+
+- **TLS.** With `--mysql-ca`, the connection is encrypted and the server's certificate must be
+  signed by that CA (`VERIFY_CA`). `--mysql-ssl-mode VERIFY_IDENTITY` also checks the certificate
+  names the host. Without a CA, it's `REQUIRED`: encrypted, but not checked. ephemeralREST
+  refuses to start, rather than run unencrypted, if the server doesn't offer TLS.
+- **Backups.** Vultr backs managed databases up automatically (with point-in-time recovery on
+  every plan but Hobbyist), so `ephemeral backup` has nothing to do for MySQL and says so. For a copy of your own, use `mysqldump` (see
+  [MIGRATING.md](../DOCS/MIGRATING.md)).
+- **An existing SQLite install** isn't moved to MySQL just because you give `--mysql-host`:
+  the data (accounts, keys, settings) isn't copied, so the installer stops and explains. Add
+  `--switch-to-mysql` to start afresh on MySQL anyway; the SQLite file is kept in `data/`.
+- Every ephemeralREST table has a primary key and uses InnoDB, as Vultr requires.
+
 ## Options
 
 ```sh
@@ -89,7 +150,9 @@ curl -fsSL .../install.sh | sudo bash -s -- --domain astro.example.com --email y
 certificate notices), `--google-key` (look places up with Google Maps instead of offline),
 `--dir`, `--image`, `--caddy-extra FILE` (extra lines for its sites, such as a `tls` block),
 `--edge-script FILE` (a local copy of the shared Caddy's script; it's still checked against its
-SHA-256), `--no-data` (don't download the ephemeris files or cities list), `--yes` (no
+SHA-256), `--mysql-host`, `--mysql-port`, `--mysql-user`, `--mysql-password-file`,
+`--mysql-database`, `--mysql-ca`, `--mysql-ssl-mode` and `--switch-to-mysql` (see above),
+`--no-data` (don't download the ephemeris files or cities list), `--yes` (no
 questions), `--skip-dns-check`, `--dry-run` (write the files only). Running the installer again
 keeps your data and settings. To add or change the admin address later, run it again with
 `--admin-domain`.
@@ -114,8 +177,7 @@ networks:
     external: true
 ```
 
-To share a MySQL database with those services instead of SQLite, set `DB_TYPE=mysql` and the
-`MYSQL_*` settings in `.env` (and use `mysqldump` for backups). See
+To use a MySQL database instead of SQLite, see [Using MySQL](#using-mysql-vultr-managed-mysql). See
 [`../deploy/two-service/`](../deploy/two-service/) for the older two-container setup.
 
 ## For maintainers
@@ -124,10 +186,10 @@ To share a MySQL database with those services instead of SQLite, set `DB_TYPE=my
 
 ```sh
 # 1. Set the version in version.py and web/package.json
-git commit -am "Version 1.0.0" && git push
+git commit -am "Version 1.0.2" && git push
 # 2. Tag it; pushing the tag starts .github/workflows/release.yml
-git tag -a v1.0.0 -m "ephemeralREST 1.0.0"
-git push origin v1.0.0
+git tag -a v1.0.2 -m "ephemeralREST 1.0.2"
+git push origin v1.0.2
 ```
 
 The release workflow runs the checks (`ci.yml`), builds the image for amd64 and arm64,

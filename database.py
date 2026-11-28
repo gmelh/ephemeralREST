@@ -94,6 +94,70 @@ PLACE_CACHE_EXPIRY_DAYS = 30
 _MYSQL_NOW_EXPR = "UTC_TIMESTAMP(6)"
 
 
+_COUNTRY_ALIASES = {'uk': 'gb', 'usa': 'us', 'u.s.': 'us', 'u.s.a.': 'us', 'u.k.': 'gb'}
+
+# How countries are written in a place's short name: the ISO code, except where people write
+# something else ("Trenton NJ, USA", "Perth, Scotland, UK").
+COUNTRY_SHORT = {'US': 'USA', 'GB': 'UK'}
+
+# States and territories that are written as abbreviations ("Perth WA", "Toronto ON"). GeoNames'
+# region codes are these already for the United States; elsewhere they're numbers, so the
+# abbreviations are looked up by the region's name.
+REGION_ABBREVIATIONS = {
+    'AU': {'Australian Capital Territory': 'ACT', 'New South Wales': 'NSW', 'Northern Territory': 'NT',
+           'Queensland': 'QLD', 'South Australia': 'SA', 'Tasmania': 'TAS', 'Victoria': 'VIC',
+           'Western Australia': 'WA'},
+    'CA': {'Alberta': 'AB', 'British Columbia': 'BC', 'Manitoba': 'MB', 'New Brunswick': 'NB',
+           'Newfoundland and Labrador': 'NL', 'Nova Scotia': 'NS', 'Ontario': 'ON',
+           'Prince Edward Island': 'PE', 'Quebec': 'QC', 'Saskatchewan': 'SK', 'Yukon': 'YT',
+           'Northwest Territories': 'NT', 'Nunavut': 'NU'},
+}
+
+
+def region_abbreviation(city: Dict[str, Any]):
+    """'WA' for Western Australia, 'NJ' for New Jersey; None where regions aren't abbreviated."""
+    cc = city.get('country_code') or ''
+    if cc == 'US':
+        code = city.get('admin1_code') or ''
+        return code if len(code) == 2 and code.isalpha() else None
+    return REGION_ABBREVIATIONS.get(cc, {}).get(city.get('admin1_name') or '')
+
+
+def country_short(city: Dict[str, Any]) -> str:
+    cc = city.get('country_code') or ''
+    return COUNTRY_SHORT.get(cc, cc)
+
+
+def fold_place_text(text: str) -> str:
+    """Lower case, accents removed and spaces tidied: how place names are compared."""
+    import unicodedata
+    text = unicodedata.normalize('NFKD', text or '')
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    return ' '.join(text.lower().split())
+
+
+def _place_matches(city: Dict[str, Any], qualifier: str) -> bool:
+    """Does one part of "City, Region, Country" (folded) describe this city?"""
+    if not qualifier:
+        return True
+    code = _COUNTRY_ALIASES.get(qualifier, qualifier)
+    if code == (city.get('country_code') or '').lower():
+        return True
+    if city.get('admin1_code') and qualifier == city['admin1_code'].lower() and not qualifier.isdigit():
+        return True  # "Springfield, IL": GeoNames uses postal codes for US states
+    if qualifier == (region_abbreviation(city) or '').lower():
+        return True  # "Perth, WA"
+    for field in ('admin1_name', 'admin2_name', 'country_name'):
+        value = fold_place_text(city.get(field) or '')
+        if value and (value == qualifier or (len(qualifier) >= 3 and value.startswith(qualifier))):
+            return True
+    # "Sangamon County IL": a district and a state abbreviation in one part
+    if ' ' in qualifier:
+        head, last = qualifier.rsplit(' ', 1)
+        return _place_matches(city, head) and _place_matches(city, last)
+    return False
+
+
 def _chart_hash(datetime_utc_iso: str, location_id: int, chart_name: str,
                 house_system: str = None) -> str:
     """
@@ -212,6 +276,79 @@ class _MySQLCursorWrapper:
         return self._cursor.rowcount
 
 
+# ---------------------------------------------------------------------------
+# MySQL TLS
+#
+# MYSQL_SSL_MODE, named as in the mysql client:
+#   DISABLED         no TLS
+#   PREFERRED        TLS when the server offers it, certificate not checked
+#                    (the default when no CA is given, as before 1.0.2)
+#   REQUIRED         TLS or refuse to start, certificate not checked
+#   VERIFY_CA        TLS, and the server certificate must be signed by
+#                    MYSQL_SSL_CA (the default when a CA is given)
+#   VERIFY_IDENTITY  as VERIFY_CA, and the certificate must name MYSQL_HOST
+# ---------------------------------------------------------------------------
+
+MYSQL_SSL_MODES = ('DISABLED', 'PREFERRED', 'REQUIRED', 'VERIFY_CA', 'VERIFY_IDENTITY')
+
+
+class MySQLConnectError(RuntimeError):
+    """Couldn't connect to MySQL; the message says why in plain words."""
+
+
+def mysql_ssl_mode(cfg: Dict[str, Any]) -> str:
+    mode = (cfg.get('ssl_mode') or '').strip().upper().replace('-', '_')
+    if not mode:
+        mode = 'VERIFY_CA' if cfg.get('ssl_ca') else 'PREFERRED'
+    if mode not in MYSQL_SSL_MODES:
+        raise MySQLConnectError(
+            f"MYSQL_SSL_MODE={mode} isn't known. Use one of: {', '.join(MYSQL_SSL_MODES)}.")
+    if mode.startswith('VERIFY') and not cfg.get('ssl_ca'):
+        raise MySQLConnectError(
+            f"MYSQL_SSL_MODE={mode} needs MYSQL_SSL_CA, the CA certificate file "
+            "(on Vultr: Download Signed Certificate on the database's page).")
+    if cfg.get('ssl_ca') and not os.path.isfile(cfg['ssl_ca']):
+        raise MySQLConnectError(f"MYSQL_SSL_CA={cfg['ssl_ca']} — there's no file there.")
+    return mode
+
+
+def mysql_ssl_args(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """mysql.connector.connect() options for the configured TLS mode."""
+    mode = mysql_ssl_mode(cfg)
+    if mode == 'DISABLED':
+        return {'ssl_disabled': True}
+    args: Dict[str, Any] = {}
+    if cfg.get('ssl_ca') and mode.startswith('VERIFY'):
+        args['ssl_ca'] = cfg['ssl_ca']
+        args['ssl_verify_cert'] = True
+        args['ssl_verify_identity'] = mode == 'VERIFY_IDENTITY'
+    return args
+
+
+def _explain_mysql_error(e, cfg: Dict[str, Any], mode: str) -> str:
+    where = f"{cfg.get('user')}@{cfg.get('host')}:{cfg.get('port', 3306)}/{cfg.get('database')}"
+    text = str(e)
+    errno = getattr(e, 'errno', None)
+    hint = ''
+    if errno == 1045:
+        hint = 'The user name or password is wrong.'
+    elif errno == 1049:
+        hint = f"The database {cfg.get('database')} doesn't exist. Create it first."
+    elif errno == 1044:
+        hint = f"{cfg.get('user')} isn't allowed to use the database {cfg.get('database')}."
+    elif errno in (2003, 2005, 2013) or 'timed out' in text.lower():
+        hint = ("The server didn't answer. Check the host and port, and that this "
+                "server's IP address is in the database's trusted sources.")
+    elif errno == 3159 or 'secure transport' in text.lower():
+        hint = 'The server only accepts TLS connections. Set MYSQL_SSL_MODE=REQUIRED or VERIFY_CA.'
+    elif 'certificate' in text.lower() or 'ssl' in text.lower():
+        hint = ("The server's certificate couldn't be checked against MYSQL_SSL_CA. "
+                "Check it's the CA for this database"
+                + (", or use VERIFY_CA if the certificate doesn't name this host."
+                   if mode == 'VERIFY_IDENTITY' else '.'))
+    return f"Couldn't connect to MySQL at {where} (TLS {mode}): {text}" + (f"\n{hint}" if hint else '')
+
+
 class _MySQLConnectionWrapper:
     """
     Wraps a mysql-connector connection so it can be used as a drop-in
@@ -222,14 +359,33 @@ class _MySQLConnectionWrapper:
 
     def __init__(self, mysql_config: Dict[str, Any]):
         import mysql.connector  # imported lazily — only required for DB_TYPE=mysql
-        self._conn = mysql.connector.connect(
-            host=mysql_config['host'],
-            port=int(mysql_config.get('port', 3306)),
-            user=mysql_config['user'],
-            password=mysql_config.get('password', ''),
-            database=mysql_config['database'],
-            autocommit=False,
-        )
+        mode = mysql_ssl_mode(mysql_config)
+        try:
+            self._conn = mysql.connector.connect(
+                host=mysql_config['host'],
+                port=int(mysql_config.get('port', 3306)),
+                user=mysql_config['user'],
+                password=mysql_config.get('password', ''),
+                database=mysql_config['database'],
+                autocommit=False,
+                connection_timeout=int(mysql_config.get('connect_timeout') or 10),
+                **mysql_ssl_args(mysql_config),
+            )
+        except mysql.connector.Error as e:
+            raise MySQLConnectError(_explain_mysql_error(e, mysql_config, mode)) from e
+        if mode in ('REQUIRED', 'VERIFY_CA', 'VERIFY_IDENTITY') and not self.tls_cipher():
+            self._conn.close()
+            raise MySQLConnectError(
+                f"MYSQL_SSL_MODE={mode}, but the connection to {mysql_config['host']} "
+                "is not encrypted. The server may not support TLS.")
+
+    def tls_cipher(self) -> str:
+        """The TLS cipher in use, or '' when the connection isn't encrypted."""
+        cur = self._conn.cursor()
+        cur.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+        row = cur.fetchone()
+        cur.close()
+        return (row[1] if row else '') or ''
 
     def cursor(self):
         return _MySQLCursorWrapper(self._conn.cursor(dictionary=True))
@@ -277,6 +433,8 @@ class DatabaseManager:
                 'user':     os.environ.get('MYSQL_USER', ''),
                 'password': os.environ.get('MYSQL_PASSWORD', ''),
                 'database': os.environ.get('MYSQL_DATABASE', ''),
+                'ssl_ca':   os.environ.get('MYSQL_SSL_CA', ''),
+                'ssl_mode': os.environ.get('MYSQL_SSL_MODE', ''),
             }
             if not self.mysql_config.get('user') or not self.mysql_config.get('database'):
                 raise ValueError(
@@ -1180,9 +1338,20 @@ class DatabaseManager:
                 latitude     REAL NOT NULL,
                 longitude    REAL NOT NULL,
                 timezone_id  TEXT NOT NULL,
-                population   INTEGER
+                population   INTEGER,
+                admin2_code  TEXT,
+                admin1_name  TEXT,
+                admin2_name  TEXT,
+                country_name TEXT
             )
         ''')
+        # Migration: region and country names (1.0.2), filled by the next cities import
+        cursor.execute("PRAGMA table_info(cities)")
+        city_columns = [column[1] for column in cursor.fetchall()]
+        for column in ('admin2_code', 'admin1_name', 'admin2_name', 'country_name'):
+            if column not in city_columns:
+                cursor.execute(f"ALTER TABLE cities ADD COLUMN {column} TEXT")
+                logger.info(f"Migration: added {column} column to cities table")
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS cities_import_meta
@@ -1679,9 +1848,17 @@ class DatabaseManager:
                 latitude     DOUBLE NOT NULL,
                 longitude    DOUBLE NOT NULL,
                 timezone_id  VARCHAR(64) NOT NULL,
-                population   INT
+                population   INT,
+                admin2_code  VARCHAR(80),
+                admin1_name  VARCHAR(255),
+                admin2_name  VARCHAR(255),
+                country_name VARCHAR(255)
             ) {charset}
         ''')
+        self._mysql_add_column_if_missing(cursor, 'cities', 'admin2_code', 'VARCHAR(80) NULL')
+        self._mysql_add_column_if_missing(cursor, 'cities', 'admin1_name', 'VARCHAR(255) NULL')
+        self._mysql_add_column_if_missing(cursor, 'cities', 'admin2_name', 'VARCHAR(255) NULL')
+        self._mysql_add_column_if_missing(cursor, 'cities', 'country_name', 'VARCHAR(255) NULL')
 
         cursor.execute(f'''
             CREATE TABLE IF NOT EXISTS cities_import_meta
@@ -3451,15 +3628,17 @@ class DatabaseManager:
         """
         Bulk-insert a list of city tuples into the cities table.
         Each tuple: (geoname_id, name, ascii_name, country_code,
-                     admin1_code, latitude, longitude, timezone_id, population)
+                     admin1_code, latitude, longitude, timezone_id, population,
+                     admin2_code, admin1_name, admin2_name, country_name)
         Returns the number of rows inserted.
         """
         with self.get_connection() as conn:
             conn.executemany('''
                 INSERT OR REPLACE INTO cities
                 (geoname_id, name, ascii_name, country_code,
-                 admin1_code, latitude, longitude, timezone_id, population)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 admin1_code, latitude, longitude, timezone_id, population,
+                 admin2_code, admin1_name, admin2_name, country_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
         return len(rows)
 
@@ -3489,18 +3668,19 @@ class DatabaseManager:
             'imported_at': row['imported_at'],
         }
 
+    _CITY_COLUMNS = ('geoname_id, name, ascii_name, country_code, admin1_code, admin2_code, '
+                     'admin1_name, admin2_name, country_name, latitude, longitude, timezone_id, population')
+
     def search_cities(self, query: str, limit: int = 10) -> list:
         """
         Prefix-match on ascii_name for autocomplete suggestions.
         Orders by population DESC so major cities surface first.
         Returns a list of dicts.
         """
-        normalised = query.strip().lower()
-        pattern    = normalised + '%'
+        pattern = fold_place_text(query) + '%'
         with self.get_connection() as conn:
-            rows = conn.execute('''
-                SELECT geoname_id, name, ascii_name, country_code,
-                       admin1_code, latitude, longitude, timezone_id, population
+            rows = conn.execute(f'''
+                SELECT {self._CITY_COLUMNS}
                 FROM cities
                 WHERE ascii_name LIKE ?
                 ORDER BY population DESC
@@ -3508,49 +3688,99 @@ class DatabaseManager:
             ''', (pattern, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def find_cities(self, name: str, limit: int = 200, prefix: bool = True) -> list:
+        """
+        Cities called `name` (exactly, ignoring case and accents), most populous first;
+        if there are none (and `prefix`), cities whose name starts with it.
+        """
+        folded = fold_place_text(name)
+        if not folded:
+            return []
+        with self.get_connection() as conn:
+            rows = conn.execute(f'''
+                SELECT {self._CITY_COLUMNS} FROM cities
+                WHERE ascii_name = ? ORDER BY population DESC LIMIT ?
+            ''', (folded, limit)).fetchall()
+            if not rows and prefix:
+                rows = conn.execute(f'''
+                    SELECT {self._CITY_COLUMNS} FROM cities
+                    WHERE ascii_name LIKE ? ORDER BY population DESC LIMIT ?
+                ''', (folded + '%', limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def resolve_city(self, query: str) -> Optional[Dict[str, Any]]:
         """
         Best-match city for a query string — used for offline geocoding.
-        Tries exact ascii_name match first, then prefix match. If the
-        query contains a comma (e.g. "Berlin, Germany"), also retries
-        using just the part before the first comma if the full string
-        didn't match anything — city names essentially never contain a
-        literal comma, so the full-string attempt first is just a safe,
-        cheap check before assuming it's a "City, Country" split.
-        Returns the highest-population match, or None if no results.
+
+        "Springfield, Illinois, United States", "Springfield IL, USA": the first part is the
+        city (with a state's abbreviation after it, if there is one); every other part must
+        match its region (state, province, or its abbreviation), district (county), country
+        name or country code. The most populous city that matches them all wins. With no other parts, it's
+        simply the most populous city of that name.
+
+        When there are other parts and none of the cities match them, None is returned
+        rather than a city somewhere else, unless the cities were imported without region
+        names (before 1.0.2): then only a country code can be checked, and otherwise the
+        most populous city of that name is returned, as before.
         """
-        def _match(conn, normalised: str) -> Optional[Dict[str, Any]]:
-            row = conn.execute('''
-                SELECT geoname_id, name, ascii_name, country_code,
-                       admin1_code, latitude, longitude, timezone_id, population
-                FROM cities
-                WHERE ascii_name = ?
-                ORDER BY population DESC
-                LIMIT 1
-            ''', (normalised,)).fetchone()
+        parts = [p.strip() for p in (query or '').split(',') if p.strip()]
+        if not parts:
+            return None
+        qualifiers = [fold_place_text(p) for p in parts[1:]]
+        candidates = self.find_cities(parts[0], prefix=False)
+        if not candidates and ' ' in parts[0].strip():
+            # "Perth WA": the state's abbreviation written after the city, as in short names
+            head, last = parts[0].strip().rsplit(' ', 1)
+            candidates = self.find_cities(head, prefix=False)
+            if candidates:
+                qualifiers.insert(0, fold_place_text(last))
+        if not candidates:
+            candidates = self.find_cities(parts[0])
+        if not candidates or not qualifiers:
+            return candidates[0] if candidates else None
+        matching = [c for c in candidates if all(_place_matches(c, q) for q in qualifiers)]
+        if matching:
+            return matching[0]
+        if any(c.get('admin1_name') or c.get('country_name') for c in candidates):
+            return None
+        return candidates[0]
 
-            if not row:
-                row = conn.execute('''
-                    SELECT geoname_id, name, ascii_name, country_code,
-                           admin1_code, latitude, longitude, timezone_id, population
-                    FROM cities
-                    WHERE ascii_name LIKE ?
-                    ORDER BY population DESC
-                    LIMIT 1
-                ''', (normalised + '%',)).fetchone()
-
-            return row
-
-        normalised = query.strip().lower()
+    def count_cities_named(self, ascii_name: str, country_code: str, admin1_code) -> int:
+        """How many cities share this name, country and region (to tell them apart by district)."""
         with self.get_connection() as conn:
-            row = _match(conn, normalised)
+            if admin1_code is None:
+                row = conn.execute(
+                    'SELECT COUNT(*) AS n FROM cities WHERE ascii_name = ? AND country_code = ? AND admin1_code IS NULL',
+                    (ascii_name, country_code)).fetchone()
+            else:
+                row = conn.execute(
+                    'SELECT COUNT(*) AS n FROM cities WHERE ascii_name = ? AND country_code = ? AND admin1_code = ?',
+                    (ascii_name, country_code, admin1_code)).fetchone()
+        return int(row['n'])
 
-            if not row and ',' in normalised:
-                city_only = normalised.split(',', 1)[0].strip()
-                if city_only:
-                    row = _match(conn, city_only)
+    def cities_have_regions(self) -> bool:
+        """Were the cities imported with region names (1.0.2 and later)?"""
+        with self.get_connection() as conn:
+            row = conn.execute(
+                'SELECT geoname_id FROM cities WHERE admin1_name IS NOT NULL LIMIT 1').fetchone()
+        return row is not None
 
-        return dict(row) if row else None
+    def retire_location_cache(self) -> int:
+        """
+        After a cities import, make cached place look-ups be found again: those no chart uses
+        are deleted; those a chart uses are kept for that chart, but no longer match a query.
+        """
+        with self.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, (SELECT COUNT(*) FROM charts c WHERE c.location_id = l.id) AS used "
+                "FROM locations l WHERE query_hash NOT LIKE 'retired-%'").fetchall()
+            unused = [(r['id'],) for r in rows if not r['used']]
+            used = [(f"retired-{r['id']}", r['id']) for r in rows if r['used']]
+            if unused:
+                conn.executemany('DELETE FROM locations WHERE id = ?', unused)
+            if used:
+                conn.executemany('UPDATE locations SET query_hash = ? WHERE id = ?', used)
+        return len(rows)
 
     # ==========================================================================
     # Stats and cleanup
@@ -3599,6 +3829,7 @@ class DatabaseManager:
                 'place_cache_active':   active_cache_count,
                 'place_cache_expired':  expired_cache_count,
                 'cities_loaded':        cities_count,
+                'cities_regions':       self.cities_have_regions() if cities_count else False,
                 'cities_import':        cities_meta,
             }
 
@@ -3700,6 +3931,8 @@ def create_database_manager(config=None) -> 'DatabaseManager':
                     'user':     config.MYSQL_USER,
                     'password': config.MYSQL_PASSWORD,
                     'database': config.MYSQL_DATABASE,
+                    'ssl_ca':   getattr(config, 'MYSQL_SSL_CA', ''),
+                    'ssl_mode': getattr(config, 'MYSQL_SSL_MODE', ''),
                 },
             )
         return DatabaseManager(db_type='sqlite', db_path=config.DATABASE_PATH)

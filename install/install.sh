@@ -22,6 +22,19 @@
 #                               only there (none: it's on the main address, as before)
 #   --email you@example.com     for certificate expiry notices from Let's Encrypt
 #   --google-key KEY            look places up with Google Maps (otherwise offline, from the cities list)
+#   --mysql-host HOST           use a MySQL database (e.g. Vultr Managed MySQL) instead of the
+#                               built-in SQLite one. The connection is checked before starting.
+#   --mysql-port PORT           (default 3306; Vultr's is on the database's page)
+#   --mysql-user USER
+#   --mysql-password-file FILE  the password, read from a file (or you're asked for it; or
+#                               --mysql-password PASSWORD, which other users of the server can see)
+#   --mysql-database NAME       the database, which must already exist (default ephemeral)
+#   --mysql-ca FILE             the database's CA certificate (Vultr: Download Signed Certificate),
+#                               so the server's certificate is checked
+#   --mysql-ssl-mode MODE       VERIFY_CA (the default with --mysql-ca), REQUIRED (the default
+#                               without), VERIFY_IDENTITY, PREFERRED or DISABLED
+#   --switch-to-mysql           move an existing install to MySQL, starting with an empty
+#                               database (its SQLite data isn't copied; the file is kept)
 #   --dir DIR                   where it's installed (default /opt/studioapps/ephemeral; an
 #                               existing install in /opt/ephemeral stays there)
 #   --image IMAGE               the ephemeralREST container image to run
@@ -91,7 +104,7 @@ valid_domain() {
   [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]
 }
 
-usage() { sed -n '2,36p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,50p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; }
 
 edge_running() {
   command -v docker >/dev/null 2>&1 &&
@@ -104,6 +117,8 @@ edge_running() {
 parse_args() {
   DOMAIN=""; ADMIN_DOMAIN=""; ACME_EMAIL=""; DIR=""; IMAGE=""; YES=0; DRY_RUN=0; SKIP_DNS=0
   GOOGLE_KEY=""; NO_DATA=0; EDGE_SCRIPT=""; CADDY_EXTRA=""
+  MYSQL_HOST=""; MYSQL_PORT=""; MYSQL_USER=""; MYSQL_PASSWORD=""; MYSQL_DATABASE=""
+  MYSQL_CA_FILE=""; MYSQL_SSL_MODE=""; SWITCH_TO_MYSQL=0; local password_file=""
   while [ $# -gt 0 ]; do
     case $1 in
       --domain) DOMAIN=${2:-}; shift 2 ;;
@@ -112,6 +127,15 @@ parse_args() {
       --caddy-extra) CADDY_EXTRA=${2:-}; shift 2 ;;
       --email) ACME_EMAIL=${2:-}; shift 2 ;;
       --google-key) GOOGLE_KEY=${2:-}; shift 2 ;;
+      --mysql-host) MYSQL_HOST=${2:-}; shift 2 ;;
+      --mysql-port) MYSQL_PORT=${2:-}; shift 2 ;;
+      --mysql-user) MYSQL_USER=${2:-}; shift 2 ;;
+      --mysql-password) MYSQL_PASSWORD=${2:-}; shift 2 ;;
+      --mysql-password-file) password_file=${2:-}; shift 2 ;;
+      --mysql-database) MYSQL_DATABASE=${2:-}; shift 2 ;;
+      --mysql-ca) MYSQL_CA_FILE=${2:-}; shift 2 ;;
+      --mysql-ssl-mode) MYSQL_SSL_MODE=$(printf '%s' "${2:-}" | tr '[:lower:]-' '[:upper:]_'); shift 2 ;;
+      --switch-to-mysql) SWITCH_TO_MYSQL=1; shift ;;
       --dir) DIR=${2:-}; shift 2 ;;
       --image) IMAGE=${2:-}; shift 2 ;;
       --no-data) NO_DATA=1; shift ;;
@@ -131,15 +155,34 @@ parse_args() {
     [ -f "$CADDY_EXTRA" ] || die "--caddy-extra: there's no file at $CADDY_EXTRA"
     CADDY_EXTRA=$(cd "$(dirname "$CADDY_EXTRA")" && printf '%s/%s' "$PWD" "$(basename "$CADDY_EXTRA")")
   fi
+  if [ -n "$password_file" ]; then
+    [ -f "$password_file" ] || die "--mysql-password-file: there's no file at $password_file"
+    MYSQL_PASSWORD=$(head -n 1 "$password_file" | tr -d '\r\n')
+  fi
+  if [ -n "$MYSQL_CA_FILE" ]; then
+    [ -f "$MYSQL_CA_FILE" ] || die "--mysql-ca: there's no file at $MYSQL_CA_FILE"
+    grep -q 'BEGIN CERTIFICATE' "$MYSQL_CA_FILE" || die "--mysql-ca: $MYSQL_CA_FILE isn't a PEM certificate"
+  fi
+  case $MYSQL_SSL_MODE in
+    ''|DISABLED|PREFERRED|REQUIRED|VERIFY_CA|VERIFY_IDENTITY) ;;
+    *) die "--mysql-ssl-mode: use VERIFY_CA, VERIFY_IDENTITY, REQUIRED, PREFERRED or DISABLED" ;;
+  esac
+  if [ -n "$MYSQL_PORT" ] && ! [[ $MYSQL_PORT =~ ^[0-9]{1,5}$ ]]; then die "--mysql-port: $MYSQL_PORT isn't a port number"; fi
+  WANT_MYSQL=0
+  if [ -n "$MYSQL_HOST$MYSQL_USER$MYSQL_DATABASE$MYSQL_CA_FILE" ] || [ "$SWITCH_TO_MYSQL" -eq 1 ]; then WANT_MYSQL=1; fi
 }
 
 clean_domain() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's|^https\{0,1\}://||; s|/.*$||'; }
 
 # Settings the installer manages in .env. Every other line there is yours and is kept.
-MANAGED='^(EPHEMERAL_DOMAIN|ADMIN_DOMAIN|ACME_EMAIL|EPHEMERAL_IMAGE|SECRET_KEY|USE_GOOGLE|GOOGLE_MAPS_API_KEY)='
+MANAGED='^(EPHEMERAL_DOMAIN|ADMIN_DOMAIN|ACME_EMAIL|EPHEMERAL_IMAGE|SECRET_KEY|USE_GOOGLE|GOOGLE_MAPS_API_KEY|DB_TYPE|MYSQL_HOST|MYSQL_PORT|MYSQL_USER|MYSQL_PASSWORD|MYSQL_DATABASE|MYSQL_SSL_CA|MYSQL_SSL_MODE)='
+
+# Inside the container, ./data is /data. A CA given with --mysql-ca is copied here.
+MYSQL_CA_NAME="mysql-ca.pem"
+
 
 load_existing() {
-  SECRET_KEY=""; USE_GOOGLE=""; EXTRA_DOMAINS=""
+  SECRET_KEY=""; USE_GOOGLE=""; EXTRA_DOMAINS=""; DB_TYPE=""; MYSQL_SSL_CA=""
   if [ -f "$DIR/.env" ]; then
     local key value
     while IFS='=' read -r key value; do
@@ -152,6 +195,14 @@ load_existing() {
         USE_GOOGLE) USE_GOOGLE=$value ;;
         GOOGLE_MAPS_API_KEY) [ -n "$GOOGLE_KEY" ] || GOOGLE_KEY=$value ;;
         EXTRA_DOMAINS) EXTRA_DOMAINS=$(printf '%s' "$value" | tr ',' ' ') ;;
+        DB_TYPE) DB_TYPE=$value ;;
+        MYSQL_HOST) [ -n "$MYSQL_HOST" ] || MYSQL_HOST=$value ;;
+        MYSQL_PORT) [ -n "$MYSQL_PORT" ] || MYSQL_PORT=$value ;;
+        MYSQL_USER) [ -n "$MYSQL_USER" ] || MYSQL_USER=$(unquote "$value") ;;
+        MYSQL_PASSWORD) [ -n "$MYSQL_PASSWORD" ] || MYSQL_PASSWORD=$(unquote "$value") ;;
+        MYSQL_DATABASE) [ -n "$MYSQL_DATABASE" ] || MYSQL_DATABASE=$value ;;
+        MYSQL_SSL_CA) MYSQL_SSL_CA=$value ;;
+        MYSQL_SSL_MODE) [ -n "$MYSQL_SSL_MODE" ] || MYSQL_SSL_MODE=$value ;;
       esac
     done < "$DIR/.env"
     EXISTING=1
@@ -167,6 +218,18 @@ load_existing() {
   # The secret key encrypts every stored API key: made once, never changed.
   [ -n "$SECRET_KEY" ] || SECRET_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
   if [ -n "$GOOGLE_KEY" ]; then USE_GOOGLE=true; else USE_GOOGLE=false; fi
+  DB_TYPE=$(printf '%s' "${DB_TYPE:-sqlite}" | tr '[:upper:]' '[:lower:]')
+  WAS_MYSQL=0
+  if [ "$DB_TYPE" = mysql ]; then WAS_MYSQL=1; fi
+  if [ "$WANT_MYSQL" -eq 1 ]; then DB_TYPE=mysql; fi
+}
+
+# docker compose reads .env values without quotes with $ and # meaning something, so the MySQL user
+# and password are written in single quotes (taken literally), and read back without them.
+unquote() {
+  local v=$1
+  if [ "${#v}" -ge 2 ] && [ "${v:0:1}" = "'" ] && [ "${v: -1}" = "'" ]; then v=${v:1:${#v}-2}; fi
+  printf '%s' "$v"
 }
 
 check_system() {
@@ -253,6 +316,83 @@ choose_geocoding() {
     if [ -n "$GOOGLE_KEY" ]; then USE_GOOGLE=true; fi
   fi
   if [ "$USE_GOOGLE" = true ]; then ok "Google Maps, with the cities list for suggestions"; else ok "Offline, from the cities list"; fi
+}
+
+choose_database() {
+  step "The database"
+  if [ "$DB_TYPE" != mysql ] && [ "$EXISTING" -eq 0 ] && [ "$YES" -eq 0 ] && has_tty; then
+    say "ephemeralREST keeps its data in a built-in SQLite database, in $DIR/data."
+    say "It can use a MySQL database instead, such as Vultr Managed MySQL."
+    MYSQL_HOST=$(ask "MySQL host (optional — press Enter for the built-in database)" "")
+    if [ -n "$MYSQL_HOST" ]; then DB_TYPE=mysql; fi
+  fi
+  if [ "$DB_TYPE" != mysql ]; then ok "Built-in (SQLite), in $DIR/data"; return; fi
+
+  # An install with data in SQLite isn't switched without being asked: the data isn't copied.
+  if [ "$EXISTING" -eq 1 ] && [ "$WAS_MYSQL" -eq 0 ] && [ -s "$DIR/data/ephemeral.db" ] && [ "$SWITCH_TO_MYSQL" -eq 0 ]; then
+    die "This install keeps its data in SQLite ($DIR/data/ephemeral.db). Moving to MySQL starts with
+an empty database: accounts, keys and settings aren't copied. To do it anyway, add --switch-to-mysql
+(the SQLite file is kept). To keep the data, install fresh with MySQL and set it up again."
+  fi
+
+  local interactive=0
+  if [ "$YES" -eq 0 ] && has_tty; then interactive=1; fi
+  if [ -z "$MYSQL_HOST" ]; then
+    [ "$interactive" -eq 1 ] || die "Give the database's address with --mysql-host"
+    MYSQL_HOST=$(ask "MySQL host" "")
+  fi
+  if [ -z "$MYSQL_PORT" ]; then
+    if [ "$interactive" -eq 1 ]; then MYSQL_PORT=$(ask "MySQL port" "3306"); else MYSQL_PORT=3306; fi
+  fi
+  if [ -z "$MYSQL_USER" ]; then
+    [ "$interactive" -eq 1 ] || die "Give the MySQL user with --mysql-user"
+    MYSQL_USER=$(ask "MySQL user" "")
+  fi
+  if [ -z "$MYSQL_DATABASE" ]; then
+    if [ "$interactive" -eq 1 ]; then MYSQL_DATABASE=$(ask "Database name (it must exist already)" "ephemeral"); else MYSQL_DATABASE=ephemeral; fi
+  fi
+  if [ -z "$MYSQL_PASSWORD" ]; then
+    [ "$interactive" -eq 1 ] || die "Give the MySQL password with --mysql-password-file"
+    printf 'MySQL password (not shown): ' > /dev/tty
+    IFS= read -rs MYSQL_PASSWORD < /dev/tty || MYSQL_PASSWORD=""
+    printf '\n' > /dev/tty
+    [ -n "$MYSQL_PASSWORD" ] || die "The MySQL password is needed."
+  fi
+  if [ -z "$MYSQL_CA_FILE" ] && [ -z "$MYSQL_SSL_CA" ] && [ "$interactive" -eq 1 ]; then
+    say "For a check that it's really your database, give its CA certificate: on Vultr, the"
+    say "database's page has ${bold}Download Signed Certificate${reset}. Copy that file to this server first."
+    MYSQL_CA_FILE=$(ask "CA certificate file (optional)" "")
+    if [ -n "$MYSQL_CA_FILE" ]; then
+      [ -f "$MYSQL_CA_FILE" ] || die "There's no file at $MYSQL_CA_FILE"
+      grep -q 'BEGIN CERTIFICATE' "$MYSQL_CA_FILE" || die "$MYSQL_CA_FILE isn't a PEM certificate"
+    fi
+  fi
+  valid_mysql_host "$MYSQL_HOST" || die "\"$MYSQL_HOST\" isn't a host name or IP address."
+  [[ $MYSQL_PORT =~ ^[0-9]{1,5}$ ]] || die "\"$MYSQL_PORT\" isn't a port number."
+  [[ $MYSQL_DATABASE =~ ^[A-Za-z0-9_$-]{1,64}$ ]] || die "\"$MYSQL_DATABASE\" isn't a database name MySQL accepts."
+  case $MYSQL_USER$MYSQL_PASSWORD in
+    *$'\n'*) die "The MySQL user or password has a line break in it." ;;
+    *"'"*) die "The MySQL user or password has a ' in it, which the settings file can't hold. Choose a password without one." ;;
+  esac
+
+  if [ -n "$MYSQL_CA_FILE" ]; then MYSQL_SSL_CA="/data/$MYSQL_CA_NAME"; fi
+  if [ -z "$MYSQL_SSL_MODE" ]; then
+    if [ -n "$MYSQL_SSL_CA" ]; then MYSQL_SSL_MODE=VERIFY_CA; else MYSQL_SSL_MODE=REQUIRED; fi
+  fi
+  case $MYSQL_SSL_MODE in
+    VERIFY_*) [ -n "$MYSQL_SSL_CA" ] || die "--mysql-ssl-mode $MYSQL_SSL_MODE needs the CA certificate: --mysql-ca FILE" ;;
+  esac
+  local tls="TLS, certificate checked"
+  case $MYSQL_SSL_MODE in
+    REQUIRED) tls="TLS, certificate not checked (add --mysql-ca to check it)" ;;
+    PREFERRED) tls="TLS if offered, not checked" ;;
+    DISABLED) tls="not encrypted" ;;
+  esac
+  ok "MySQL: $MYSQL_USER@$MYSQL_HOST:$MYSQL_PORT/$MYSQL_DATABASE ($tls)"
+}
+
+valid_mysql_host() {
+  [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$ ]] || [[ $1 =~ ^[0-9a-fA-F:]+$ ]]
 }
 
 install_docker() {
@@ -374,6 +514,18 @@ SECRET_KEY=$SECRET_KEY
 USE_GOOGLE=$USE_GOOGLE
 GOOGLE_MAPS_API_KEY=$GOOGLE_KEY
 EOF
+    if [ "$DB_TYPE" = mysql ]; then
+      cat <<EOF
+DB_TYPE=mysql
+MYSQL_HOST=$MYSQL_HOST
+MYSQL_PORT=$MYSQL_PORT
+MYSQL_USER='$MYSQL_USER'
+MYSQL_PASSWORD='$MYSQL_PASSWORD'
+MYSQL_DATABASE=$MYSQL_DATABASE
+MYSQL_SSL_CA=$MYSQL_SSL_CA
+MYSQL_SSL_MODE=$MYSQL_SSL_MODE
+EOF
+    fi
     if [ -n "$(printf '%s' "$own" | tr -d '[:space:]')" ]; then
       printf '%s\n' "$own"
     else
@@ -391,13 +543,8 @@ EOF
 # TRUSTED_DEVICE_DAYS=28
 # More addresses for this server (e.g. old ones), then re-run the installer:
 # EXTRA_DOMAINS=api.example.com admin.example.com
-# To use MySQL instead of the built-in SQLite database:
-# DB_TYPE=mysql
-# MYSQL_HOST=...
-# MYSQL_PORT=3306
-# MYSQL_USER=...
-# MYSQL_PASSWORD=...
-# MYSQL_DATABASE=...
+# To use MySQL instead of the built-in SQLite database, run the installer again
+# with --mysql-host and friends (see --help): it checks the connection first.
 EOF
     fi
   } > "$DIR/.env.new"
@@ -482,6 +629,10 @@ write_files() {
   write_env
   write_compose
   write_site
+  if [ -n "$MYSQL_CA_FILE" ] && [ "$(readlink -f "$MYSQL_CA_FILE")" != "$(readlink -f "$DIR/data/$MYSQL_CA_NAME")" ]; then
+    cp "$MYSQL_CA_FILE" "$DIR/data/$MYSQL_CA_NAME"
+  fi
+  if [ -f "$DIR/data/$MYSQL_CA_NAME" ]; then chmod 644 "$DIR/data/$MYSQL_CA_NAME"; fi
   if [ "$DRY_RUN" -eq 0 ]; then chown -R "$APP_UID:$APP_UID" "$DIR/data"; fi
   chmod 700 "$DIR/backups"
   ok "compose.yml, $SITE.caddy and .env"
@@ -569,9 +720,10 @@ Usage: ephemeral COMMAND
   restart | stop | start
   reset-password EMAIL       Print a link to set a new password, for someone who's locked out.
   keys ...                   Manage keys from here: ephemeral keys --help
-  fetch-ephemeris            Download the Swiss Ephemeris files again.
-  import-cities              Download and import the GeoNames cities list again.
+  fetch-ephemeris            Download any Swiss Ephemeris files that are missing (all of them, ~120 MB).
+  import-cities              Download and import the GeoNames cities list again, with region names.
   cleanup ...                Remove old cached charts: ephemeral cleanup --help
+  check-db                   Check the connection to the database (and, for MySQL, its TLS).
   version
 
 The shared Caddy, which Studio apps on this server use too, has its own command:
@@ -585,7 +737,7 @@ backup() {
     case $1 in --keep) keep=$2; shift 2 ;; --quiet) quiet=1; shift ;; *) shift ;; esac
   done
   if grep -q '^DB_TYPE=mysql' .env; then
-    [ "$quiet" -eq 1 ] || echo "The database is MySQL: back it up with mysqldump. (The ephemeris files and cities list can be downloaded again.)"
+    [ "$quiet" -eq 1 ] || echo "The database is MySQL: it's backed up by your MySQL provider (Vultr Managed MySQL does it automatically), or with mysqldump. Nothing else needs a backup: the ephemeris files and cities list can be downloaded again."
     return 0
   fi
   stamp=$(date +%Y-%m-%d-%H%M%S)
@@ -647,7 +799,7 @@ case ${1:-help} in
   stop) compose stop ;;
   start) compose up -d ;;
   reset-password) app reset-password "${2:?Usage: ephemeral reset-password EMAIL}" ;;
-  keys|cleanup|fetch-ephemeris|import-cities) app "$@" ;;
+  keys|cleanup|fetch-ephemeris|import-cities|check-db) app "$@" ;;
   version) app version ;;
   help|--help|-h) usage ;;
   *) usage; exit 1 ;;
@@ -662,7 +814,12 @@ EOF
 start() {
   step "Starting ephemeralREST"
   if [ "$DRY_RUN" -eq 1 ]; then say "${dim}(dry run: would run docker compose pull and up, then studioapps site add)${reset}"; return; fi
-  if ! (cd "$DIR" && docker compose pull --quiet --ignore-pull-failures && docker compose up -d --remove-orphans); then
+  if ! (cd "$DIR" && docker compose pull --quiet --ignore-pull-failures); then
+    warn "Couldn't get the ephemeralREST image ($IMAGE)."
+    return 1
+  fi
+  check_database || return 1
+  if ! (cd "$DIR" && docker compose up -d --remove-orphans); then
     warn "Starting ephemeralREST failed. See: cd $DIR && docker compose logs"
     return 1
   fi
@@ -670,6 +827,26 @@ start() {
     warn "The shared Caddy refused ephemeralREST's site file ($DIR/$SITE.caddy). Its message is above."
     return 1
   fi
+}
+
+# With MySQL, connect once before starting, so a wrong password, a missing trusted source or a
+# certificate that doesn't match is one clear message rather than a container that keeps restarting.
+check_database() {
+  [ "$DB_TYPE" = mysql ] || return 0
+  say "Checking the connection to MySQL at $MYSQL_HOST..."
+  local out
+  if out=$(cd "$DIR" && docker compose run --rm --no-deps -T app ephemeral check-db 2>&1); then
+    printf '%s\n' "$out" | grep -v -e '^Note: no Swiss' -e '^ *Run .ephemeral fetch-ephemeris' || true
+    return 0
+  fi
+  printf '%s\n' "$out" | grep -v -e '^Note: no Swiss' -e '^ *Run .ephemeral fetch-ephemeris' >&2 || true
+  local ip
+  ip=$(public_ip)
+  warn "ephemeralREST can't use the MySQL database, so it wasn't started."
+  say "Check the settings above. On Vultr Managed MySQL, the database's page lists its host, port,"
+  say "user and password, and its ${bold}Trusted Sources${reset} must include this server${ip:+ ($ip)}."
+  say "The settings are in $DIR/.env; run the installer again with the right --mysql-... options."
+  return 1
 }
 
 # ephemeralREST used to run its own Caddy. Move it onto the shared Caddy, bringing its certificates
@@ -769,18 +946,21 @@ download_data() {
   if [ "$NO_DATA" -eq 1 ]; then say "${dim}(skipped — later: ephemeral fetch-ephemeris; ephemeral import-cities)${reset}"; return; fi
   if [ "$DRY_RUN" -eq 1 ]; then say "${dim}(dry run: would download them)${reset}"; return; fi
   local app="docker compose --project-directory $DIR exec -T app ephemeral"
-  if ls "$DIR"/data/sweph/*.se1 >/dev/null 2>&1; then
-    ok "Ephemeris files already there"
-  else
-    $app fetch-ephemeris || warn "Couldn't download the ephemeris files. Try later: ephemeral fetch-ephemeris"
-  fi
-  local loaded
-  loaded=$(curl -fsS --max-time 10 "https://$DOMAIN/api/v1/cache/stats" 2>/dev/null \
-    | grep -o '"cities_loaded": *[0-9]*' | grep -o '[0-9]*$' || echo 0)
-  if [ "${loaded:-0}" -gt 0 ]; then
+  # Every Swiss Ephemeris file (about 120 MB: 13201 BC to 17191 AD). Files already there are
+  # kept, so an install that has the 1800–2399 files only gets the rest.
+  $app fetch-ephemeris || warn "Some ephemeris files didn't download. Try again later: ephemeral fetch-ephemeris"
+  local stats loaded regions
+  stats=$(curl -fsS --max-time 10 "https://$DOMAIN/api/v1/cache/stats" 2>/dev/null || true)
+  loaded=$(printf '%s' "$stats" | grep -o '"cities_loaded": *[0-9]*' | grep -o '[0-9]*$' || echo 0)
+  regions=$(printf '%s' "$stats" | grep -o '"cities_regions": *[a-z]*' | grep -o '[a-z]*$' || echo false)
+  if [ "${loaded:-0}" -gt 0 ] && [ "$regions" = true ]; then
     ok "Cities list already imported ($loaded places)"
   else
-    say "Importing the cities list (a minute or two)..."
+    if [ "${loaded:-0}" -gt 0 ]; then
+      say "Importing the cities list again, with the names of states, regions and countries (a minute or two)..."
+    else
+      say "Importing the cities list (a minute or two)..."
+    fi
     $app import-cities >/dev/null || warn "Couldn't import the cities list. Try later: ephemeral import-cities"
     ok "Cities list imported"
   fi
@@ -799,7 +979,11 @@ finish() {
   say ""
   say "  Useful commands:  ephemeral status | logs | update | backup"
   say "  Settings:         $DIR/.env  (then: ephemeral restart)"
-  say "  Your data:        $DIR/data   (backed up daily to $DIR/backups)"
+  if [ "$DB_TYPE" = mysql ]; then
+    say "  Your data:        MySQL at $MYSQL_HOST, database $MYSQL_DATABASE (backed up by your provider)"
+  else
+    say "  Your data:        $DIR/data   (backed up daily to $DIR/backups)"
+  fi
   say "  Shared Caddy:     studioapps sites   (Studio apps can share this server)"
   if [ "$MOVED_FROM_OWN_CADDY" -eq 1 ]; then
     say ""
@@ -818,6 +1002,7 @@ main() {
   check_internet
   choose_domain
   choose_geocoding
+  choose_database
   install_docker
   check_ports
   check_dns

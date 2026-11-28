@@ -51,9 +51,10 @@ app on the server, so Studio apps such as AstrologyStudio can be installed besid
    ephemeral start
    ```
 
-   **MySQL** (for example a database shared with marketREST): don't copy a database file —
-   add `DB_TYPE=mysql` and the `MYSQL_*` settings from the old `.env` to `/opt/studioapps/ephemeral/.env`
-   instead. If MySQL runs on the host, also add an `extra_hosts` entry for the app in
+   **MySQL** (for example a database shared with marketREST): don't copy a database file.
+   To keep using the same MySQL, run the installer again with its `--mysql-...` options (it
+   checks the connection first); to move to Vultr Managed MySQL, see
+   [below](#moving-the-database-to-vultr-managed-mysql). If MySQL runs on the host, also add an `extra_hosts` entry for the app in
    `compose.override.yml` (as the old compose file had) and use `MYSQL_HOST=host.docker.internal`.
 
    Copy over any other settings you'd changed (`SITE_NAME`, `CORS_ORIGINS`, rate limits,
@@ -80,6 +81,72 @@ app on the server, so Studio apps such as AstrologyStudio can be installed besid
 6. **Check**: `ephemeral status`, log in at the new address, and call
    `https://api.example.com/health` from a client. Then retire the old containers and the
    ephemeralADMIN checkout.
+
+## Moving the database to Vultr Managed MySQL
+
+To move an install that uses MySQL on the server itself onto Vultr Managed MySQL (the same
+accounts, keys and settings), copy the database across first, then install against it.
+
+1. **Make the managed database ready**, as in [Using MySQL](../install/README.md#using-mysql-vultr-managed-mysql):
+   create a database (`ephemeral`), add the old server's and the new server's IP addresses to
+   its *Trusted Sources*, and download its CA certificate (`ca-certificate.crt`).
+
+2. **Check every table has a primary key** — Vultr refuses tables without one. ephemeralREST's
+   own tables all have one; this lists any that don't (a table left by another service, say):
+
+   ```sql
+   SELECT t.table_name FROM information_schema.tables t
+   LEFT JOIN information_schema.table_constraints c
+     ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+    AND c.constraint_type = 'PRIMARY KEY'
+   WHERE t.table_schema = 'OLD_DB' AND t.table_type = 'BASE TABLE' AND c.constraint_name IS NULL;
+   ```
+
+   Leave any it lists out of the copy (name the tables to copy after the database name in the
+   `mysqldump` command below). Vultr also has only InnoDB: a table on another engine is made as
+   InnoDB on import, or refused.
+
+3. **Copy the data.** Stop ephemeralREST on the old server so nothing changes during the copy, then:
+
+   ```sh
+   mysqldump --single-transaction --set-gtid-purged=OFF --no-tablespaces \
+     -h OLD_HOST -u OLD_USER -p OLD_DB > ephemeral.sql
+   mysql --ssl-mode=VERIFY_CA --ssl-ca=ca-certificate.crt \
+     -h vultr-prod-xxxx.vultrdb.com -P 16751 -u vultradmin -p ephemeral < ephemeral.sql
+   ```
+
+   `--set-gtid-purged=OFF` matters: without it the dump tries to set GTIDs, which a managed
+   database doesn't allow.
+
+4. **Give the new install the old `SECRET_KEY`** before it starts, so it can read the stored keys.
+   The installer keeps a key it finds in `.env`:
+
+   ```sh
+   sudo install -d -m 755 /opt/studioapps/ephemeral
+   echo 'SECRET_KEY=THE-OLD-KEY' | sudo tee /opt/studioapps/ephemeral/.env >/dev/null
+   sudo chmod 600 /opt/studioapps/ephemeral/.env
+   ```
+
+5. **Install** with the `--mysql-...` options. The installer checks the connection, then
+   ephemeralREST starts on the copied tables (and brings them up to date, as it does on any start):
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/gmelh/ephemeralREST/main/install/install.sh | sudo bash -s -- \
+     --domain api.example.com --admin-domain admin.example.com --no-data \
+     --mysql-host vultr-prod-xxxx.vultrdb.com --mysql-port 16751 --mysql-user vultradmin \
+     --mysql-password-file /root/mysql-password --mysql-database ephemeral \
+     --mysql-ca /root/ca-certificate.crt
+   ```
+
+   Then the ephemeris files as in step 3 above, and log in as usual.
+
+6. **Other services that read ephemeralREST's database** (marketREST and searchREST check keys
+   against it) need its new address too: the Vultr host, port and user, with TLS, and their
+   server in the database's *Trusted Sources*. Give them a read-only user of their own
+   (`GRANT SELECT ON ephemeral.* TO …`) rather than ephemeralREST's.
+
+An install that uses SQLite can move to MySQL too, but only by starting afresh: there's no
+copy from SQLite to MySQL. The installer won't do it unasked (see `--switch-to-mysql`).
 
 ## What's gone
 

@@ -64,10 +64,12 @@ directly from them:
   (also reachable via FTP at `ftp://ftp.astro.com/pub/swisseph/ephe/`)
 - Background and file-naming reference: https://www.astro.com/swisseph-download/
 
-At minimum, grab the planetary, lunar, and main-asteroid files covering
-1800–2399 AD (`sepl_18.se1`, `semo_18.se1`, `seas_18.se1`) — that range
-covers general-purpose astrological calculation. Download a wider range
-if you specifically need dates outside it.
+`ephemeral fetch-ephemeris` (or `python cli.py fetch-ephemeris`) downloads every file
+from Astrodienst's GitHub copy, about 120 MB: the planets and Moon for 13201 BC – 17191 AD,
+the main asteroids for 5401 BC – 5399 AD, the fixed stars and the fictitious bodies. With
+`--minimal` it gets only the 1800–2399 AD files (`sepl_18.se1`, `semo_18.se1`, `seas_18.se1`).
+Outside the files it has, the Swiss Ephemeris uses its built-in, less precise Moshier
+ephemeris.
 
 ```bash
 cd ~/ephemeral/ephemeralREST

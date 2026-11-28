@@ -14,12 +14,20 @@
 #   - an install with its own Caddy (in /opt/ephemeral) moves across with the same certificate
 #     and its data, and a failed move puts the old setup back
 #   - something else on port 80 stops the installer before it changes anything
+#   - with TEST_MYSQL_HOST set: an install on MySQL, with TLS and the certificate checked; a wrong
+#     password stops it before it starts; a re-run keeps MySQL; an SQLite install with data isn't
+#     switched to MySQL without --switch-to-mysql
 #
 # Settings (environment):
 #   EPH_IMAGE    the ephemeralREST image (default ghcr.io/gmelh/ephemeralrest:1)
 #   STUDIOAPPS_EDGE_IMAGE   the Caddy image for the shared Caddy (default: edge.sh's, caddy:2.10)
 #   OLD_REF      the git ref of the installer that ran its own Caddy (default d6ed606)
 #   KEEP=1       leave the server as the last check left it, to look around (no clean-up)
+#   TEST_MYSQL_HOST, TEST_MYSQL_PORT (3306), TEST_MYSQL_USER, TEST_MYSQL_PASSWORD,
+#   TEST_MYSQL_DATABASE, TEST_MYSQL_CA
+#                the MySQL checks, run when TEST_MYSQL_HOST is set. The host must be reachable from
+#                containers (not 127.0.0.1), and the database empty: the checks fill it, and empty it
+#                again at the end. TEST_MYSQL_CA is the server's CA certificate file.
 #
 # Certificates come from Caddy's own local authority (`tls internal`, through --caddy-extra), so
 # no real domain or Let's Encrypt is needed; the test domains are put in /etc/hosts.
@@ -219,6 +227,78 @@ grep -q "t-squatter" "$WORK/squat.log" && grep -q "Nothing has been changed" "$W
 [ ! -e "$NEW_DIR" ] && [ ! -e /usr/local/bin/studioapps ] || bad "nothing should be installed"
 ok "another container on port 80 stops it before anything is installed"
 docker rm -f t-squatter >/dev/null
+
+if [ -n "${TEST_MYSQL_HOST:-}" ]; then
+  echo "MySQL"
+  mysql_args=(--mysql-host "$TEST_MYSQL_HOST" --mysql-port "${TEST_MYSQL_PORT:-3306}"
+              --mysql-user "$TEST_MYSQL_USER" --mysql-database "$TEST_MYSQL_DATABASE")
+  if [ -n "${TEST_MYSQL_CA:-}" ]; then mysql_args+=(--mysql-ca "$TEST_MYSQL_CA"); fi
+  printf '%s\n' "$TEST_MYSQL_PASSWORD" > "$WORK/mysql-password"
+  printf 'wrong-password\n' > "$WORK/wrong-password"
+  tables() { # how many tables the app's database has, by the app's own check
+    docker compose --project-directory "$NEW_DIR" run --rm --no-deps -T app ephemeral check-db 2>/dev/null |
+      sed -n 's/^ *\([0-9][0-9]*\) tables in .*/\1/p'
+  }
+  empty_database() {
+    [ -f "$NEW_DIR/compose.yml" ] || return 0
+    docker compose --project-directory "$NEW_DIR" run --rm --no-deps -T app python -c '
+import os, mysql.connector
+from database import mysql_ssl_args
+c = mysql.connector.connect(host=os.environ["MYSQL_HOST"], port=int(os.environ["MYSQL_PORT"]),
+    user=os.environ["MYSQL_USER"], password=os.environ["MYSQL_PASSWORD"], database=os.environ["MYSQL_DATABASE"],
+    **mysql_ssl_args({"ssl_ca": os.environ.get("MYSQL_SSL_CA"), "ssl_mode": os.environ.get("MYSQL_SSL_MODE")}))
+cur = c.cursor(); cur.execute("SET FOREIGN_KEY_CHECKS=0"); cur.execute("SHOW TABLES")
+for (t,) in cur.fetchall(): cur.execute(f"DROP TABLE `{t}`")
+' >/dev/null 2>&1 || true
+  }
+
+  reset_server
+  if install_eph --domain "$DOMAIN" "${mysql_args[@]}" --mysql-password-file "$WORK/wrong-password" > "$WORK/my-wrong.log" 2>&1; then
+    bad "a wrong MySQL password should stop the install"
+  fi
+  grep -q "can't use the MySQL database, so it wasn't started" "$WORK/my-wrong.log" &&
+    grep -q "password is wrong" "$WORK/my-wrong.log" || { cat "$WORK/my-wrong.log"; bad "it should say the password is wrong"; }
+  [ -z "$(docker ps -q --filter name=ephemeral-app-1)" ] || bad "the app shouldn't have been started"
+  ok "a wrong MySQL password stops the install before ephemeralREST starts, and says why"
+
+  install_eph --domain "$DOMAIN" "${mysql_args[@]}" --mysql-password-file "$WORK/mysql-password" > "$WORK/my-fresh.log" 2>&1 ||
+    { cat "$WORK/my-fresh.log"; bad "an install on MySQL should work"; }
+  answers "$DOMAIN" || bad "ephemeralREST on MySQL should answer"
+  grep -q '^DB_TYPE=mysql$' "$NEW_DIR/.env" && [ ! -e "$NEW_DIR/data/ephemeral.db" ] || bad "it should use MySQL, not SQLite"
+  grep -q "^✓ TLS " "$WORK/my-fresh.log" || { cat "$WORK/my-fresh.log"; bad "the connection should be encrypted"; }
+  if [ -n "${TEST_MYSQL_CA:-}" ]; then
+    grep -q '^MYSQL_SSL_MODE=VERIFY_CA$' "$NEW_DIR/.env" && [ -f "$NEW_DIR/data/mysql-ca.pem" ] &&
+      grep -q "certificate checked against MYSQL_SSL_CA" "$WORK/my-fresh.log" || bad "the certificate should be checked"
+  fi
+  [ "$(tables)" -gt 20 ] || bad "ephemeralREST should have made its tables in MySQL"
+  docker exec ephemeral-app-1 env | grep -qxF "MYSQL_PASSWORD=$TEST_MYSQL_PASSWORD" ||
+    bad "the password should reach the app exactly as given"
+  ok "a fresh install on MySQL answers, over TLS${TEST_MYSQL_CA:+ with the certificate checked}, with its tables made"
+
+  first=$(docker inspect -f '{{.Id}}' ephemeral-app-1)
+  install_eph > "$WORK/my-again.log" 2>&1 || { cat "$WORK/my-again.log"; bad "running it again on MySQL should work"; }
+  [ "$(docker inspect -f '{{.Id}}' ephemeral-app-1)" = "$first" ] && grep -q '^DB_TYPE=mysql$' "$NEW_DIR/.env" ||
+    bad "running it again should keep MySQL and change nothing"
+  docker exec ephemeral-app-1 env | grep -qxF "MYSQL_PASSWORD=$TEST_MYSQL_PASSWORD" || bad "the password should be kept"
+  ok "running it again keeps MySQL and its settings"
+  empty_database
+
+  reset_server
+  install_eph --domain "$DOMAIN" > "$WORK/my-sqlite.log" 2>&1 || { cat "$WORK/my-sqlite.log"; bad "an SQLite install"; }
+  if install_eph "${mysql_args[@]}" --mysql-password-file "$WORK/mysql-password" > "$WORK/my-switch.log" 2>&1; then
+    bad "an SQLite install with data shouldn't move to MySQL unasked"
+  fi
+  grep -q -- "--switch-to-mysql" "$WORK/my-switch.log" && ! grep -q '^DB_TYPE=' "$NEW_DIR/.env" ||
+    { cat "$WORK/my-switch.log"; bad "it should stop, explain, and leave the settings alone"; }
+  answers "$DOMAIN" || bad "the SQLite install should still answer"
+  ok "an SQLite install with data isn't moved to MySQL without --switch-to-mysql"
+  install_eph "${mysql_args[@]}" --mysql-password-file "$WORK/mysql-password" --switch-to-mysql > "$WORK/my-switched.log" 2>&1 ||
+    { cat "$WORK/my-switched.log"; bad "--switch-to-mysql should work"; }
+  answers "$DOMAIN" && grep -q '^DB_TYPE=mysql$' "$NEW_DIR/.env" && [ -s "$NEW_DIR/data/ephemeral.db" ] ||
+    bad "it should run on MySQL, with the SQLite file kept"
+  ok "with --switch-to-mysql it moves to MySQL, keeping the SQLite file"
+  empty_database
+fi
 
 echo
 echo "All $PASSED installer checks passed."

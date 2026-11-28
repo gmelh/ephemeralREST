@@ -52,6 +52,8 @@ from typing import Optional, Dict, Any
 
 import pytz
 
+from database import country_short, fold_place_text, region_abbreviation
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,14 +77,40 @@ def _tz_offsets(timezone_id: str) -> Dict[str, int]:
         return {'utc_offset_seconds': 0, 'dst_offset_seconds': 0}
 
 
-def _format_name(row: Dict[str, Any]) -> str:
+def _format_name(row: Dict[str, Any], with_district: bool = False) -> str:
     """
-    Build a human-readable location string from a cities row.
-    Format: "City, Country Code" — clean and consistent for every resolution.
-    e.g. "Perth, AU" or "London, GB"
+    A place, written short: "Perth WA, AU", "Trenton NJ, USA", "Perth, Scotland, UK",
+    "Paris, Île-de-France, FR". States that are usually abbreviated (Australia, Canada, the
+    United States) are written after the city; other regions in full.
+
+    When that's needed to tell two places apart, the district (county) comes in instead of the
+    full region: "Newport, Isle of Wight, UK", "Springfield, Sangamon County IL, USA".
     """
-    parts = [row['name'], row['country_code']]
+    name = row['name']
+    abbr = region_abbreviation(row)
+    same = lambda other: fold_place_text(other or '') == fold_place_text(name)  # "Zürich, Zurich"
+    region = row.get('admin1_name') if not same(row.get('admin1_name')) else None
+    district = row.get('admin2_name') if with_district and not same(row.get('admin2_name')) else None
+    if district:
+        parts = [name, f"{district} {abbr}" if abbr else district]
+    elif abbr:
+        parts = [f"{name} {abbr}"]
+    else:
+        parts = [name, region]
+    parts.append(country_short(row))
     return ', '.join(p for p in parts if p)
+
+
+def _place_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The parts of a place, for an app that shows them separately."""
+    return {
+        'name':         row['name'],
+        'district':     row.get('admin2_name'),
+        'region':       row.get('admin1_name'),
+        'country':      row.get('country_name'),
+        'country_code': row['country_code'],
+        'geoname_id':   row['geoname_id'],
+    }
 
 
 class CitiesService:
@@ -104,7 +132,11 @@ class CitiesService:
         London GB before smaller Londons).
 
         Each result dict:
-            description  — display string for the autocomplete UI
+            description  — display string for the autocomplete UI, naming the region and
+                           country, short ("Springfield IL, USA", "Perth, Scotland, UK"); sent back as a
+                           chart's location, it finds this same place
+            name, district, region, country — the parts, for showing them separately
+                           (district is the county or similar; any of them may be None)
             geoname_id   — GeoNames ID (stable, use as reference key)
             country_code — ISO 3166-1 alpha-2
             latitude     — city centroid
@@ -117,12 +149,16 @@ class CitiesService:
             return []
 
         rows = self.db.search_cities(query, limit=limit)
+        # Two places that would read the same ("Newport, England, UK") get their district
+        # instead, so the person can tell which they're choosing.
+        plain = [_format_name(row) for row in rows]
         results = []
-        for row in rows:
+        for row, text in zip(rows, plain):
+            if plain.count(text) > 1:
+                text = _format_name(row, with_district=True)
             results.append({
-                'description': _format_name(row),
-                'geoname_id':  row['geoname_id'],
-                'country_code': row['country_code'],
+                'description': text,
+                **_place_fields(row),
                 'latitude':    row['latitude'],
                 'longitude':   row['longitude'],
                 'timezone_id': row['timezone_id'],
@@ -164,15 +200,23 @@ class CitiesService:
         row = self.db.resolve_city(query)
 
         if not row:
+            if ',' in query and self.db.find_cities(query.split(',', 1)[0]):
+                return None, (
+                    f"No place called {query.split(',', 1)[0].strip()} matches '{query}'. "
+                    "Check the region and country, or choose the place from the suggestions."
+                )
             return None, (
                 f"Location '{query}' not found in cities database. "
                 "Try a larger nearby city, or check spelling."
             )
 
         offsets = _tz_offsets(row['timezone_id'])
+        ambiguous = bool(row.get('admin2_name')) and self.db.count_cities_named(
+            row['ascii_name'], row['country_code'], row.get('admin1_code')) > 1
 
         place = {
-            'formatted_name':     _format_name(row),
+            'formatted_name':     _format_name(row, with_district=ambiguous),
+            **_place_fields(row),
             'latitude':           row['latitude'],
             'longitude':          row['longitude'],
             'timezone_id':        row['timezone_id'],

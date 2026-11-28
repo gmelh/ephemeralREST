@@ -95,6 +95,12 @@ MYSQL_PORT=3306
 MYSQL_USER=
 MYSQL_PASSWORD=
 MYSQL_DATABASE=
+# TLS to MySQL. MYSQL_SSL_CA is the server's CA certificate (on Vultr Managed
+# MySQL: "Download Signed Certificate"). MYSQL_SSL_MODE is one of DISABLED,
+# PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY — VERIFY_CA when a CA is
+# set, otherwise PREFERRED (encrypted if the server offers it, not checked).
+MYSQL_SSL_CA=
+MYSQL_SSL_MODE=
 
 SWISS_EPHEMERIS_PATH=./sweph
 
@@ -287,6 +293,8 @@ class Config:
     MYSQL_USER     = os.environ.get('MYSQL_USER', '')
     MYSQL_PASSWORD = os.environ.get('MYSQL_PASSWORD', '')
     MYSQL_DATABASE = os.environ.get('MYSQL_DATABASE', '')
+    MYSQL_SSL_CA   = os.environ.get('MYSQL_SSL_CA', '')
+    MYSQL_SSL_MODE = os.environ.get('MYSQL_SSL_MODE', '').strip().upper()
 
     # Swiss Ephemeris
     SWISS_EPHEMERIS_PATH = _data_path('SWISS_EPHEMERIS_PATH', './sweph', 'sweph')
@@ -367,6 +375,14 @@ class Config:
                 errors.append("MYSQL_USER is required when DB_TYPE=mysql")
             if not cls.MYSQL_DATABASE:
                 errors.append("MYSQL_DATABASE is required when DB_TYPE=mysql")
+            mode = cls.MYSQL_SSL_MODE or ('VERIFY_CA' if cls.MYSQL_SSL_CA else 'PREFERRED')
+            if mode not in ('DISABLED', 'PREFERRED', 'REQUIRED', 'VERIFY_CA', 'VERIFY_IDENTITY'):
+                errors.append(f"MYSQL_SSL_MODE={cls.MYSQL_SSL_MODE} isn't known")
+            elif mode.startswith('VERIFY') and not cls.MYSQL_SSL_CA:
+                errors.append(f"MYSQL_SSL_MODE={mode} needs MYSQL_SSL_CA")
+            elif mode in ('DISABLED', 'PREFERRED') and cls.MYSQL_HOST not in ('localhost', '127.0.0.1', '::1'):
+                warnings.append(f"MYSQL_SSL_MODE={mode}: the connection to {cls.MYSQL_HOST} "
+                                "isn't checked. Set MYSQL_SSL_CA to verify the server.")
             if not cls.MYSQL_PASSWORD:
                 warnings.append("MYSQL_PASSWORD is empty — only appropriate for local/dev MySQL")
 

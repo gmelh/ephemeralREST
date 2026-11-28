@@ -192,22 +192,24 @@ A date with no time component is treated as midnight local time at the given loc
 
 ### Historical dates
 
-The Swiss Ephemeris supports dates from 1800 BCE to 2400 CE. For dates before the Gregorian calendar reform (before 1582-10-15), the Julian calendar is used. Most astrological software handles this automatically, and so does this API.
+With every Swiss Ephemeris file installed (`ephemeral fetch-ephemeris`, which the installer runs), the planets and the Moon are calculated from Astrodienst's files for 13201 BC to 17191 AD, and the main asteroids for 5401 BC to 5399 AD. Without a file for a date, the Swiss Ephemeris falls back to its built-in Moshier ephemeris, which is less precise. Dates in a request are ordinary calendar dates (years 1 to 9999 AD). For dates before the Gregorian calendar reform (before 1582-10-15), the Julian calendar is used. Most astrological software handles this automatically, and so does this API.
 
 ---
 
 ## How locations work
 
-The API accepts a location as a plain text string, geocodes it using Google Maps, and returns the canonical coordinates, timezone, and daylight saving status. Results are cached for 30 days so repeated requests for the same location do not consume Google API quota.
+The API accepts a location as a plain text string. Offline (the default), it's found in the GeoNames cities list, by name and by any region, district or country given after it (see `/autocomplete` below). With `USE_GOOGLE=true` it's looked up with Google Maps. Either way the API returns the canonical coordinates, timezone, and daylight saving status. Results are cached for 30 days so repeated requests for the same location do not consume Google API quota.
 
 Examples of location strings that work:
 
 ```
 "London"
 "London, UK"
-"New York, NY"
+"Perth, Scotland"
+"Springfield, Illinois, United States"
+"Springfield IL, USA"
+"Perth WA"
 "Sydney, Australia"
-"48.8566, 2.3522"           ← latitude,longitude pair
 ```
 
 The API always returns the resolved location details alongside the chart data so you can confirm that the correct place was found.
@@ -384,16 +386,46 @@ Suggest location names matching a partial string. No authentication required. Us
 curl "https://api.yourdomain.com/autocomplete?q=Perth"
 ```
 
+Suggestions come from the GeoNames list of places with more than 5,000 people, most populous
+first, whichever way places are looked up (`USE_GOOGLE`).
+
 ```json
 {
   "predictions": [
-    { "description": "Perth WA, Australia", "place_id": "ChIJgf3RJh9HqakR0WBB..." },
-    { "description": "Perth, Scotland, UK",  "place_id": "ChIJ..." }
+    {
+      "description": "Perth WA, AU",
+      "name": "Perth", "district": null, "region": "Western Australia",
+      "country": "Australia", "country_code": "AU", "geoname_id": 2063523,
+      "latitude": -31.95224, "longitude": 115.8614, "timezone_id": "Australia/Perth"
+    },
+    {
+      "description": "Perth, Scotland, UK",
+      "name": "Perth", "district": "Perth and Kinross", "region": "Scotland",
+      "country": "United Kingdom", "country_code": "GB", "geoname_id": 2640358,
+      "latitude": 56.39522, "longitude": -3.43139, "timezone_id": "Europe/London"
+    }
   ]
 }
 ```
 
-The `place_id` value can be passed directly as the `location` field in a calculate request instead of a text string, which avoids an additional geocoding round-trip.
+- `description` is short, and names the region and country so people can tell places apart:
+  `Perth WA, AU`, `Trenton NJ, USA`, `Perth, Scotland, UK`, `Paris, Île-de-France, FR`.
+  States are abbreviated after the city in Australia, Canada and the United States; elsewhere
+  the region is written in full. The country is its ISO code, except `USA` and `UK`.
+- Where two suggestions would still read the same, both name their district (county or
+  similar) instead: `Newport, Isle of Wight, UK` and `Newport, Shropshire, UK`.
+- `name`, `district`, `region` and `country` are the parts, for showing them separately. Any of
+  them can be `null`.
+- **Send the `description` back as a chart's `location`** and the chart is made for that same
+  place.
+- A typed location works the same way. `Springfield, Illinois`, `Springfield IL`,
+  `Springfield, IL` and `Perth, Scotland` find those places. Each part after the first must match the place's region,
+  district, country or country code. When nothing matches, the request fails with a message
+  rather than using a place somewhere else. A name alone (`Perth`) gives the most populous
+  place of that name.
+- On a server that imported the cities list before 1.0.2, descriptions read `Perth, AU` (with no region) until
+  the list is imported again (`ephemeral import-cities`; the installer does it when you run it
+  again).
 
 ---
 
