@@ -23,4 +23,4 @@ client = app_module.app.test_client()
 H = {'X-API-Key': key}
 OFF = {'output': {'bodies': {'ceres': False, 'pallas': False, 'juno': False, 'vesta': False, 'chiron': False}}}
 with db.get_connection() as conn:
-    conn.execute("INSERT OR IGNORE INTO cities VALUES (2063523, 'Perth', 'Perth', 'AU', '08', -31.95224, 115.8614, 'Australia/Perth', 1896548)")
+    conn.execute("INSERT OR IGNORE INTO cities (geoname_id, name, ascii_name, country_code, admin1_code, latitude, longitude, timezone_id, population) VALUES (2063523, 'Perth', 'Perth', 'AU', '08', -31.95224, 115.8614, 'Australia/Perth', 1896548)")

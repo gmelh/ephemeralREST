@@ -246,7 +246,11 @@ def _bootstrap_env_if_missing(env_path: str = '.env') -> None:
 
 
 _bootstrap_env_if_missing()
-load_dotenv()
+# The .env in the folder it runs from (the one written above on a first run). Not in the
+# container or the tests (EPHEMERAL_NO_ENV_FILE): there the settings are the environment's
+# alone, so a developer's own .env in a checkout never leaks into a test run.
+if not os.environ.get('EPHEMERAL_NO_ENV_FILE'):
+    load_dotenv(os.path.join(os.getcwd(), '.env'))
 
 
 # In the container everything the server keeps lives under one directory

@@ -73,7 +73,8 @@ from dotenv import load_dotenv
 # Ensure the script can import from the project directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-load_dotenv()
+if not os.environ.get('EPHEMERAL_NO_ENV_FILE'):
+    load_dotenv(os.path.join(os.getcwd(), '.env'))
 
 
 def main():

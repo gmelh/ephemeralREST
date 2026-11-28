@@ -52,7 +52,7 @@ print('stored charts ok: old charts get theirs worked out; progressions, solar a
 
 # Charts: the offline place lookup needs cities5000; one city is enough for this check.
 with routes.db_manager.get_connection() as conn:
-    conn.execute("INSERT OR IGNORE INTO cities VALUES (2063523, 'Perth', 'Perth', 'AU', '08', -31.95224, 115.8614, 'Australia/Perth', 1896548)")
+    conn.execute("INSERT OR IGNORE INTO cities (geoname_id, name, ascii_name, country_code, admin1_code, latitude, longitude, timezone_id, population) VALUES (2063523, 'Perth', 'Perth', 'AU', '08', -31.95224, 115.8614, 'Australia/Perth', 1896548)")
 r = client.post('/calculate', json={'chart_name': 'Test', 'datetime': '1966-03-20 10:15:00', 'location': 'Perth, Australia', **off}, headers=H)
 if r.status_code != 200:
     print('calculate skipped here:', r.status_code, r.get_data(as_text=True)[:200])
