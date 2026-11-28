@@ -19,10 +19,11 @@ COPY web/ ./
 RUN npm run typecheck && npm run build
 
 # ---- Python dependencies (pyswisseph needs a compiler) ---------------------------
-# pyswisseph has a ready-made wheel for amd64 only; for arm64 it's compiled here, which needs
-# the C library's headers (libc6-dev) as well as gcc: --no-install-recommends leaves them out.
+# pyswisseph has a ready-made wheel for amd64 only; for arm64 it's compiled here. That needs
+# the C and C++ compilers (it has one C++ file) and the C library's headers (libc6-dev), which
+# --no-install-recommends would otherwise leave out.
 FROM python:3.11-slim AS deps
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
@@ -44,10 +45,15 @@ ENV PYTHONUNBUFFERED=1 \
     FLASK_HOST=0.0.0.0 \
     FLASK_PORT=8080
 
+# pyswisseph needs the C++ runtime (usually there already; this makes sure).
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --home-dir /app ephemeral
 WORKDIR /app
 
 COPY --from=deps /install /usr/local
+# Stop the build here, plainly, if a compiled library won't load on this platform.
+RUN python -c "import swisseph, mysql.connector, cryptography.fernet; print('swisseph', swisseph.version)"
 COPY *.py ./
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint
 COPY docker/ephemeral /usr/local/bin/ephemeral
